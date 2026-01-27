@@ -486,7 +486,7 @@ def run_email_fetch_filtered(filters):
         found_metric.metric("Emails Found", emails_found)
         
         elapsed = time.time() - start_time
-        speed = done / elapsed if elapsed > 0 else 0
+        speed = processed_count / elapsed if elapsed > 0 else 0
         speed_metric.metric("Speed", f"{speed:.1f}/sec")
         
         # Auto-save
