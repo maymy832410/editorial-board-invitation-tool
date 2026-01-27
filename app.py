@@ -490,7 +490,30 @@ def display_results(discipline_filter):
     if isinstance(sent_invitations, list):
         sent_invitations = set(sent_invitations)
     
-    # Filter options
+    # Collect all unique specialties from results for autocomplete
+    all_specialties = set()
+    for r in results:
+        if r.get('all_topics'):
+            all_specialties.update(r['all_topics'])
+        elif r.get('specialty'):
+            all_specialties.add(r['specialty'])
+    
+    # Filter options - Row 1: Specialty autocomplete
+    selected_specialty = st.selectbox(
+        "Filter by Specialty (autocomplete)",
+        options=["All Specialties"] + sorted(all_specialties),
+        key="specialty_filter",
+        help="Search and select a specific research topic"
+    )
+    
+    # Apply specialty filter
+    if selected_specialty != "All Specialties":
+        filtered = [
+            r for r in filtered 
+            if selected_specialty in (r.get('all_topics') or []) or r.get('specialty') == selected_specialty
+        ]
+    
+    # Filter options - Row 2: Checkboxes
     col_filter1, col_filter2 = st.columns(2)
     with col_filter1:
         show_only_with_email = st.checkbox("Show only authors with email", value=False, key="filter_email")
@@ -532,12 +555,14 @@ def display_results(discipline_filter):
             'Select': False,
             'Name': r.get('name', ''),
             'H-Index': r.get('h_index', ''),
+            'Specialty': r.get('specialty', '') or '',
             'Discipline': r.get('discipline', ''),
             'Email': r.get('email', '') or '',
             'Institution': r.get('institution', ''),
             'Country': r.get('country', ''),
             'Notified': '✓' if orcid_id in sent_invitations else '',
-            'orcid_id': orcid_id
+            'orcid_id': orcid_id,
+            'all_topics': r.get('all_topics', [])
         })
     
     if not df_data:
@@ -553,16 +578,18 @@ def display_results(discipline_filter):
             "Select": st.column_config.CheckboxColumn("Select", default=False, width="small"),
             "Name": st.column_config.TextColumn("Name", width="medium"),
             "H-Index": st.column_config.NumberColumn("H-Index", width="small"),
-            "Discipline": st.column_config.TextColumn("Discipline", width="medium"),
+            "Specialty": st.column_config.TextColumn("Specialty", width="medium"),
+            "Discipline": st.column_config.TextColumn("Discipline", width="small"),
             "Email": st.column_config.TextColumn("Email", width="medium"),
             "Institution": st.column_config.TextColumn("Institution", width="large"),
             "Country": st.column_config.TextColumn("Country", width="small"),
             "Notified": st.column_config.TextColumn("Notified", width="small"),
-            "orcid_id": None  # Hidden
+            "orcid_id": None,  # Hidden
+            "all_topics": None  # Hidden
         },
         hide_index=True,
         use_container_width=True,
-        disabled=['Name', 'H-Index', 'Discipline', 'Email', 'Institution', 'Country', 'Notified', 'orcid_id']
+        disabled=['Name', 'H-Index', 'Specialty', 'Discipline', 'Email', 'Institution', 'Country', 'Notified', 'orcid_id', 'all_topics']
     )
     
     # Get selected authors
@@ -573,6 +600,7 @@ def display_results(discipline_filter):
             'name': selected_rows.iloc[0]['Name'],
             'email': selected_rows.iloc[0]['Email'],
             'orcid_id': selected_rows.iloc[0]['orcid_id'],
+            'specialty': selected_rows.iloc[0]['Specialty'],
             'discipline': selected_rows.iloc[0]['Discipline'],
             'institution': selected_rows.iloc[0]['Institution']
         }
@@ -581,7 +609,7 @@ def display_results(discipline_filter):
     # Export button
     col1, col2 = st.columns(2)
     with col1:
-        csv = df.drop(columns=['Select', 'orcid_id']).to_csv(index=False)
+        csv = df.drop(columns=['Select', 'orcid_id', 'all_topics']).to_csv(index=False)
         st.download_button(
             "Export CSV",
             data=csv,
@@ -593,7 +621,7 @@ def display_results(discipline_filter):
         # Export only with emails
         df_with_email = df[df['Email'] != '']
         if not df_with_email.empty:
-            csv_email = df_with_email.drop(columns=['Select', 'orcid_id']).to_csv(index=False)
+            csv_email = df_with_email.drop(columns=['Select', 'orcid_id', 'all_topics']).to_csv(index=False)
             st.download_button(
                 f"Export With Email ({len(df_with_email)})",
                 data=csv_email,

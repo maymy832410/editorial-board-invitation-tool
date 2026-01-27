@@ -159,13 +159,25 @@ class OpenAlexClient:
         summary_stats = author.get("summary_stats", {})
         h_index = summary_stats.get("h_index")
         
-        # Get top topics/research areas
+        # Get topics/research areas
         topics = author.get("topics", [])
-        top_topics = []
-        for topic in topics[:3]:  # Get top 3 topics
-            topic_name = topic.get("display_name")
-            if topic_name:
-                top_topics.append(topic_name)
+        
+        # Extract all topic names for filtering
+        all_topics = [t.get("display_name") for t in topics if t.get("display_name")]
+        
+        # Get primary specialty (most specific topic)
+        specialty = None
+        subfield = None
+        if topics:
+            first_topic = topics[0]
+            specialty = first_topic.get("display_name")
+            # Get subfield from the topic structure
+            subfield_data = first_topic.get("subfield", {})
+            if subfield_data:
+                subfield = subfield_data.get("display_name")
+        
+        # Get top 3 topics for display
+        top_topics = all_topics[:3] if all_topics else []
         
         # Get discipline from topics
         discipline = get_discipline_from_topics(topics)
@@ -181,6 +193,9 @@ class OpenAlexClient:
             "institution": institution_name,
             "country": institution_country,
             "discipline": discipline,
+            "specialty": specialty,
+            "subfield": subfield,
+            "all_topics": all_topics,
             "research_areas": ", ".join(top_topics) if top_topics else None,
         }
     
