@@ -69,6 +69,150 @@ def save_state():
     state_mgr.save_state(st.session_state.app_state)
 
 
+@st.dialog("Send Invitation Email", width="large")
+def email_dialog(author: dict, filters: dict):
+    """Dialog for composing and sending invitation email to a specific author."""
+    
+    journal_config = st.session_state.app_state.get('journal_config', {})
+    publisher_id = filters.get('publisher', 'peninsula')
+    
+    # Author info header
+    st.markdown(f"### To: **{author['name']}**")
+    if author.get('institution'):
+        st.caption(f"{author.get('institution')} | H-index: {author.get('h_index', 'N/A')}")
+    
+    st.divider()
+    
+    # Template selection
+    template_names = get_template_names()
+    template_id = st.selectbox(
+        "Invitation Type",
+        options=list(template_names.keys()),
+        format_func=lambda x: template_names[x],
+        key="dialog_template"
+    )
+    
+    # Format template
+    publisher_name = email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else ""
+    sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
+    
+    formatted = format_template(
+        template_id=template_id,
+        author_name=author['name'],
+        journal_name=journal_config.get('name', ''),
+        journal_issn=journal_config.get('issn', ''),
+        journal_link=journal_config.get('link', ''),
+        editor_in_chief_name=journal_config.get('editor_in_chief', ''),
+        publisher_name=publisher_name,
+        sender_email=sender_email,
+        publisher_location=journal_config.get('location', '')
+    )
+    
+    # Editable email fields
+    to_email = st.text_input(
+        "To (Email)",
+        value=author.get('email', ''),
+        key="dialog_to"
+    )
+    
+    subject = st.text_input(
+        "Subject",
+        value=formatted['subject'],
+        key="dialog_subject"
+    )
+    
+    body = st.text_area(
+        "Email Body",
+        value=formatted['body'],
+        height=300,
+        key="dialog_body"
+    )
+    
+    # PDF option
+    col1, col2 = st.columns(2)
+    with col1:
+        attach_pdf = st.checkbox("Attach PDF invitation letter", value=True, key="dialog_pdf")
+    
+    # Preview PDF
+    if attach_pdf:
+        with st.expander("Preview PDF"):
+            try:
+                pdf_bytes = generate_invitation_pdf(
+                    publisher_id=publisher_id,
+                    recipient_name=author['name'],
+                    email_body=body,
+                    subject=subject,
+                    journal_name=journal_config.get('name', ''),
+                    journal_link=journal_config.get('link', '')
+                )
+                st.download_button(
+                    "Download PDF Preview",
+                    data=pdf_bytes,
+                    file_name="Invitation_Letter_Preview.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"PDF error: {str(e)}")
+    
+    st.divider()
+    
+    # Action buttons
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    
+    with col2:
+        send_disabled = not EMAIL_AVAILABLE or not to_email
+        if st.button("Send Email", type="primary", use_container_width=True, disabled=send_disabled):
+            with st.spinner("Sending..."):
+                # Generate PDF if needed
+                pdf_bytes = None
+                if attach_pdf:
+                    try:
+                        pdf_bytes = generate_invitation_pdf(
+                            publisher_id=publisher_id,
+                            recipient_name=author['name'],
+                            email_body=body,
+                            subject=subject,
+                            journal_name=journal_config.get('name', ''),
+                            journal_link=journal_config.get('link', '')
+                        )
+                    except Exception as e:
+                        st.error(f"PDF generation failed: {str(e)}")
+                        pdf_bytes = None
+                
+                # Send email
+                success, msg = email_sender.send_email(
+                    publisher_id=publisher_id,
+                    to_email=to_email,
+                    subject=subject,
+                    body=body,
+                    to_name=author['name'],
+                    pdf_attachment=pdf_bytes
+                )
+                
+                if success:
+                    # Mark as notified if sent to original email
+                    if to_email == author.get('email'):
+                        sent_invitations = st.session_state.app_state.get('sent_invitations', set())
+                        if isinstance(sent_invitations, list):
+                            sent_invitations = set(sent_invitations)
+                        sent_invitations.add(author['orcid_id'])
+                        st.session_state.app_state['sent_invitations'] = sent_invitations
+                        save_state()
+                    
+                    st.success(f"Email sent to {to_email}!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"Failed: {msg}")
+    
+    if not EMAIL_AVAILABLE:
+        st.warning("Email sending not configured. Add email_credentials.json.")
+
+
 def render_sidebar():
     """Render the sidebar with all configuration options."""
     
@@ -611,15 +755,18 @@ def display_results(filters):
     
     st.divider()
     
-    # Results table with selection
+    # Results table with Send buttons
     st.subheader(f"Authors ({len(filtered)})")
     
-    # Prepare dataframe
+    if not filtered:
+        st.info("No authors match the current filters.")
+        return
+    
+    # Prepare dataframe for export
     df_data = []
     for r in filtered:
         orcid_id = r.get('orcid_id', '')
         df_data.append({
-            'Select': False,
             'Name': r.get('name', ''),
             'H-Index': r.get('h_index', ''),
             'Specialty': r.get('specialty', '') or '',
@@ -632,51 +779,141 @@ def display_results(filters):
             'all_topics': r.get('all_topics', [])
         })
     
-    if not df_data:
-        st.info("No authors match the current filters.")
-        return
-    
     df = pd.DataFrame(df_data)
     
-    # Use data editor for selection
-    edited_df = st.data_editor(
-        df,
-        column_config={
-            "Select": st.column_config.CheckboxColumn("Select", default=False, width="small"),
-            "Name": st.column_config.TextColumn("Name", width="medium"),
-            "H-Index": st.column_config.NumberColumn("H-Index", width="small"),
-            "Specialty": st.column_config.TextColumn("Specialty", width="medium"),
-            "Discipline": st.column_config.TextColumn("Discipline", width="small"),
-            "Email": st.column_config.TextColumn("Email", width="medium"),
-            "Institution": st.column_config.TextColumn("Institution", width="large"),
-            "Country": st.column_config.TextColumn("Country", width="small"),
-            "Notified": st.column_config.TextColumn("Notified", width="small"),
-            "orcid_id": None,  # Hidden
-            "all_topics": None  # Hidden
-        },
-        hide_index=True,
-        use_container_width=True,
-        disabled=['Name', 'H-Index', 'Specialty', 'Discipline', 'Email', 'Institution', 'Country', 'Notified', 'orcid_id', 'all_topics']
-    )
+    # Custom CSS for row highlighting
+    st.markdown("""
+    <style>
+    .notified-row {
+        background-color: #d4edda !important;
+        border-left: 4px solid #28a745;
+        padding: 5px;
+        margin: 2px 0;
+        border-radius: 4px;
+    }
+    .pending-row {
+        background-color: #ffffff;
+        padding: 5px;
+        margin: 2px 0;
+        border-radius: 4px;
+    }
+    .no-email-row {
+        background-color: #f8f9fa;
+        padding: 5px;
+        margin: 2px 0;
+        border-radius: 4px;
+        opacity: 0.7;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    # Get selected authors
-    selected_rows = edited_df[edited_df['Select'] == True]
+    # Table header
+    header_cols = st.columns([2.5, 0.7, 2, 1.5, 2, 1])
+    with header_cols[0]:
+        st.markdown("**Name**")
+    with header_cols[1]:
+        st.markdown("**H-Index**")
+    with header_cols[2]:
+        st.markdown("**Specialty**")
+    with header_cols[3]:
+        st.markdown("**Discipline**")
+    with header_cols[4]:
+        st.markdown("**Email**")
+    with header_cols[5]:
+        st.markdown("**Action**")
     
-    if not selected_rows.empty:
-        selected_author = {
-            'name': selected_rows.iloc[0]['Name'],
-            'email': selected_rows.iloc[0]['Email'],
-            'orcid_id': selected_rows.iloc[0]['orcid_id'],
-            'specialty': selected_rows.iloc[0]['Specialty'],
-            'discipline': selected_rows.iloc[0]['Discipline'],
-            'institution': selected_rows.iloc[0]['Institution']
-        }
-        st.session_state.selected_author = selected_author
+    st.divider()
     
-    # Export button
+    # Display rows with Send buttons (paginated for performance)
+    page_size = 50
+    total_pages = (len(filtered) + page_size - 1) // page_size
+    
+    if 'results_page' not in st.session_state:
+        st.session_state.results_page = 0
+    
+    # Pagination controls
+    if total_pages > 1:
+        col_prev, col_page, col_next = st.columns([1, 2, 1])
+        with col_prev:
+            if st.button("← Previous", disabled=st.session_state.results_page == 0):
+                st.session_state.results_page -= 1
+                st.rerun()
+        with col_page:
+            st.markdown(f"<center>Page {st.session_state.results_page + 1} of {total_pages}</center>", unsafe_allow_html=True)
+        with col_next:
+            if st.button("Next →", disabled=st.session_state.results_page >= total_pages - 1):
+                st.session_state.results_page += 1
+                st.rerun()
+    
+    # Get current page of results
+    start_idx = st.session_state.results_page * page_size
+    end_idx = min(start_idx + page_size, len(filtered))
+    page_results = filtered[start_idx:end_idx]
+    
+    # Display rows
+    for idx, author in enumerate(page_results):
+        orcid_id = author.get('orcid_id', '')
+        is_notified = orcid_id in sent_invitations
+        has_email = bool(author.get('email'))
+        
+        # Row styling based on status
+        if is_notified:
+            row_class = "notified-row"
+        elif has_email:
+            row_class = "pending-row"
+        else:
+            row_class = "no-email-row"
+        
+        cols = st.columns([2.5, 0.7, 2, 1.5, 2, 1])
+        
+        with cols[0]:
+            name_display = author.get('name', '')
+            if is_notified:
+                st.markdown(f"✅ {name_display}")
+            else:
+                st.write(name_display)
+        
+        with cols[1]:
+            st.write(author.get('h_index', ''))
+        
+        with cols[2]:
+            specialty = author.get('specialty', '') or ''
+            # Truncate long specialty names
+            if len(specialty) > 30:
+                specialty = specialty[:27] + "..."
+            st.write(specialty)
+        
+        with cols[3]:
+            st.write(author.get('discipline', ''))
+        
+        with cols[4]:
+            email = author.get('email', '')
+            if email:
+                # Truncate long emails
+                if len(email) > 25:
+                    email_display = email[:22] + "..."
+                else:
+                    email_display = email
+                st.write(email_display)
+            else:
+                st.caption("No email")
+        
+        with cols[5]:
+            if has_email:
+                btn_label = "✓ Sent" if is_notified else "Send"
+                btn_type = "secondary" if is_notified else "primary"
+                if st.button(btn_label, key=f"send_{orcid_id}_{start_idx + idx}", type=btn_type, use_container_width=True):
+                    # Open dialog for this author
+                    email_dialog(author, filters)
+            else:
+                st.button("—", disabled=True, key=f"no_email_{start_idx + idx}", use_container_width=True)
+    
+    st.divider()
+    
+    # Export buttons
     col1, col2 = st.columns(2)
     with col1:
-        csv = df.drop(columns=['Select', 'orcid_id', 'all_topics']).to_csv(index=False)
+        csv = df.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
         st.download_button(
             "Export CSV",
             data=csv,
@@ -688,7 +925,7 @@ def display_results(filters):
         # Export only with emails
         df_with_email = df[df['Email'] != '']
         if not df_with_email.empty:
-            csv_email = df_with_email.drop(columns=['Select', 'orcid_id', 'all_topics']).to_csv(index=False)
+            csv_email = df_with_email.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
             st.download_button(
                 f"Export With Email ({len(df_with_email)})",
                 data=csv_email,
@@ -902,11 +1139,6 @@ def main():
     
     # Main content
     render_search_section(filters)
-    
-    st.divider()
-    
-    # Invitation section
-    render_invitation_section(filters)
 
 
 if __name__ == "__main__":
