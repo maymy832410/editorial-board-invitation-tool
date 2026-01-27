@@ -54,7 +54,8 @@ class OpenAlexClient:
     def search_topics(
         self, 
         keywords: list[str], 
-        max_per_keyword: int = 5
+        max_per_keyword: int = 3,
+        max_total: int = 25
     ) -> tuple[list[str], list[dict]]:
         """
         Search for topic IDs matching keywords.
@@ -62,6 +63,7 @@ class OpenAlexClient:
         Args:
             keywords: List of keywords to search for
             max_per_keyword: Maximum topics to return per keyword
+            max_total: Maximum total topic IDs to return (OpenAlex has filter limits)
             
         Returns:
             Tuple of (list of topic IDs, list of topic details for display)
@@ -74,6 +76,10 @@ class OpenAlexClient:
             if not keyword:
                 continue
             
+            # Stop if we've reached the total limit
+            if len(topic_ids) >= max_total:
+                break
+            
             params = {
                 "search": keyword,
                 "per_page": max_per_keyword
@@ -83,6 +89,9 @@ class OpenAlexClient:
                 data = self._make_request("topics", params)
                 
                 for topic in data.get("results", []):
+                    if len(topic_ids) >= max_total:
+                        break
+                    
                     topic_id = topic.get("id", "").split("/")[-1]
                     if topic_id and topic_id not in topic_ids:
                         topic_ids.add(topic_id)

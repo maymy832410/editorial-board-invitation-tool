@@ -313,10 +313,13 @@ def run_search(filters):
     # Step 1: Search for topics if keywords provided
     if keywords:
         with st.spinner(f"Searching topics for: {', '.join(keywords)}..."):
-            topic_ids, topic_details = client.search_topics(keywords, max_per_keyword=5)
+            topic_ids, topic_details = client.search_topics(keywords, max_per_keyword=3, max_total=25)
         
         if topic_ids:
-            st.success(f"Found {len(topic_ids)} matching topics")
+            msg = f"Found {len(topic_ids)} matching topics"
+            if len(topic_ids) >= 25:
+                msg += " (limited to 25 for API compatibility)"
+            st.success(msg)
             
             # Show some matching topics
             with st.expander("View matching topics", expanded=False):
