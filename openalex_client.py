@@ -51,11 +51,63 @@ class OpenAlexClient:
         
         raise Exception(f"Failed to fetch data after {max_retries} retries")
     
+    def search_topics(
+        self, 
+        keywords: list[str], 
+        max_per_keyword: int = 5
+    ) -> tuple[list[str], list[dict]]:
+        """
+        Search for topic IDs matching keywords.
+        
+        Args:
+            keywords: List of keywords to search for
+            max_per_keyword: Maximum topics to return per keyword
+            
+        Returns:
+            Tuple of (list of topic IDs, list of topic details for display)
+        """
+        topic_ids = set()
+        topic_details = []
+        
+        for keyword in keywords:
+            keyword = keyword.strip()
+            if not keyword:
+                continue
+            
+            params = {
+                "search": keyword,
+                "per_page": max_per_keyword
+            }
+            
+            try:
+                data = self._make_request("topics", params)
+                
+                for topic in data.get("results", []):
+                    topic_id = topic.get("id", "").split("/")[-1]
+                    if topic_id and topic_id not in topic_ids:
+                        topic_ids.add(topic_id)
+                        topic_details.append({
+                            "id": topic_id,
+                            "name": topic.get("display_name", ""),
+                            "works_count": topic.get("works_count", 0),
+                            "keyword": keyword
+                        })
+                
+                # Small delay between keyword searches
+                time.sleep(0.1)
+                
+            except Exception:
+                # Continue with other keywords if one fails
+                continue
+        
+        return list(topic_ids), topic_details
+    
     def build_filter(
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
         country_codes: Optional[list[str]] = None,
+        topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True
     ) -> str:
         """Build the filter string for OpenAlex query."""
@@ -72,6 +124,11 @@ class OpenAlexClient:
             country_filter = "|".join(country_codes)
             filters.append(f"last_known_institutions.country_code:{country_filter}")
         
+        if topic_ids:
+            # Use OR operator (pipe) to match any of the topics
+            topic_filter = "|".join(topic_ids)
+            filters.append(f"topics.id:{topic_filter}")
+        
         if require_orcid:
             filters.append("has_orcid:true")
         
@@ -82,6 +139,7 @@ class OpenAlexClient:
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
         country_codes: Optional[list[str]] = None,
+        topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True,
         max_results: int = 1000,
         per_page: int = 200
@@ -93,6 +151,7 @@ class OpenAlexClient:
             h_index_min: Minimum h-index
             h_index_max: Maximum h-index
             country_codes: List of country codes to filter by
+            topic_ids: List of OpenAlex topic IDs to filter by (OR logic)
             require_orcid: Only return authors with ORCID
             max_results: Maximum number of results to return
             per_page: Results per API page
@@ -103,6 +162,7 @@ class OpenAlexClient:
             h_index_min=h_index_min,
             h_index_max=h_index_max,
             country_codes=country_codes,
+            topic_ids=topic_ids,
             require_orcid=require_orcid
         )
         
@@ -204,6 +264,7 @@ class OpenAlexClient:
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
         country_codes: Optional[list[str]] = None,
+        topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True
     ) -> int:
         """Get total count of authors matching filters without fetching all data."""
@@ -211,6 +272,7 @@ class OpenAlexClient:
             h_index_min=h_index_min,
             h_index_max=h_index_max,
             country_codes=country_codes,
+            topic_ids=topic_ids,
             require_orcid=require_orcid
         )
         

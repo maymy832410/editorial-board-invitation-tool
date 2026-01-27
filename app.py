@@ -173,6 +173,18 @@ def render_sidebar():
         
         search_params = st.session_state.app_state.get('search_params', {})
         
+        # Keyword Tags - NEW
+        st.markdown("**Keyword Tags** (comma-separated)")
+        keyword_tags = st.text_area(
+            "Keywords",
+            value=search_params.get('keyword_tags', ''),
+            placeholder="media, journalism, cinema, broadcasting, news",
+            help="Enter keywords to search - uses OR logic to find matching topics",
+            height=80,
+            key="keyword_tags",
+            label_visibility="collapsed"
+        )
+        
         st.markdown("**H-Index Range**")
         col1, col2 = st.columns(2)
         with col1:
@@ -197,14 +209,6 @@ def render_sidebar():
             options=list(COUNTRIES.keys()),
             default=search_params.get('countries', []),
             key="countries"
-        )
-        
-        disciplines = st.multiselect(
-            "Filter by Discipline",
-            options=ALL_DISCIPLINES,
-            default=search_params.get('disciplines', []),
-            help="Filter results after search",
-            key="disciplines"
         )
         
         max_results = st.number_input(
@@ -254,10 +258,10 @@ def render_sidebar():
                 st.warning("Click again to confirm reset")
         
         return {
+            'keyword_tags': keyword_tags,
             'h_min': h_min,
             'h_max': h_max,
             'countries': countries,
-            'disciplines': disciplines,
             'max_results': max_results,
             'concurrent': concurrent,
             'delay': delay,
@@ -277,14 +281,10 @@ def render_search_section(filters):
         search_clicked = st.button("Search OpenAlex", type="primary", use_container_width=True)
     
     with col2:
-        fetch_emails_clicked = st.button(
-            "Fetch Emails",
-            use_container_width=True,
-            disabled=not st.session_state.app_state.get('search_results')
-        )
+        stop_clicked = st.button("Stop", use_container_width=True)
     
     with col3:
-        stop_clicked = st.button("Stop", use_container_width=True)
+        pass  # Reserved for future use
     
     if stop_clicked:
         st.session_state.stop_fetching = True
@@ -293,43 +293,63 @@ def render_search_section(filters):
     if search_clicked:
         run_search(filters)
     
-    # Handle email fetching
-    if fetch_emails_clicked:
-        run_email_fetch(filters)
-    
-    # Display results
-    display_results(filters['disciplines'])
+    # Display results (returns filtered list for email fetching)
+    display_results(filters)
 
 
 def run_search(filters):
-    """Execute the author search."""
+    """Execute the author search with keyword-based topic filtering."""
     
     country_codes = [COUNTRIES[c] for c in filters['countries']] if filters['countries'] else None
     
     client = OpenAlexClient()
     
+    # Parse keyword tags
+    keyword_tags = filters.get('keyword_tags', '')
+    keywords = [k.strip() for k in keyword_tags.split(',') if k.strip()]
+    
+    topic_ids = None
+    
+    # Step 1: Search for topics if keywords provided
+    if keywords:
+        with st.spinner(f"Searching topics for: {', '.join(keywords)}..."):
+            topic_ids, topic_details = client.search_topics(keywords, max_per_keyword=5)
+        
+        if topic_ids:
+            st.success(f"Found {len(topic_ids)} matching topics")
+            
+            # Show some matching topics
+            with st.expander("View matching topics", expanded=False):
+                for t in topic_details[:15]:
+                    st.write(f"- **{t['name']}** ({t['works_count']:,} works) - from '{t['keyword']}'")
+        else:
+            st.warning("No topics found for the given keywords. Searching without topic filter.")
+    
     # Show search info
     search_info = f"H-index: {filters['h_min']}-{filters['h_max']}"
     if filters['countries']:
         search_info += f" | Countries: {', '.join(filters['countries'])}"
+    if keywords:
+        search_info += f" | Keywords: {', '.join(keywords[:3])}{'...' if len(keywords) > 3 else ''}"
     st.info(f"Searching: {search_info}")
     
-    # Get total count
+    # Step 2: Get total count with topic filter
     with st.spinner("Counting matching authors..."):
         total_count = client.get_total_count(
             h_index_min=filters['h_min'],
             h_index_max=filters['h_max'],
             country_codes=country_codes,
+            topic_ids=topic_ids,
             require_orcid=True
         )
     
     if total_count == 0:
-        st.warning("No authors found. Try adjusting filters.")
+        st.warning("No authors found. Try adjusting filters or keywords.")
         return
     
     st.success(f"Found {total_count:,} authors. Fetching up to {filters['max_results']:,}...")
     
-    # Fetch authors
+    # Step 3: Fetch authors with topic filter
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -339,6 +359,7 @@ def run_search(filters):
             h_index_min=filters['h_min'],
             h_index_max=filters['h_max'],
             country_codes=country_codes,
+            topic_ids=topic_ids,
             require_orcid=True,
             max_results=filters['max_results']
         )):
@@ -357,10 +378,10 @@ def run_search(filters):
         st.session_state.app_state['search_results'] = results
         st.session_state.app_state['processed_orcids'] = set()
         st.session_state.app_state['search_params'] = {
+            'keyword_tags': keyword_tags,
             'h_index_min': filters['h_min'],
             'h_index_max': filters['h_max'],
             'countries': filters['countries'],
-            'disciplines': filters['disciplines'],
             'max_results': filters['max_results']
         }
         save_state()
@@ -369,23 +390,24 @@ def run_search(filters):
         st.error(f"Error: {str(e)}")
 
 
-def run_email_fetch(filters):
-    """Fetch emails for authors using async."""
+def run_email_fetch_filtered(filters):
+    """Fetch emails ONLY for currently filtered authors."""
     
-    results = st.session_state.app_state.get('search_results', [])
-    if not results:
-        st.warning("No authors to process. Search first.")
+    # Get filtered authors from session state
+    filtered_authors = st.session_state.get('filtered_authors', [])
+    if not filtered_authors:
+        st.warning("No filtered authors to process.")
         return
     
     processed = st.session_state.app_state.get('processed_orcids', set())
     if isinstance(processed, list):
         processed = set(processed)
     
-    # Get authors without emails
+    # Get only filtered authors without emails
     to_process = [
         {'orcid_id': a['orcid_id'], 'name': a['name']}
-        for a in results
-        if a.get('orcid_id') and a['orcid_id'] not in processed
+        for a in filtered_authors
+        if a.get('orcid_id') and a['orcid_id'] not in processed and not a.get('email')
     ]
     
     if not to_process:
@@ -455,9 +477,9 @@ def run_email_fetch(filters):
         st.session_state.app_state['processed_orcids'] = processed
         
         # Update metrics
-        done = len(processed)
-        progress_bar.progress(done / len(results))
-        processed_metric.metric("Processed", f"{done}/{len(results)}")
+        processed_count = batch_start + len(batch)
+        progress_bar.progress(min(processed_count / total, 1.0))
+        processed_metric.metric("Processed", f"{processed_count}/{total}")
         found_metric.metric("Emails Found", emails_found)
         
         elapsed = time.time() - start_time
@@ -471,8 +493,8 @@ def run_email_fetch(filters):
     st.session_state.stop_fetching = False
 
 
-def display_results(discipline_filter):
-    """Display search results with selection."""
+def display_results(filters):
+    """Display search results with selection and filtering."""
     
     results = st.session_state.app_state.get('search_results', [])
     
@@ -480,39 +502,38 @@ def display_results(discipline_filter):
         st.info("No results yet. Use the search button above.")
         return
     
-    # Apply discipline filter
-    if discipline_filter:
-        filtered = [r for r in results if r.get('discipline') in discipline_filter]
-    else:
-        filtered = results
+    filtered = results.copy()
     
     sent_invitations = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(sent_invitations, list):
         sent_invitations = set(sent_invitations)
     
-    # Collect all unique specialties from results for autocomplete
+    # Collect unique disciplines and specialties from results
+    all_disciplines = set()
     all_specialties = set()
     for r in results:
+        if r.get('discipline'):
+            all_disciplines.add(r['discipline'])
         if r.get('all_topics'):
             all_specialties.update(r['all_topics'])
         elif r.get('specialty'):
             all_specialties.add(r['specialty'])
     
-    # Filter options - Row 1: Keyword search and Specialty dropdown
-    col_kw1, col_kw2 = st.columns(2)
+    # Filter options - Row 1: Discipline and Specialty filters
+    col_f1, col_f2 = st.columns(2)
     
-    with col_kw1:
-        # Keyword search filter
-        keyword_search = st.text_input(
-            "Keyword Search",
-            value="",
-            placeholder="e.g., media, journalism, cinema, AI...",
-            key="keyword_filter",
-            help="Filter authors whose topics contain this keyword (case-insensitive)"
+    with col_f1:
+        # Discipline filter (multiselect)
+        selected_disciplines = st.multiselect(
+            "Filter by Discipline",
+            options=sorted(all_disciplines),
+            default=[],
+            key="discipline_filter",
+            help="Filter by broad discipline category"
         )
     
-    with col_kw2:
-        # Specialty autocomplete
+    with col_f2:
+        # Specialty filter (single select with search)
         selected_specialty = st.selectbox(
             "Filter by Specialty",
             options=["All Specialties"] + sorted(all_specialties),
@@ -520,14 +541,9 @@ def display_results(discipline_filter):
             help="Select a specific research topic"
         )
     
-    # Apply keyword filter (searches through all topics)
-    if keyword_search.strip():
-        keyword_lower = keyword_search.strip().lower()
-        filtered = [
-            r for r in filtered 
-            if any(keyword_lower in topic.lower() for topic in (r.get('all_topics') or []))
-            or keyword_lower in (r.get('specialty') or '').lower()
-        ]
+    # Apply discipline filter
+    if selected_disciplines:
+        filtered = [r for r in filtered if r.get('discipline') in selected_disciplines]
     
     # Apply specialty filter
     if selected_specialty != "All Specialties":
@@ -551,10 +567,36 @@ def display_results(discipline_filter):
     if show_only_not_sent:
         filtered = [r for r in filtered if r.get('orcid_id') not in sent_invitations]
     
+    # Store filtered list in session state for email fetching
+    st.session_state.filtered_authors = filtered
+    
+    # Count authors without email in filtered list
+    without_email = sum(1 for r in filtered if not r.get('email'))
+    
+    # Fetch Emails button - only for filtered authors
+    st.divider()
+    col_btn1, col_btn2 = st.columns([2, 1])
+    with col_btn1:
+        fetch_btn_label = f"Fetch Emails for {without_email} Filtered Authors" if without_email > 0 else "All Filtered Authors Have Emails"
+        fetch_emails_clicked = st.button(
+            fetch_btn_label,
+            type="primary" if without_email > 0 else "secondary",
+            use_container_width=True,
+            disabled=without_email == 0
+        )
+    with col_btn2:
+        stop_clicked = st.button("Stop Fetching", use_container_width=True)
+    
+    if stop_clicked:
+        st.session_state.stop_fetching = True
+    
+    if fetch_emails_clicked:
+        run_email_fetch_filtered(filters)
+    
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Total Authors", len(filtered))
+        st.metric("Filtered Authors", len(filtered))
     with col2:
         with_email = sum(1 for r in filtered if r.get('email'))
         st.metric("With Email", with_email)
@@ -562,8 +604,7 @@ def display_results(discipline_filter):
         sent_count = sum(1 for r in filtered if r.get('orcid_id') in sent_invitations)
         st.metric("Notified", sent_count)
     with col4:
-        pending = with_email - sent_count
-        st.metric("Pending", max(0, pending))
+        st.metric("Need Email", without_email)
     
     st.divider()
     
