@@ -1,0 +1,208 @@
+"""OpenAlex API client for searching authors."""
+
+import time
+from typing import Generator, Optional
+import requests
+
+from config import OPENALEX_BASE_URL, OPENALEX_EMAIL
+
+
+class OpenAlexClient:
+    """Client for querying OpenAlex API for author data."""
+    
+    def __init__(self, email: str = OPENALEX_EMAIL):
+        self.email = email
+        self.base_url = OPENALEX_BASE_URL
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": f"AuthorEmailFinder/1.0 (mailto:{email})"
+        })
+    
+    def _make_request(self, endpoint: str, params: dict, max_retries: int = 3) -> dict:
+        """Make a request with retry logic and exponential backoff."""
+        params["mailto"] = self.email
+        url = f"{self.base_url}/{endpoint}"
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, timeout=30)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    # Rate limited - wait and retry
+                    wait_time = (2 ** attempt) * 2
+                    time.sleep(wait_time)
+                    continue
+                elif response.status_code >= 500:
+                    # Server error - retry
+                    wait_time = (2 ** attempt) * 2
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    response.raise_for_status()
+                    
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 2
+                    time.sleep(wait_time)
+                    continue
+                raise e
+        
+        raise Exception(f"Failed to fetch data after {max_retries} retries")
+    
+    def build_filter(
+        self,
+        h_index_min: Optional[int] = None,
+        h_index_max: Optional[int] = None,
+        country_codes: Optional[list[str]] = None,
+        require_orcid: bool = True
+    ) -> str:
+        """Build the filter string for OpenAlex query."""
+        filters = []
+        
+        if h_index_min is not None:
+            filters.append(f"summary_stats.h_index:>{h_index_min - 1}")
+        
+        if h_index_max is not None:
+            filters.append(f"summary_stats.h_index:<{h_index_max + 1}")
+        
+        if country_codes:
+            # OpenAlex uses pipe for OR within a filter
+            country_filter = "|".join(country_codes)
+            filters.append(f"last_known_institutions.country_code:{country_filter}")
+        
+        if require_orcid:
+            filters.append("has_orcid:true")
+        
+        return ",".join(filters)
+    
+    def search_authors(
+        self,
+        h_index_min: Optional[int] = None,
+        h_index_max: Optional[int] = None,
+        country_codes: Optional[list[str]] = None,
+        require_orcid: bool = True,
+        max_results: int = 1000,
+        per_page: int = 200
+    ) -> Generator[dict, None, None]:
+        """
+        Search for authors with specified filters.
+        
+        Args:
+            h_index_min: Minimum h-index
+            h_index_max: Maximum h-index
+            country_codes: List of country codes to filter by
+            require_orcid: Only return authors with ORCID
+            max_results: Maximum number of results to return
+            per_page: Results per API page
+        
+        Yields author records one by one, handling pagination automatically.
+        """
+        filter_str = self.build_filter(
+            h_index_min=h_index_min,
+            h_index_max=h_index_max,
+            country_codes=country_codes,
+            require_orcid=require_orcid
+        )
+        
+        cursor = "*"
+        total_yielded = 0
+        
+        while cursor and total_yielded < max_results:
+            params = {
+                "filter": filter_str,
+                "select": "id,display_name,orcid,summary_stats,last_known_institutions,works_count,cited_by_count,topics",
+                "per_page": min(per_page, max_results - total_yielded),
+                "cursor": cursor
+            }
+            
+            data = self._make_request("authors", params)
+            
+            results = data.get("results", [])
+            if not results:
+                break
+            
+            for author in results:
+                yield self._parse_author(author)
+                total_yielded += 1
+                
+                if total_yielded >= max_results:
+                    break
+            
+            # Get next cursor for pagination
+            cursor = data.get("meta", {}).get("next_cursor")
+            
+            # Small delay to be polite
+            time.sleep(0.1)
+    
+    def _parse_author(self, author: dict) -> dict:
+        """Parse author data into a cleaner format."""
+        from disciplines import get_discipline_from_topics
+        
+        # Extract ORCID ID from URL
+        orcid_url = author.get("orcid")
+        orcid_id = None
+        if orcid_url:
+            orcid_id = orcid_url.split("/")[-1]
+        
+        # Get institution info
+        institution_name = None
+        institution_country = None
+        institutions = author.get("last_known_institutions", [])
+        if institutions:
+            inst = institutions[0]
+            institution_name = inst.get("display_name")
+            institution_country = inst.get("country_code")
+        
+        # Get h-index
+        summary_stats = author.get("summary_stats", {})
+        h_index = summary_stats.get("h_index")
+        
+        # Get top topics/research areas
+        topics = author.get("topics", [])
+        top_topics = []
+        for topic in topics[:3]:  # Get top 3 topics
+            topic_name = topic.get("display_name")
+            if topic_name:
+                top_topics.append(topic_name)
+        
+        # Get discipline from topics
+        discipline = get_discipline_from_topics(topics)
+        
+        return {
+            "author_id": author.get("id"),
+            "name": author.get("display_name"),
+            "orcid_id": orcid_id,
+            "orcid_url": orcid_url,
+            "h_index": h_index,
+            "works_count": author.get("works_count"),
+            "cited_by_count": author.get("cited_by_count"),
+            "institution": institution_name,
+            "country": institution_country,
+            "discipline": discipline,
+            "research_areas": ", ".join(top_topics) if top_topics else None,
+        }
+    
+    def get_total_count(
+        self,
+        h_index_min: Optional[int] = None,
+        h_index_max: Optional[int] = None,
+        country_codes: Optional[list[str]] = None,
+        require_orcid: bool = True
+    ) -> int:
+        """Get total count of authors matching filters without fetching all data."""
+        filter_str = self.build_filter(
+            h_index_min=h_index_min,
+            h_index_max=h_index_max,
+            country_codes=country_codes,
+            require_orcid=require_orcid
+        )
+        
+        params = {
+            "filter": filter_str,
+            "per_page": 1
+        }
+        
+        data = self._make_request("authors", params)
+        return data.get("meta", {}).get("count", 0)
