@@ -498,13 +498,36 @@ def display_results(discipline_filter):
         elif r.get('specialty'):
             all_specialties.add(r['specialty'])
     
-    # Filter options - Row 1: Specialty autocomplete
-    selected_specialty = st.selectbox(
-        "Filter by Specialty (autocomplete)",
-        options=["All Specialties"] + sorted(all_specialties),
-        key="specialty_filter",
-        help="Search and select a specific research topic"
-    )
+    # Filter options - Row 1: Keyword search and Specialty dropdown
+    col_kw1, col_kw2 = st.columns(2)
+    
+    with col_kw1:
+        # Keyword search filter
+        keyword_search = st.text_input(
+            "Keyword Search",
+            value="",
+            placeholder="e.g., media, journalism, cinema, AI...",
+            key="keyword_filter",
+            help="Filter authors whose topics contain this keyword (case-insensitive)"
+        )
+    
+    with col_kw2:
+        # Specialty autocomplete
+        selected_specialty = st.selectbox(
+            "Filter by Specialty",
+            options=["All Specialties"] + sorted(all_specialties),
+            key="specialty_filter",
+            help="Select a specific research topic"
+        )
+    
+    # Apply keyword filter (searches through all topics)
+    if keyword_search.strip():
+        keyword_lower = keyword_search.strip().lower()
+        filtered = [
+            r for r in filtered 
+            if any(keyword_lower in topic.lower() for topic in (r.get('all_topics') or []))
+            or keyword_lower in (r.get('specialty') or '').lower()
+        ]
     
     # Apply specialty filter
     if selected_specialty != "All Specialties":
