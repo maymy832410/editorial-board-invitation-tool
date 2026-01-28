@@ -16,6 +16,7 @@ from config import (
 )
 from openalex_client import OpenAlexClient
 from orcid_async import fetch_emails_async
+from openai_email_async import AsyncOpenAIEmailClient
 from progress_manager import StateManager
 from disciplines import ALL_DISCIPLINES
 from email_sender import EmailSender
@@ -367,7 +368,7 @@ def render_sidebar():
         st.divider()
         
         # Speed Settings
-        st.subheader("Email Fetch Speed")
+        st.subheader("Email Fetch Settings")
         
         concurrent = st.slider(
             "Concurrent requests",
@@ -386,6 +387,22 @@ def render_sidebar():
             step=0.5,
             key="delay"
         )
+        
+        st.divider()
+        
+        # Web Search Email Finding
+        st.subheader("Web Search for Emails")
+        
+        use_openai = st.checkbox(
+            "Enable web search for emails",
+            value=True,
+            help="Use OpenAI to search the web and find real emails",
+            key="use_openai"
+        )
+        
+        if use_openai:
+            st.caption("🔍 Searches faculty pages, Google Scholar, ResearchGate")
+            st.caption("💰 Uses GPT-4o-mini with web search")
         
         st.divider()
         
@@ -409,7 +426,8 @@ def render_sidebar():
             'max_results': max_results,
             'concurrent': concurrent,
             'delay': delay,
-            'publisher': selected_publisher
+            'publisher': selected_publisher,
+            'use_openai': use_openai
         }
 
 
@@ -538,7 +556,10 @@ def run_search(filters):
 
 
 def run_email_fetch_filtered(filters):
-    """Fetch emails ONLY for currently filtered authors."""
+    """Fetch emails ONLY for currently filtered authors.
+    
+    Uses ORCID API first, then falls back to OpenAI inference for missing emails.
+    """
     
     # Get filtered authors from session state
     filtered_authors = st.session_state.get('filtered_authors', [])
@@ -552,7 +573,8 @@ def run_email_fetch_filtered(filters):
     
     # Get only filtered authors without emails
     to_process = [
-        {'orcid_id': a['orcid_id'], 'name': a['name']}
+        {'orcid_id': a['orcid_id'], 'name': a['name'], 'institution': a.get('institution'), 
+         'country': a.get('country'), 'specialty': a.get('specialty')}
         for a in filtered_authors
         if a.get('orcid_id') and a['orcid_id'] not in processed and not a.get('email')
     ]
@@ -562,15 +584,18 @@ def run_email_fetch_filtered(filters):
         return
     
     st.session_state.stop_fetching = False
+    use_openai = filters.get('use_openai', True)
     
     # Progress display
     progress_bar = st.progress(0)
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         processed_metric = st.empty()
     with col2:
         found_metric = st.empty()
     with col3:
+        openai_metric = st.empty()
+    with col4:
         speed_metric = st.empty()
     
     status_text = st.empty()
@@ -578,7 +603,8 @@ def run_email_fetch_filtered(filters):
     # Process in batches
     batch_size = filters['concurrent'] * 5
     total = len(to_process)
-    emails_found = 0
+    orcid_emails_found = 0
+    openai_emails_found = 0
     start_time = time.time()
     
     for batch_start in range(0, total, batch_size):
@@ -587,9 +613,9 @@ def run_email_fetch_filtered(filters):
             break
         
         batch = to_process[batch_start:batch_start + batch_size]
-        status_text.text(f"Processing batch {batch_start // batch_size + 1}...")
+        status_text.text(f"Fetching from ORCID (batch {batch_start // batch_size + 1})...")
         
-        # Run async fetch
+        # Run async ORCID fetch
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -601,25 +627,57 @@ def run_email_fetch_filtered(filters):
                     delay_between_batches=filters['delay']
                 )
             )
+            
+            # Update results from ORCID
+            authors_without_email = []
+            for result in batch_results:
+                orcid_id = result.get('orcid_id')
+                email = result.get('email')
+                
+                if orcid_id:
+                    # Update in search results
+                    for author in st.session_state.app_state['search_results']:
+                        if author.get('orcid_id') == orcid_id:
+                            if email:
+                                author['email'] = email
+                                author['email_source'] = 'orcid'
+                                orcid_emails_found += 1
+                            else:
+                                # Track authors without email for OpenAI fallback
+                                authors_without_email.append(author)
+                            break
+                    
+                    processed.add(orcid_id)
+            
+            # Tavily + GPT-4o-mini fallback for authors without ORCID email
+            if use_openai and authors_without_email:
+                status_text.text(f"Searching web for emails ({len(authors_without_email)} authors)...")
+                
+                async def fetch_tavily_emails():
+                    async with AsyncOpenAIEmailClient(
+                        max_concurrent=min(5, filters['concurrent']),
+                        delay_between_requests=0.5
+                    ) as client:
+                        return await client.fetch_emails_batch(authors_without_email)
+                
+                tavily_results = loop.run_until_complete(fetch_tavily_emails())
+                
+                # Update with web search results
+                for result in tavily_results:
+                    email = result.get('email')
+                    if email:
+                        orcid_id = result.get('orcid_id')
+                        for author in st.session_state.app_state['search_results']:
+                            if author.get('orcid_id') == orcid_id:
+                                author['email'] = email
+                                author['all_emails'] = result.get('all_emails', email)
+                                author['email_source'] = result.get('email_source', 'web_search')
+                                author['email_confidence'] = result.get('email_confidence', 'unknown')
+                                openai_emails_found += 1
+                                break
+                
         finally:
             loop.close()
-        
-        # Update results
-        for result in batch_results:
-            orcid_id = result.get('orcid_id')
-            email = result.get('email')
-            
-            if orcid_id:
-                # Update in search results
-                for author in st.session_state.app_state['search_results']:
-                    if author.get('orcid_id') == orcid_id:
-                        author['email'] = email
-                        break
-                
-                processed.add(orcid_id)
-                
-                if email:
-                    emails_found += 1
         
         st.session_state.app_state['processed_orcids'] = processed
         
@@ -627,7 +685,8 @@ def run_email_fetch_filtered(filters):
         processed_count = batch_start + len(batch)
         progress_bar.progress(min(processed_count / total, 1.0))
         processed_metric.metric("Processed", f"{processed_count}/{total}")
-        found_metric.metric("Emails Found", emails_found)
+        found_metric.metric("ORCID Emails", orcid_emails_found)
+        openai_metric.metric("Web Found", openai_emails_found)
         
         elapsed = time.time() - start_time
         speed = processed_count / elapsed if elapsed > 0 else 0
@@ -636,7 +695,8 @@ def run_email_fetch_filtered(filters):
         # Auto-save
         save_state()
     
-    status_text.text("Email fetching complete!")
+    total_found = orcid_emails_found + openai_emails_found
+    status_text.text(f"Complete! Found {total_found} emails ({orcid_emails_found} ORCID + {openai_emails_found} Web)")
     st.session_state.stop_fetching = False
 
 
@@ -772,6 +832,7 @@ def display_results(filters):
             'Specialty': r.get('specialty', '') or '',
             'Discipline': r.get('discipline', ''),
             'Email': r.get('email', '') or '',
+            'All_Emails': r.get('all_emails', '') or r.get('email', '') or '',
             'Institution': r.get('institution', ''),
             'Country': r.get('country', ''),
             'Notified': '✓' if orcid_id in sent_invitations else '',
@@ -888,13 +949,21 @@ def display_results(filters):
         
         with cols[4]:
             email = author.get('email', '')
+            all_emails = author.get('all_emails', '')
             if email:
+                # Show all emails if multiple found, otherwise just primary
+                display_email = all_emails if all_emails else email
                 # Truncate long emails
-                if len(email) > 25:
-                    email_display = email[:22] + "..."
+                if len(display_email) > 30:
+                    email_display = display_email[:27] + "..."
                 else:
-                    email_display = email
-                st.write(email_display)
+                    email_display = display_email
+                # Show source indicator
+                source = author.get('email_source', 'orcid')
+                if source == 'web_search':
+                    st.write(f"🔍 {email_display}")
+                else:
+                    st.write(email_display)
             else:
                 st.caption("No email")
         
