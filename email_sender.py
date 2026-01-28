@@ -152,6 +152,9 @@ class EmailSender:
             context = ssl.create_default_context()
             
             # Connect and send
+            # Use smtp_username if provided (e.g., for AWS SES), otherwise use email
+            smtp_user = creds.get("smtp_username", creds["email"])
+            
             if creds.get("use_ssl", True):
                 # SSL connection (port 465)
                 with smtplib.SMTP_SSL(
@@ -159,7 +162,7 @@ class EmailSender:
                     creds["smtp_port"],
                     context=context
                 ) as server:
-                    server.login(creds["email"], creds["password"])
+                    server.login(smtp_user, creds["password"])
                     server.sendmail(
                         creds["email"],
                         to_email,
@@ -169,7 +172,7 @@ class EmailSender:
                 # TLS connection (port 587)
                 with smtplib.SMTP(creds["smtp_server"], creds["smtp_port"]) as server:
                     server.starttls(context=context)
-                    server.login(creds["email"], creds["password"])
+                    server.login(smtp_user, creds["password"])
                     server.sendmail(
                         creds["email"],
                         to_email,
@@ -247,6 +250,9 @@ class EmailSender:
         try:
             context = ssl.create_default_context()
             
+            # Use smtp_username if provided (e.g., for AWS SES), otherwise use email
+            smtp_user = creds.get("smtp_username", creds["email"])
+            
             if creds.get("use_ssl", True):
                 with smtplib.SMTP_SSL(
                     creds["smtp_server"],
@@ -254,7 +260,7 @@ class EmailSender:
                     context=context,
                     timeout=10
                 ) as server:
-                    server.login(creds["email"], creds["password"])
+                    server.login(smtp_user, creds["password"])
                     return True, "Connection successful!"
             else:
                 with smtplib.SMTP(
@@ -263,7 +269,7 @@ class EmailSender:
                     timeout=10
                 ) as server:
                     server.starttls(context=context)
-                    server.login(creds["email"], creds["password"])
+                    server.login(smtp_user, creds["password"])
                     return True, "Connection successful!"
                     
         except smtplib.SMTPAuthenticationError:
