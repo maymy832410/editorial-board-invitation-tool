@@ -7,6 +7,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from email.utils import formataddr
+from email.header import Header
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -102,7 +104,16 @@ class EmailSender:
         if publisher_id not in self.credentials:
             return False, f"Unknown publisher: {publisher_id}"
         
+        # Validate recipient email
+        if not to_email or '@' not in to_email:
+            return False, f"Invalid recipient email: '{to_email}'"
+        
         creds = self.credentials[publisher_id]
+        
+        # Validate sender email
+        sender_email = creds.get('email', '')
+        if not sender_email or '@' not in sender_email:
+            return False, f"Invalid sender email in credentials"
         
         try:
             # Create message - use mixed for attachments
@@ -112,10 +123,13 @@ class EmailSender:
                 message = MIMEMultipart("alternative")
             
             message["Subject"] = subject
-            message["From"] = f"{creds['name']} <{creds['email']}>"
+            # Use formataddr to properly encode names with special characters
+            message["From"] = formataddr((creds['name'], creds['email']))
             
             if to_name:
-                message["To"] = f"{to_name} <{to_email}>"
+                # Sanitize to_name - remove characters that break email headers
+                safe_name = ''.join(c for c in to_name if c.isalnum() or c in ' .-')
+                message["To"] = formataddr((safe_name, to_email))
             else:
                 message["To"] = to_email
             
