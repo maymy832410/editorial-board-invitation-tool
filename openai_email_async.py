@@ -61,11 +61,12 @@ class AsyncEmailFinderClient:
         # Try to initialize Tavily
         try:
             from tavily import TavilyClient
-            self.tavily_client = TavilyClient(api_key=self.tavily_api_key)
+            self.tavily_client = TavilyClient(self.tavily_api_key)  # API key as positional arg
             # Test with a simple query
             self.tavily_client.search("test", max_results=1)
             self.tavily_available = True
-        except Exception:
+        except Exception as e:
+            print(f"Tavily initialization failed: {e}")
             self.tavily_available = False
         
         return self
@@ -106,7 +107,7 @@ class AsyncEmailFinderClient:
             query += f" {institution}"
         
         try:
-            results = self.tavily_client.search(query, max_results=5)
+            results = self.tavily_client.search(query, search_depth="advanced", max_results=5)
             
             # Combine all result content
             combined_text = []
