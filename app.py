@@ -390,19 +390,27 @@ def render_sidebar():
         
         st.divider()
         
-        # Web Search Email Finding
-        st.subheader("Web Search for Emails")
+        # Email Search Options
+        st.subheader("Email Search Options")
         
-        use_openai = st.checkbox(
-            "Enable web search for emails",
+        st.caption("ORCID API is always used first (free)")
+        
+        use_tavily = st.checkbox(
+            "Enable Tavily search",
             value=True,
-            help="Use OpenAI to search the web and find real emails",
-            key="use_openai"
+            help="Tavily + GPT-4o-mini extraction (lower cost)",
+            key="use_tavily"
         )
         
-        if use_openai:
+        use_openai_web = st.checkbox(
+            "Enable OpenAI web search",
+            value=True,
+            help="OpenAI Responses API with web_search (fallback, higher cost)",
+            key="use_openai_web"
+        )
+        
+        if use_tavily or use_openai_web:
             st.caption("🔍 Searches faculty pages, Google Scholar, ResearchGate")
-            st.caption("💰 Uses GPT-4o-mini with web search")
         
         st.divider()
         
@@ -427,7 +435,8 @@ def render_sidebar():
             'concurrent': concurrent,
             'delay': delay,
             'publisher': selected_publisher,
-            'use_openai': use_openai
+            'use_tavily': use_tavily,
+            'use_openai_web': use_openai_web
         }
 
 
@@ -584,7 +593,8 @@ def run_email_fetch_filtered(filters):
         return
     
     st.session_state.stop_fetching = False
-    use_openai = filters.get('use_openai', True)
+    use_tavily = filters.get('use_tavily', True)
+    use_openai_web = filters.get('use_openai_web', True)
     
     # Progress display
     progress_bar = st.progress(0)
@@ -649,21 +659,25 @@ def run_email_fetch_filtered(filters):
                     
                     processed.add(orcid_id)
             
-            # Tavily + GPT-4o-mini fallback for authors without ORCID email
-            if use_openai and authors_without_email:
+            # Web search fallback for authors without ORCID email
+            if (use_tavily or use_openai_web) and authors_without_email:
                 status_text.text(f"Searching web for emails ({len(authors_without_email)} authors)...")
                 
-                async def fetch_tavily_emails():
+                async def fetch_web_emails():
                     async with AsyncOpenAIEmailClient(
                         max_concurrent=min(5, filters['concurrent']),
                         delay_between_requests=0.5
                     ) as client:
-                        return await client.fetch_emails_batch(authors_without_email)
+                        return await client.fetch_emails_batch(
+                            authors_without_email,
+                            use_tavily=use_tavily,
+                            use_openai_web=use_openai_web
+                        )
                 
-                tavily_results = loop.run_until_complete(fetch_tavily_emails())
+                web_results = loop.run_until_complete(fetch_web_emails())
                 
                 # Update with web search results
-                for result in tavily_results:
+                for result in web_results:
                     email = result.get('email')
                     if email:
                         orcid_id = result.get('orcid_id')

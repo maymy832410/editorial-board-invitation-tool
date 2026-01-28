@@ -210,19 +210,21 @@ class AsyncEmailFinderClient:
         author_name: str,
         institution: Optional[str] = None,
         country: Optional[str] = None,
-        research_area: Optional[str] = None
+        research_area: Optional[str] = None,
+        use_tavily: bool = True,
+        use_openai_web: bool = True
     ) -> Dict:
         """
         Find email for an author using multiple methods.
         
         Priority:
-        1. Tavily search + GPT-4o-mini extraction
-        2. OpenAI web_search (fallback)
+        1. Tavily search + GPT-4o-mini extraction (if use_tavily=True)
+        2. OpenAI web_search fallback (if use_openai_web=True)
         3. Return null
         """
         async with self.semaphore:
             # Method 1: Tavily + GPT-4o-mini (cheap)
-            if self.tavily_available:
+            if use_tavily and self.tavily_available:
                 tavily_results = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: self._search_tavily(author_name, institution)
@@ -240,18 +242,19 @@ class AsyncEmailFinderClient:
                         }
             
             # Method 2: OpenAI web_search (fallback)
-            openai_result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._search_openai_web(author_name, institution)
-            )
-            
-            if openai_result.get("primary"):
-                return {
-                    "email": openai_result["primary"],
-                    "all_emails": ", ".join(openai_result["emails"]),
-                    "confidence": "high",
-                    "source": openai_result["source"]
-                }
+            if use_openai_web:
+                openai_result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._search_openai_web(author_name, institution)
+                )
+                
+                if openai_result.get("primary"):
+                    return {
+                        "email": openai_result["primary"],
+                        "all_emails": ", ".join(openai_result["emails"]),
+                        "confidence": "high",
+                        "source": openai_result["source"]
+                    }
             
             # Method 3: Return null
             return {
@@ -261,13 +264,20 @@ class AsyncEmailFinderClient:
                 "source": "not_found"
             }
     
-    async def _fetch_single(self, author: Dict) -> Dict:
+    async def _fetch_single(
+        self,
+        author: Dict,
+        use_tavily: bool = True,
+        use_openai_web: bool = True
+    ) -> Dict:
         """Fetch email for a single author."""
         result = await self.find_email(
             author_name=author.get("name", ""),
             institution=author.get("institution"),
             country=author.get("country"),
-            research_area=author.get("research_area") or author.get("specialty")
+            research_area=author.get("research_area") or author.get("specialty"),
+            use_tavily=use_tavily,
+            use_openai_web=use_openai_web
         )
         
         # Add delay between requests
@@ -285,10 +295,16 @@ class AsyncEmailFinderClient:
         self,
         authors: List[Dict],
         on_result: Optional[Callable] = None,
-        on_progress: Optional[Callable] = None
+        on_progress: Optional[Callable] = None,
+        use_tavily: bool = True,
+        use_openai_web: bool = True
     ) -> List[Dict]:
         """
         Find emails for a batch of authors with parallel processing.
+        
+        Args:
+            use_tavily: Enable Tavily + GPT-4o-mini search
+            use_openai_web: Enable OpenAI web_search fallback
         """
         results = []
         total = len(authors)
@@ -300,7 +316,7 @@ class AsyncEmailFinderClient:
             batch = authors[i:i + batch_size]
             
             # Create tasks for parallel execution
-            tasks = [self._fetch_single(author) for author in batch]
+            tasks = [self._fetch_single(author, use_tavily, use_openai_web) for author in batch]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
             for j, result in enumerate(batch_results):
