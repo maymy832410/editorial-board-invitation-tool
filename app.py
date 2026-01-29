@@ -40,13 +40,17 @@ st.set_page_config(
 # Initialize state manager
 state_mgr = StateManager()
 
-# Initialize email sender (may fail if credentials missing)
-try:
-    email_sender = EmailSender()
-    EMAIL_AVAILABLE = True
-except FileNotFoundError:
-    email_sender = None
-    EMAIL_AVAILABLE = False
+# Initialize email sender as cached resource (shared across all users for rotation)
+@st.cache_resource
+def get_email_sender():
+    """Get cached EmailSender instance (shared across all users for round-robin rotation)."""
+    try:
+        return EmailSender()
+    except FileNotFoundError:
+        return None
+
+email_sender = get_email_sender()
+EMAIL_AVAILABLE = email_sender is not None
 
 # Load saved state
 if 'app_state' not in st.session_state:
@@ -184,14 +188,16 @@ def email_dialog(author: dict, filters: dict):
                         st.error(f"PDF generation failed: {str(e)}")
                         pdf_bytes = None
                 
-                # Send email
+                # Send email (use force_account if set)
+                force_account = st.session_state.get('force_account')
                 success, msg = email_sender.send_email(
                     publisher_id=publisher_id,
                     to_email=to_email,
                     subject=subject,
                     body=body,
                     to_name=author['name'],
-                    pdf_attachment=pdf_bytes
+                    pdf_attachment=pdf_bytes,
+                    force_account_email=force_account
                 )
                 
                 if success:
@@ -246,13 +252,35 @@ def render_sidebar():
             next_account = email_sender.peek_next_account(selected_publisher)
             
             st.caption(f"Account Pool: {pool_status['total']} accounts ({pool_status['daily_capacity']}/day)")
-            if next_account:
-                st.caption(f"Next sender: {next_account.get('email', 'N/A')}")
+            
+            # Manual account selector
+            all_accounts = email_sender.get_all_accounts(selected_publisher)
+            account_options = ["Auto (round-robin)"] + all_accounts
+            
+            selected_account = st.selectbox(
+                "Send From Account",
+                options=account_options,
+                index=0,
+                key=f"account_select_{selected_publisher}",
+                help="Auto rotates through accounts. Select specific account if one is rate-limited."
+            )
+            
+            # Store selected account (None means auto)
+            if selected_account == "Auto (round-robin)":
+                force_account = None
+                if next_account:
+                    st.caption(f"Next auto: {next_account.get('email', 'N/A')}")
+            else:
+                force_account = selected_account
+                st.caption(f"Using: {force_account}")
+            
+            # Store in session state for use in send functions
+            st.session_state['force_account'] = force_account
             
             # Test connection button
             if st.button("Test Email Connection", use_container_width=True):
                 with st.spinner("Testing..."):
-                    success, msg = email_sender.test_connection(selected_publisher)
+                    success, msg = email_sender.test_connection(selected_publisher, force_account_email=force_account)
                 if success:
                     st.success(msg)
                 else:
@@ -1175,14 +1203,16 @@ def render_invitation_section(filters):
                             st.error(f"PDF generation failed: {str(e)}")
                             pdf_bytes = None
                     
-                    # Send email
+                    # Send email (use force_account if set)
+                    force_account = st.session_state.get('force_account')
                     success, msg = email_sender.send_email(
                         publisher_id=publisher_id,
                         to_email=to_email,
                         subject=subject,
                         body=body,
                         to_name=selected['name'],
-                        pdf_attachment=pdf_bytes
+                        pdf_attachment=pdf_bytes,
+                        force_account_email=force_account
                     )
                 
                 if success:

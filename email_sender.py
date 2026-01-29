@@ -150,6 +150,21 @@ class EmailSender:
             "sends_today": idx  # Approximate, resets on app restart
         }
     
+    def get_all_accounts(self, publisher_id: str) -> List[str]:
+        """Get list of all account emails for a publisher."""
+        if publisher_id not in self.credentials:
+            return []
+        return [acc["email"] for acc in self.credentials[publisher_id].get("accounts", [])]
+    
+    def get_account_by_email(self, publisher_id: str, email: str) -> Dict:
+        """Get account by email address."""
+        if publisher_id not in self.credentials:
+            return {}
+        for acc in self.credentials[publisher_id].get("accounts", []):
+            if acc.get("email") == email:
+                return acc
+        return {}
+    
     def send_email(
         self,
         publisher_id: str,
@@ -158,7 +173,8 @@ class EmailSender:
         body: str,
         to_name: Optional[str] = None,
         pdf_attachment: Optional[bytes] = None,
-        attachment_filename: str = "Invitation_Letter.pdf"
+        attachment_filename: str = "Invitation_Letter.pdf",
+        force_account_email: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Send an email using the next account in the publisher's pool.
@@ -171,6 +187,7 @@ class EmailSender:
             to_name: Optional recipient name for display
             pdf_attachment: Optional PDF file as bytes to attach
             attachment_filename: Filename for the PDF attachment
+            force_account_email: Optional specific account email to use (bypasses rotation)
             
         Returns:
             Tuple of (success: bool, message: str)
@@ -184,10 +201,15 @@ class EmailSender:
         
         pub_config = self.credentials[publisher_id]
         
-        # Get next account from pool
-        account = self.get_next_account(publisher_id)
-        if not account:
-            return False, "No email accounts configured for this publisher"
+        # Get account - either forced or next in rotation
+        if force_account_email:
+            account = self.get_account_by_email(publisher_id, force_account_email)
+            if not account:
+                return False, f"Account not found: {force_account_email}"
+        else:
+            account = self.get_next_account(publisher_id)
+            if not account:
+                return False, "No email accounts configured for this publisher"
         
         sender_email = account.get('email', '')
         sender_password = account.get('password', '')
@@ -323,12 +345,13 @@ class EmailSender:
         </html>
         """
     
-    def test_connection(self, publisher_id: str) -> Tuple[bool, str]:
+    def test_connection(self, publisher_id: str, force_account_email: Optional[str] = None) -> Tuple[bool, str]:
         """
-        Test SMTP connection using the first account in the pool.
+        Test SMTP connection using the specified or first account in the pool.
         
         Args:
             publisher_id: Publisher ID to test
+            force_account_email: Optional specific account email to test
             
         Returns:
             Tuple of (success: bool, message: str)
@@ -342,8 +365,14 @@ class EmailSender:
         if not accounts:
             return False, "No accounts configured for this publisher"
         
-        # Test first account in pool
-        account = accounts[0]
+        # Get account - either forced or first in pool
+        if force_account_email:
+            account = self.get_account_by_email(publisher_id, force_account_email)
+            if not account:
+                return False, f"Account not found: {force_account_email}"
+        else:
+            account = accounts[0]
+        
         test_email = account.get("email", "")
         test_password = account.get("password", "")
         
