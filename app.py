@@ -241,8 +241,13 @@ def render_sidebar():
                 st.session_state.app_state['publisher'] = selected_publisher
                 save_state()
             
-            # Show publisher email
-            st.caption(f"Sender: {email_sender.get_publisher_email(selected_publisher)}")
+            # Show pool info
+            pool_status = email_sender.get_pool_status(selected_publisher)
+            next_account = email_sender.peek_next_account(selected_publisher)
+            
+            st.caption(f"Account Pool: {pool_status['total']} accounts ({pool_status['daily_capacity']}/day)")
+            if next_account:
+                st.caption(f"Next sender: {next_account.get('email', 'N/A')}")
             
             # Test connection button
             if st.button("Test Email Connection", use_container_width=True):

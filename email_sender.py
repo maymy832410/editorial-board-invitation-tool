@@ -1,4 +1,4 @@
-"""Email sender for sending invitations via SMTP."""
+"""Email sender for sending invitations via SMTP with account pooling."""
 
 import json
 import smtplib
@@ -10,16 +10,17 @@ from email import encoders
 from email.utils import formataddr
 from email.header import Header
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 
 
 class EmailSender:
-    """Send emails via SMTP using publisher credentials."""
+    """Send emails via SMTP using publisher account pools with round-robin rotation."""
     
     CREDENTIALS_FILE = "email_credentials.json"
     
     def __init__(self):
         self.credentials = self._load_credentials()
+        self._account_index: Dict[str, int] = {}  # Track rotation per publisher
     
     def _load_credentials(self) -> dict:
         """Load email credentials from JSON file or Streamlit secrets."""
@@ -34,12 +35,18 @@ class EmailSender:
                     pub_data = st.secrets.publishers[pub_id]
                     credentials[pub_id] = {
                         "name": pub_data.get("name", ""),
-                        "email": pub_data.get("email", ""),
-                        "password": pub_data.get("password", ""),
-                        "smtp_server": pub_data.get("smtp_server", ""),
+                        "smtp_server": pub_data.get("smtp_server", "smtp.titan.email"),
                         "smtp_port": pub_data.get("smtp_port", 465),
-                        "use_ssl": pub_data.get("use_ssl", True)
+                        "use_ssl": pub_data.get("use_ssl", True),
+                        "accounts": []
                     }
+                    # Load accounts array
+                    if "accounts" in pub_data:
+                        for acc in pub_data.accounts:
+                            credentials[pub_id]["accounts"].append({
+                                "email": acc.get("email", ""),
+                                "password": acc.get("password", "")
+                            })
                 if credentials:
                     return credentials
         except Exception:
@@ -59,10 +66,19 @@ class EmailSender:
     
     def get_publishers(self) -> list:
         """Get list of available publishers."""
-        return [
-            {"id": key, "name": val["name"], "email": val["email"]}
-            for key, val in self.credentials.items()
-        ]
+        result = []
+        for key, val in self.credentials.items():
+            # Get primary email (first account in pool)
+            primary_email = ""
+            if "accounts" in val and len(val["accounts"]) > 0:
+                primary_email = val["accounts"][0]["email"]
+            result.append({
+                "id": key,
+                "name": val["name"],
+                "email": primary_email,
+                "account_count": len(val.get("accounts", []))
+            })
+        return result
     
     def get_publisher_name(self, publisher_id: str) -> str:
         """Get publisher display name."""
@@ -71,10 +87,68 @@ class EmailSender:
         return ""
     
     def get_publisher_email(self, publisher_id: str) -> str:
-        """Get publisher email address."""
+        """Get publisher primary email address (first account in pool)."""
         if publisher_id in self.credentials:
-            return self.credentials[publisher_id]["email"]
+            accounts = self.credentials[publisher_id].get("accounts", [])
+            if accounts:
+                return accounts[0]["email"]
         return ""
+    
+    def get_account_count(self, publisher_id: str) -> int:
+        """Get number of accounts in the pool for a publisher."""
+        if publisher_id in self.credentials:
+            return len(self.credentials[publisher_id].get("accounts", []))
+        return 0
+    
+    def get_next_account(self, publisher_id: str) -> Dict:
+        """
+        Get next account in round-robin rotation.
+        
+        Returns dict with 'email' and 'password' keys.
+        """
+        if publisher_id not in self.credentials:
+            return {}
+        
+        accounts = self.credentials[publisher_id].get("accounts", [])
+        if not accounts:
+            return {}
+        
+        idx = self._account_index.get(publisher_id, 0)
+        account = accounts[idx % len(accounts)]
+        self._account_index[publisher_id] = idx + 1
+        
+        return account
+    
+    def peek_next_account(self, publisher_id: str) -> Dict:
+        """
+        Peek at the next account without advancing the rotation.
+        
+        Returns dict with 'email' and 'password' keys.
+        """
+        if publisher_id not in self.credentials:
+            return {}
+        
+        accounts = self.credentials[publisher_id].get("accounts", [])
+        if not accounts:
+            return {}
+        
+        idx = self._account_index.get(publisher_id, 0)
+        return accounts[idx % len(accounts)]
+    
+    def get_pool_status(self, publisher_id: str) -> Dict:
+        """Get pool status for a publisher."""
+        if publisher_id not in self.credentials:
+            return {"total": 0, "current_index": 0, "daily_capacity": 0}
+        
+        accounts = self.credentials[publisher_id].get("accounts", [])
+        idx = self._account_index.get(publisher_id, 0)
+        
+        return {
+            "total": len(accounts),
+            "current_index": idx % len(accounts) if accounts else 0,
+            "daily_capacity": len(accounts) * 50,  # 50 emails per account per day
+            "sends_today": idx  # Approximate, resets on app restart
+        }
     
     def send_email(
         self,
@@ -87,7 +161,7 @@ class EmailSender:
         attachment_filename: str = "Invitation_Letter.pdf"
     ) -> Tuple[bool, str]:
         """
-        Send an email using the specified publisher's SMTP settings.
+        Send an email using the next account in the publisher's pool.
         
         Args:
             publisher_id: Publisher ID (e.g., 'peninsula', 'mesopotamian')
@@ -108,12 +182,18 @@ class EmailSender:
         if not to_email or '@' not in to_email:
             return False, f"Invalid recipient email: '{to_email}'"
         
-        creds = self.credentials[publisher_id]
+        pub_config = self.credentials[publisher_id]
         
-        # Validate sender email
-        sender_email = creds.get('email', '')
+        # Get next account from pool
+        account = self.get_next_account(publisher_id)
+        if not account:
+            return False, "No email accounts configured for this publisher"
+        
+        sender_email = account.get('email', '')
+        sender_password = account.get('password', '')
+        
         if not sender_email or '@' not in sender_email:
-            return False, f"Invalid sender email in credentials"
+            return False, f"Invalid sender email in account pool"
         
         try:
             # Create message - use mixed for attachments
@@ -124,7 +204,7 @@ class EmailSender:
             
             message["Subject"] = subject
             # Use formataddr to properly encode names with special characters
-            message["From"] = formataddr((creds['name'], creds['email']))
+            message["From"] = formataddr((pub_config['name'], sender_email))
             
             if to_name:
                 # Sanitize to_name - remove characters that break email headers
@@ -165,39 +245,36 @@ class EmailSender:
             # Create SSL context
             context = ssl.create_default_context()
             
-            # Connect and send
-            # Use smtp_username if provided (e.g., for AWS SES), otherwise use email
-            smtp_user = creds.get("smtp_username", creds["email"])
-            
-            if creds.get("use_ssl", True):
+            # Connect and send using pool account
+            if pub_config.get("use_ssl", True):
                 # SSL connection (port 465)
                 with smtplib.SMTP_SSL(
-                    creds["smtp_server"],
-                    creds["smtp_port"],
+                    pub_config["smtp_server"],
+                    pub_config["smtp_port"],
                     context=context
                 ) as server:
-                    server.login(smtp_user, creds["password"])
+                    server.login(sender_email, sender_password)
                     server.sendmail(
-                        creds["email"],
+                        sender_email,
                         to_email,
                         message.as_string()
                     )
             else:
                 # TLS connection (port 587)
-                with smtplib.SMTP(creds["smtp_server"], creds["smtp_port"]) as server:
+                with smtplib.SMTP(pub_config["smtp_server"], pub_config["smtp_port"]) as server:
                     server.starttls(context=context)
-                    server.login(smtp_user, creds["password"])
+                    server.login(sender_email, sender_password)
                     server.sendmail(
-                        creds["email"],
+                        sender_email,
                         to_email,
                         message.as_string()
                     )
             
             attachment_info = " with PDF attachment" if pdf_attachment else ""
-            return True, f"Email sent successfully{attachment_info}"
+            return True, f"Email sent from {sender_email}{attachment_info}"
             
         except smtplib.SMTPAuthenticationError:
-            return False, "Authentication failed. Please check your email credentials."
+            return False, f"Authentication failed for {sender_email}. Check credentials."
         except smtplib.SMTPRecipientsRefused:
             return False, f"Recipient refused: {to_email}"
         except smtplib.SMTPException as e:
@@ -248,7 +325,7 @@ class EmailSender:
     
     def test_connection(self, publisher_id: str) -> Tuple[bool, str]:
         """
-        Test SMTP connection without sending an email.
+        Test SMTP connection using the first account in the pool.
         
         Args:
             publisher_id: Publisher ID to test
@@ -259,35 +336,41 @@ class EmailSender:
         if publisher_id not in self.credentials:
             return False, f"Unknown publisher: {publisher_id}"
         
-        creds = self.credentials[publisher_id]
+        pub_config = self.credentials[publisher_id]
+        accounts = pub_config.get("accounts", [])
+        
+        if not accounts:
+            return False, "No accounts configured for this publisher"
+        
+        # Test first account in pool
+        account = accounts[0]
+        test_email = account.get("email", "")
+        test_password = account.get("password", "")
         
         try:
             context = ssl.create_default_context()
             
-            # Use smtp_username if provided (e.g., for AWS SES), otherwise use email
-            smtp_user = creds.get("smtp_username", creds["email"])
-            
-            if creds.get("use_ssl", True):
+            if pub_config.get("use_ssl", True):
                 with smtplib.SMTP_SSL(
-                    creds["smtp_server"],
-                    creds["smtp_port"],
+                    pub_config["smtp_server"],
+                    pub_config["smtp_port"],
                     context=context,
                     timeout=10
                 ) as server:
-                    server.login(smtp_user, creds["password"])
-                    return True, "Connection successful!"
+                    server.login(test_email, test_password)
+                    return True, f"Connection successful! ({len(accounts)} accounts in pool)"
             else:
                 with smtplib.SMTP(
-                    creds["smtp_server"],
-                    creds["smtp_port"],
+                    pub_config["smtp_server"],
+                    pub_config["smtp_port"],
                     timeout=10
                 ) as server:
                     server.starttls(context=context)
-                    server.login(smtp_user, creds["password"])
-                    return True, "Connection successful!"
+                    server.login(test_email, test_password)
+                    return True, f"Connection successful! ({len(accounts)} accounts in pool)"
                     
         except smtplib.SMTPAuthenticationError:
-            return False, "Authentication failed. Check credentials."
+            return False, f"Authentication failed for {test_email}. Check credentials."
         except smtplib.SMTPException as e:
             return False, f"SMTP error: {str(e)}"
         except Exception as e:
