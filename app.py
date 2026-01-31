@@ -291,6 +291,17 @@ def render_sidebar():
     with st.sidebar:
         st.title("Configuration")
         
+        # Database Status Indicator
+        db_status = supabase_storage.get_status()
+        if db_status["available"]:
+            st.success("🟢 Database: Connected")
+        else:
+            st.error(f"🔴 Database: Offline")
+            if db_status["error"]:
+                st.caption(f"Error: {db_status['error'][:50]}...")
+        
+        st.divider()
+        
         # Publisher Selection
         st.subheader("Publisher")
         

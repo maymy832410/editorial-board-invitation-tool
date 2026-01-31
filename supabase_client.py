@@ -5,18 +5,22 @@ from datetime import datetime
 from typing import Optional, Set, Dict, List
 from supabase import create_client, Client
 
-# Supabase configuration
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-# Try to load from Streamlit secrets
-try:
-    import streamlit as st
-    if hasattr(st, 'secrets'):
-        SUPABASE_URL = st.secrets.get("SUPABASE_URL", SUPABASE_URL)
-        SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", SUPABASE_KEY)
-except:
-    pass
+def _get_credentials():
+    """Get Supabase credentials from environment or Streamlit secrets."""
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    
+    # Try to load from Streamlit secrets (takes priority)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets'):
+            url = st.secrets.get("SUPABASE_URL", url)
+            key = st.secrets.get("SUPABASE_KEY", key)
+    except Exception:
+        pass
+    
+    return url, key
 
 
 class SupabaseStorage:
@@ -27,32 +31,36 @@ class SupabaseStorage:
     def __init__(self):
         self.client: Optional[Client] = None
         self.available = False
+        self.error_message = ""
         self._init_client()
     
     def _init_client(self):
         """Initialize Supabase client."""
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            print("Supabase credentials not configured")
+        url, key = _get_credentials()
+        
+        if not url or not key:
+            self.error_message = "Supabase credentials not configured"
+            print(self.error_message)
             return
         
         try:
-            self.client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            self.client = create_client(url, key)
+            # Test connection by querying table
+            self.client.table(self.TABLE_NAME).select("orcid_id").limit(1).execute()
             self.available = True
-            # Ensure table exists
-            self._ensure_table()
+            self.error_message = ""
         except Exception as e:
-            print(f"Supabase init error: {e}")
+            self.error_message = f"Supabase error: {str(e)}"
+            print(self.error_message)
             self.available = False
     
-    def _ensure_table(self):
-        """Create table if it doesn't exist (will silently fail if exists)."""
-        # Table should be created via Supabase dashboard or SQL editor
-        # This just verifies connection works
-        try:
-            self.client.table(self.TABLE_NAME).select("orcid_id").limit(1).execute()
-        except Exception as e:
-            # Table might not exist yet - that's ok, will be created
-            print(f"Table check: {e}")
+    def get_status(self) -> Dict:
+        """Get database status for UI display."""
+        return {
+            "available": self.available,
+            "error": self.error_message,
+            "table": self.TABLE_NAME
+        }
     
     def mark_sent(self, orcid_id: str, author_name: str = "", email: str = "", publisher: str = "") -> bool:
         """Mark an author as sent invitation."""
