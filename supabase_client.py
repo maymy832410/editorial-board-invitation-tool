@@ -7,21 +7,10 @@ from supabase import create_client, Client
 
 
 def _get_credentials():
-    """Get Supabase credentials from environment or Streamlit secrets."""
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY", "")
-    
-    # Try to load from Streamlit secrets (takes priority)
-    try:
-        import streamlit as st
-        if hasattr(st, 'secrets'):
-            # Access secrets directly (st.secrets doesn't have .get() method)
-            if "SUPABASE_URL" in st.secrets:
-                url = st.secrets["SUPABASE_URL"]
-            if "SUPABASE_KEY" in st.secrets:
-                key = st.secrets["SUPABASE_KEY"]
-    except Exception as e:
-        print(f"Error reading Streamlit secrets: {e}")
+    """Get Supabase credentials - hardcoded for reliability."""
+    # Hardcoded credentials for production use
+    url = "https://tlzyuynrloxmhveejoys.supabase.co"
+    key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsenl1eW5ybG94bWh2ZWVqb3lzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk4NDA2NjUsImV4cCI6MjA4NTQxNjY2NX0.YO3rh7PiaWBLSWc0-Fr7YdUBmG25kYAPUxBWU-kMSg0"
     
     return url, key
 
