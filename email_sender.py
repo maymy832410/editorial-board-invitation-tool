@@ -30,22 +30,23 @@ class EmailSender:
             import streamlit as st
             if hasattr(st, 'secrets') and 'publishers' in st.secrets:
                 # Load from Streamlit secrets
+                # Note: st.secrets objects don't have .get() method, use bracket access with defaults
                 credentials = {}
                 for pub_id in st.secrets.publishers:
                     pub_data = st.secrets.publishers[pub_id]
                     credentials[pub_id] = {
-                        "name": pub_data.get("name", ""),
-                        "smtp_server": pub_data.get("smtp_server", "smtp.titan.email"),
-                        "smtp_port": pub_data.get("smtp_port", 465),
-                        "use_ssl": pub_data.get("use_ssl", True),
+                        "name": pub_data["name"] if "name" in pub_data else "",
+                        "smtp_server": pub_data["smtp_server"] if "smtp_server" in pub_data else "smtp.titan.email",
+                        "smtp_port": pub_data["smtp_port"] if "smtp_port" in pub_data else 465,
+                        "use_ssl": pub_data["use_ssl"] if "use_ssl" in pub_data else True,
                         "accounts": []
                     }
                     # Load accounts array
                     if "accounts" in pub_data:
                         for acc in pub_data.accounts:
                             credentials[pub_id]["accounts"].append({
-                                "email": acc.get("email", ""),
-                                "password": acc.get("password", "")
+                                "email": acc["email"] if "email" in acc else "",
+                                "password": acc["password"] if "password" in acc else ""
                             })
                 if credentials:
                     return credentials

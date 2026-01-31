@@ -56,9 +56,17 @@ ORCID_API_BASE_URL = "https://pub.orcid.org/v3.0"
 import os
 try:
     import streamlit as st
-    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-    TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY", os.environ.get("TAVILY_API_KEY", ""))
-except:
+    # st.secrets doesn't have .get() method - use 'in' check instead
+    if hasattr(st, 'secrets') and "OPENAI_API_KEY" in st.secrets:
+        OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    else:
+        OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+    
+    if hasattr(st, 'secrets') and "TAVILY_API_KEY" in st.secrets:
+        TAVILY_API_KEY = st.secrets["TAVILY_API_KEY"]
+    else:
+        TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+except Exception:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
