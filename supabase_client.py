@@ -15,10 +15,13 @@ def _get_credentials():
     try:
         import streamlit as st
         if hasattr(st, 'secrets'):
-            url = st.secrets.get("SUPABASE_URL", url)
-            key = st.secrets.get("SUPABASE_KEY", key)
-    except Exception:
-        pass
+            # Access secrets directly (st.secrets doesn't have .get() method)
+            if "SUPABASE_URL" in st.secrets:
+                url = st.secrets["SUPABASE_URL"]
+            if "SUPABASE_KEY" in st.secrets:
+                key = st.secrets["SUPABASE_KEY"]
+    except Exception as e:
+        print(f"Error reading Streamlit secrets: {e}")
     
     return url, key
 
