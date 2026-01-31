@@ -28,6 +28,7 @@ from templates import (
     TEMPLATE_EDITOR_IN_CHIEF,
 )
 from pdf_generator import generate_invitation_pdf
+from supabase_client import get_storage as get_supabase_storage
 
 
 # Page config
@@ -74,6 +75,54 @@ def save_state():
     state_mgr.save_state(st.session_state.app_state)
 
 
+# Supabase storage for persistent sent tracking
+@st.cache_resource
+def get_supabase():
+    """Get cached Supabase storage instance."""
+    return get_supabase_storage()
+
+supabase_storage = get_supabase()
+
+
+def get_sent_invitations() -> set:
+    """Get sent invitations from Supabase (with local fallback)."""
+    # Try Supabase first (persistent)
+    if supabase_storage.available:
+        return supabase_storage.get_all_sent()
+    
+    # Fall back to local session state
+    sent = st.session_state.app_state.get('sent_invitations', set())
+    if isinstance(sent, list):
+        sent = set(sent)
+    return sent
+
+
+def is_author_notified(orcid_id: str) -> bool:
+    """Check if author was notified (Supabase with local fallback)."""
+    if supabase_storage.available:
+        return supabase_storage.is_sent(orcid_id)
+    
+    sent = st.session_state.app_state.get('sent_invitations', set())
+    if isinstance(sent, list):
+        sent = set(sent)
+    return orcid_id in sent
+
+
+def mark_author_notified(orcid_id: str, author_name: str = "", email: str = "", publisher: str = ""):
+    """Mark author as notified in Supabase and local state."""
+    # Save to Supabase (persistent)
+    if supabase_storage.available:
+        supabase_storage.mark_sent(orcid_id, author_name, email, publisher)
+    
+    # Also save to local state (backup)
+    sent = st.session_state.app_state.get('sent_invitations', set())
+    if isinstance(sent, list):
+        sent = set(sent)
+    sent.add(orcid_id)
+    st.session_state.app_state['sent_invitations'] = sent
+    save_state()
+
+
 @st.dialog("Send Invitation Email", width="large")
 def email_dialog(author: dict, filters: dict):
     """Dialog for composing and sending invitation email to a specific author."""
@@ -81,11 +130,8 @@ def email_dialog(author: dict, filters: dict):
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'peninsula')
     
-    # Check if already notified
-    sent_invitations = st.session_state.app_state.get('sent_invitations', set())
-    if isinstance(sent_invitations, list):
-        sent_invitations = set(sent_invitations)
-    is_already_notified = author.get('orcid_id') in sent_invitations
+    # Check if already notified (using Supabase)
+    is_already_notified = is_author_notified(author.get('orcid_id', ''))
     
     # WARNING BANNER for already notified authors
     if is_already_notified:
@@ -220,14 +266,14 @@ def email_dialog(author: dict, filters: dict):
                 )
                 
                 if success:
-                    # Mark as notified if sent to original email
+                    # Mark as notified in Supabase (persistent)
                     if to_email == author.get('email'):
-                        sent_invitations = st.session_state.app_state.get('sent_invitations', set())
-                        if isinstance(sent_invitations, list):
-                            sent_invitations = set(sent_invitations)
-                        sent_invitations.add(author['orcid_id'])
-                        st.session_state.app_state['sent_invitations'] = sent_invitations
-                        save_state()
+                        mark_author_notified(
+                            author['orcid_id'],
+                            author_name=author.get('name', ''),
+                            email=to_email,
+                            publisher=publisher_id
+                        )
                     
                     st.success(f"Email sent to {to_email}!")
                     time.sleep(1)
@@ -777,9 +823,8 @@ def display_results(filters):
     
     filtered = results.copy()
     
-    sent_invitations = st.session_state.app_state.get('sent_invitations', set())
-    if isinstance(sent_invitations, list):
-        sent_invitations = set(sent_invitations)
+    # Get sent invitations from Supabase (persistent)
+    sent_invitations = get_sent_invitations()
     
     # Collect unique disciplines and specialties from results
     all_disciplines = set()
@@ -1092,11 +1137,8 @@ def render_invitation_section(filters):
         st.warning("Please configure journal details in the sidebar.")
         return
     
-    # Check if already notified - show warning at TOP
-    sent_invitations = st.session_state.app_state.get('sent_invitations', set())
-    if isinstance(sent_invitations, list):
-        sent_invitations = set(sent_invitations)
-    is_already_notified = selected.get('orcid_id') in sent_invitations
+    # Check if already notified - show warning at TOP (using Supabase)
+    is_already_notified = is_author_notified(selected.get('orcid_id', ''))
     
     if is_already_notified:
         st.error("⚠️ WARNING: This author has ALREADY been notified! Sending again will result in a DUPLICATE invitation.")
@@ -1260,14 +1302,14 @@ def render_invitation_section(filters):
                 if success:
                     st.success(f"Email sent to {to_email}!")
                     
-                    # Mark as sent (only if sent to original email)
+                    # Mark as sent in Supabase (persistent)
                     if to_email == selected.get('email'):
-                        sent = st.session_state.app_state.get('sent_invitations', set())
-                        if isinstance(sent, list):
-                            sent = set(sent)
-                        sent.add(selected['orcid_id'])
-                        st.session_state.app_state['sent_invitations'] = sent
-                        save_state()
+                        mark_author_notified(
+                            selected['orcid_id'],
+                            author_name=selected.get('name', ''),
+                            email=to_email,
+                            publisher=publisher_id
+                        )
                     else:
                         st.info("Note: Email was sent to a test address. Author not marked as notified.")
                     
