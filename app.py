@@ -81,6 +81,16 @@ def email_dialog(author: dict, filters: dict):
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'peninsula')
     
+    # Check if already notified
+    sent_invitations = st.session_state.app_state.get('sent_invitations', set())
+    if isinstance(sent_invitations, list):
+        sent_invitations = set(sent_invitations)
+    is_already_notified = author.get('orcid_id') in sent_invitations
+    
+    # WARNING BANNER for already notified authors
+    if is_already_notified:
+        st.error("⚠️ WARNING: This author has ALREADY been notified! Sending again will result in a DUPLICATE invitation.")
+    
     # Author info header
     st.markdown(f"### To: **{author['name']}**")
     if author.get('institution'):
@@ -161,6 +171,15 @@ def email_dialog(author: dict, filters: dict):
     
     st.divider()
     
+    # Confirmation checkbox for already notified authors
+    confirm_resend = True  # Default to allowed
+    if is_already_notified:
+        confirm_resend = st.checkbox(
+            "I confirm I want to send ANOTHER invitation to this already-notified author",
+            value=False,
+            key="dialog_confirm_resend"
+        )
+    
     # Action buttons
     col1, col2 = st.columns(2)
     
@@ -169,7 +188,7 @@ def email_dialog(author: dict, filters: dict):
             st.rerun()
     
     with col2:
-        send_disabled = not EMAIL_AVAILABLE or not to_email
+        send_disabled = not EMAIL_AVAILABLE or not to_email or (is_already_notified and not confirm_resend)
         if st.button("Send Email", type="primary", use_container_width=True, disabled=send_disabled):
             with st.spinner("Sending..."):
                 # Generate PDF if needed
@@ -882,7 +901,7 @@ def display_results(filters):
             'All_Emails': r.get('all_emails', '') or r.get('email', '') or '',
             'Institution': r.get('institution', ''),
             'Country': r.get('country', ''),
-            'Notified': '✓' if orcid_id in sent_invitations else '',
+            'Status': '✅ SENT' if orcid_id in sent_invitations else '',
             'orcid_id': orcid_id,
             'all_topics': r.get('all_topics', [])
         })
@@ -977,7 +996,7 @@ def display_results(filters):
         with cols[0]:
             name_display = author.get('name', '')
             if is_notified:
-                st.markdown(f"✅ {name_display}")
+                st.markdown(f"✅ **{name_display}** :green[SENT]")
             else:
                 st.write(name_display)
         
@@ -1016,8 +1035,12 @@ def display_results(filters):
         
         with cols[5]:
             if has_email:
-                btn_label = "✓ Sent" if is_notified else "Send"
-                btn_type = "secondary" if is_notified else "primary"
+                if is_notified:
+                    btn_label = "⚠️ Re-send"
+                    btn_type = "secondary"
+                else:
+                    btn_label = "Send"
+                    btn_type = "primary"
                 if st.button(btn_label, key=f"send_{orcid_id}_{start_idx + idx}", type=btn_type, use_container_width=True):
                     # Open dialog for this author
                     email_dialog(author, filters)
@@ -1068,6 +1091,15 @@ def render_invitation_section(filters):
     if not journal_config.get('name'):
         st.warning("Please configure journal details in the sidebar.")
         return
+    
+    # Check if already notified - show warning at TOP
+    sent_invitations = st.session_state.app_state.get('sent_invitations', set())
+    if isinstance(sent_invitations, list):
+        sent_invitations = set(sent_invitations)
+    is_already_notified = selected.get('orcid_id') in sent_invitations
+    
+    if is_already_notified:
+        st.error("⚠️ WARNING: This author has ALREADY been notified! Sending again will result in a DUPLICATE invitation.")
     
     # Template selection
     col1, col2 = st.columns([2, 1])
@@ -1170,6 +1202,15 @@ def render_invitation_section(filters):
     
     st.divider()
     
+    # Confirmation checkbox for already notified authors
+    confirm_resend = True  # Default to allowed
+    if is_already_notified:
+        confirm_resend = st.checkbox(
+            "I confirm I want to send ANOTHER invitation to this already-notified author",
+            value=False,
+            key="confirm_resend_main"
+        )
+    
     # Action buttons
     col1, col2, col3 = st.columns(3)
     
@@ -1183,7 +1224,8 @@ def render_invitation_section(filters):
     
     with col3:
         # Send button
-        if EMAIL_AVAILABLE and to_email:
+        send_blocked = is_already_notified and not confirm_resend
+        if EMAIL_AVAILABLE and to_email and not send_blocked:
             send_label = "Send Email with PDF" if attach_pdf else "Send Email"
             if st.button(send_label, type="primary", use_container_width=True):
                 with st.spinner("Sending..."):
@@ -1234,16 +1276,10 @@ def render_invitation_section(filters):
                     st.error(f"Failed: {msg}")
         elif not to_email:
             st.warning("No email address. Enter one above.")
+        elif send_blocked:
+            st.warning("Check the confirmation box above to re-send to this already-notified author.")
         else:
             st.warning("Email sending not available.")
-    
-    # Show if already sent
-    sent_invitations = st.session_state.app_state.get('sent_invitations', set())
-    if isinstance(sent_invitations, list):
-        sent_invitations = set(sent_invitations)
-    
-    if selected.get('orcid_id') in sent_invitations:
-        st.success("This author has already been notified.")
 
 
 def main():
