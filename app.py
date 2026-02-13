@@ -506,14 +506,14 @@ def render_sidebar():
         
         use_tavily = st.checkbox(
             "Enable Tavily search",
-            value=True,
+            value=False,
             help="Tavily + GPT-4o-mini extraction (lower cost)",
             key="use_tavily"
         )
         
         use_openai_web = st.checkbox(
             "Enable OpenAI web search",
-            value=True,
+            value=False,
             help="OpenAI Responses API with web_search (fallback, higher cost)",
             key="use_openai_web"
         )
