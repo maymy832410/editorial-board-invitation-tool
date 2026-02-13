@@ -9,8 +9,8 @@ from supabase import create_client, Client
 def _get_credentials():
     """Get Supabase credentials - hardcoded for reliability."""
     # Hardcoded credentials for production use
-    url = "https://tlzyuynrloxmhveejoys.supabase.co"
-    key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsenl1eW5ybG94bWh2ZWVqb3lzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk4NDA2NjUsImV4cCI6MjA4NTQxNjY2NX0.YO3rh7PiaWBLSWc0-Fr7YdUBmG25kYAPUxBWU-kMSg0"
+    url = "https://csstwegijzwlkjvjkvhp.supabase.co"
+    key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNzc3R3ZWdpanp3bGtqdmprdmhwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA5NDc3NTUsImV4cCI6MjA4NjUyMzc1NX0.n7Z6e4a-vFxANGteGWsZgmBWIvISUKmkIUfSN6KsZuk"
     
     return url, key
 
