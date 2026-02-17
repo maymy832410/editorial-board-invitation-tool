@@ -1,8 +1,9 @@
-"""Email sender for sending invitations via SMTP with account pooling."""
+"""Email sender for sending invitations via SMTP with account pooling and rate limiting."""
 
 import json
 import smtplib
 import ssl
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -13,14 +14,78 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
 
+# Rate limits per account (with safety buffer of 10 below Titan Free limits)
+HOURLY_LIMIT = 40   # Titan Free: 50/hour
+DAILY_LIMIT = 90    # Titan Free: 100/day
+
+
+class AccountRateLimiter:
+    """Track send timestamps per account to enforce hourly/daily limits."""
+    
+    def __init__(self):
+        self._send_times: Dict[str, List[datetime]] = {}
+    
+    def _cleanup(self, email: str):
+        """Remove timestamps older than 24 hours."""
+        if email not in self._send_times:
+            return
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        self._send_times[email] = [t for t in self._send_times[email] if t > cutoff]
+    
+    def record_send(self, email: str):
+        """Record a send for the given account."""
+        if email not in self._send_times:
+            self._send_times[email] = []
+        self._send_times[email].append(datetime.utcnow())
+    
+    def get_hourly_count(self, email: str) -> int:
+        """Get number of emails sent in the last hour."""
+        self._cleanup(email)
+        cutoff = datetime.utcnow() - timedelta(hours=1)
+        return sum(1 for t in self._send_times.get(email, []) if t > cutoff)
+    
+    def get_daily_count(self, email: str) -> int:
+        """Get number of emails sent in the last 24 hours."""
+        self._cleanup(email)
+        return len(self._send_times.get(email, []))
+    
+    def can_send(self, email: str) -> Tuple[bool, str]:
+        """Check if account can send. Returns (allowed, reason)."""
+        hourly = self.get_hourly_count(email)
+        daily = self.get_daily_count(email)
+        
+        if daily >= DAILY_LIMIT:
+            return False, f"Daily limit reached ({daily}/{DAILY_LIMIT})"
+        if hourly >= HOURLY_LIMIT:
+            return False, f"Hourly limit reached ({hourly}/{HOURLY_LIMIT})"
+        return True, f"OK ({hourly}/{HOURLY_LIMIT} hourly, {daily}/{DAILY_LIMIT} daily)"
+    
+    def get_status(self, email: str) -> Dict:
+        """Get rate limit status for an account."""
+        hourly = self.get_hourly_count(email)
+        daily = self.get_daily_count(email)
+        can, reason = self.can_send(email)
+        return {
+            "hourly_sent": hourly,
+            "hourly_limit": HOURLY_LIMIT,
+            "hourly_remaining": max(0, HOURLY_LIMIT - hourly),
+            "daily_sent": daily,
+            "daily_limit": DAILY_LIMIT,
+            "daily_remaining": max(0, DAILY_LIMIT - daily),
+            "can_send": can,
+            "reason": reason,
+        }
+
+
 class EmailSender:
-    """Send emails via SMTP using publisher account pools with round-robin rotation."""
+    """Send emails via SMTP using publisher account pools with round-robin rotation and rate limiting."""
     
     CREDENTIALS_FILE = "email_credentials.json"
     
     def __init__(self):
         self.credentials = self._load_credentials()
-        self._account_index: Dict[str, int] = {}  # Track rotation per publisher
+        self._account_index: Dict[str, int] = {}
+        self.rate_limiter = AccountRateLimiter()
     
     def _load_credentials(self) -> dict:
         """Load email credentials from JSON file or Streamlit secrets."""
@@ -103,9 +168,9 @@ class EmailSender:
     
     def get_next_account(self, publisher_id: str) -> Dict:
         """
-        Get next account in round-robin rotation.
+        Get next available account in round-robin rotation, skipping rate-limited ones.
         
-        Returns dict with 'email' and 'password' keys.
+        Returns dict with 'email' and 'password' keys, or empty dict if all accounts are rate-limited.
         """
         if publisher_id not in self.credentials:
             return {}
@@ -115,10 +180,17 @@ class EmailSender:
             return {}
         
         idx = self._account_index.get(publisher_id, 0)
-        account = accounts[idx % len(accounts)]
-        self._account_index[publisher_id] = idx + 1
         
-        return account
+        # Try each account in rotation, skip rate-limited ones
+        for attempt in range(len(accounts)):
+            candidate = accounts[(idx + attempt) % len(accounts)]
+            can_send, reason = self.rate_limiter.can_send(candidate.get("email", ""))
+            if can_send:
+                self._account_index[publisher_id] = idx + attempt + 1
+                return candidate
+        
+        # All accounts are rate-limited
+        return {}
     
     def peek_next_account(self, publisher_id: str) -> Dict:
         """
@@ -137,18 +209,35 @@ class EmailSender:
         return accounts[idx % len(accounts)]
     
     def get_pool_status(self, publisher_id: str) -> Dict:
-        """Get pool status for a publisher."""
+        """Get pool status for a publisher with rate limit info."""
         if publisher_id not in self.credentials:
-            return {"total": 0, "current_index": 0, "daily_capacity": 0}
+            return {"total": 0, "current_index": 0, "daily_capacity": 0, "available_accounts": 0,
+                    "total_hourly_remaining": 0, "total_daily_remaining": 0}
         
         accounts = self.credentials[publisher_id].get("accounts", [])
         idx = self._account_index.get(publisher_id, 0)
         
+        # Calculate rate limit stats across all accounts
+        available = 0
+        total_hourly_remaining = 0
+        total_daily_remaining = 0
+        total_daily_sent = 0
+        for acc in accounts:
+            status = self.rate_limiter.get_status(acc.get("email", ""))
+            if status["can_send"]:
+                available += 1
+            total_hourly_remaining += status["hourly_remaining"]
+            total_daily_remaining += status["daily_remaining"]
+            total_daily_sent += status["daily_sent"]
+        
         return {
             "total": len(accounts),
             "current_index": idx % len(accounts) if accounts else 0,
-            "daily_capacity": len(accounts) * 50,  # 50 emails per account per day
-            "sends_today": idx  # Approximate, resets on app restart
+            "daily_capacity": len(accounts) * DAILY_LIMIT,
+            "sends_today": total_daily_sent,
+            "available_accounts": available,
+            "total_hourly_remaining": total_hourly_remaining,
+            "total_daily_remaining": total_daily_remaining,
         }
     
     def get_all_accounts(self, publisher_id: str) -> List[str]:
@@ -207,9 +296,17 @@ class EmailSender:
             account = self.get_account_by_email(publisher_id, force_account_email)
             if not account:
                 return False, f"Account not found: {force_account_email}"
+            # Check rate limit for forced account
+            can_send, reason = self.rate_limiter.can_send(force_account_email)
+            if not can_send:
+                return False, f"Rate limited ({force_account_email}): {reason}"
         else:
             account = self.get_next_account(publisher_id)
             if not account:
+                # Check if it's because all are rate-limited vs no accounts configured
+                all_accounts = self.credentials[publisher_id].get("accounts", [])
+                if all_accounts:
+                    return False, f"All {len(all_accounts)} accounts are rate-limited. Wait for limits to reset."
                 return False, "No email accounts configured for this publisher"
         
         sender_email = account.get('email', '')
@@ -293,8 +390,13 @@ class EmailSender:
                         message.as_string()
                     )
             
+            # Record successful send for rate limiting
+            self.rate_limiter.record_send(sender_email)
+            status = self.rate_limiter.get_status(sender_email)
+            
             attachment_info = " with PDF attachment" if pdf_attachment else ""
-            return True, f"Email sent from {sender_email}{attachment_info}"
+            remaining = f" [{status['hourly_remaining']}h/{status['daily_remaining']}d remaining]"
+            return True, f"Email sent from {sender_email}{attachment_info}{remaining}"
             
         except smtplib.SMTPAuthenticationError:
             return False, f"Authentication failed for {sender_email}. Check credentials."

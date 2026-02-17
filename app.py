@@ -327,7 +327,16 @@ def render_sidebar():
             pool_status = email_sender.get_pool_status(selected_publisher)
             next_account = email_sender.peek_next_account(selected_publisher)
             
-            st.caption(f"Account Pool: {pool_status['total']} accounts ({pool_status['daily_capacity']}/day)")
+            avail = pool_status.get('available_accounts', pool_status['total'])
+            hourly_rem = pool_status.get('total_hourly_remaining', '?')
+            daily_rem = pool_status.get('total_daily_remaining', '?')
+            sent_today = pool_status.get('sends_today', 0)
+            
+            if avail == pool_status['total']:
+                st.caption(f"Pool: {pool_status['total']} accounts | Sent today: {sent_today}")
+            else:
+                st.warning(f"Pool: {avail}/{pool_status['total']} accounts available | Sent: {sent_today}")
+            st.caption(f"Remaining: {hourly_rem}/hr, {daily_rem}/day (limits: 40/hr, 90/day per account)")
             
             # Manual account selector
             all_accounts = email_sender.get_all_accounts(selected_publisher)
