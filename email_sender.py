@@ -109,10 +109,13 @@ class EmailSender:
                     # Load accounts array
                     if "accounts" in pub_data:
                         for acc in pub_data.accounts:
-                            credentials[pub_id]["accounts"].append({
+                            acct = {
                                 "email": acc["email"] if "email" in acc else "",
                                 "password": acc["password"] if "password" in acc else ""
-                            })
+                            }
+                            if "smtp_login" in acc:
+                                acct["smtp_login"] = acc["smtp_login"]
+                            credentials[pub_id]["accounts"].append(acct)
                 if credentials:
                     return credentials
         except Exception:
@@ -311,6 +314,7 @@ class EmailSender:
         
         sender_email = account.get('email', '')
         sender_password = account.get('password', '')
+        login_user = account.get('smtp_login') or sender_email
         
         if not sender_email or '@' not in sender_email:
             return False, f"Invalid sender email in account pool"
@@ -373,7 +377,7 @@ class EmailSender:
                     pub_config["smtp_port"],
                     context=context
                 ) as server:
-                    server.login(sender_email, sender_password)
+                    server.login(login_user, sender_password)
                     server.sendmail(
                         sender_email,
                         to_email,
@@ -383,7 +387,7 @@ class EmailSender:
                 # TLS connection (port 587)
                 with smtplib.SMTP(pub_config["smtp_server"], pub_config["smtp_port"]) as server:
                     server.starttls(context=context)
-                    server.login(sender_email, sender_password)
+                    server.login(login_user, sender_password)
                     server.sendmail(
                         sender_email,
                         to_email,
@@ -476,8 +480,8 @@ class EmailSender:
         else:
             account = accounts[0]
         
-        test_email = account.get("email", "")
         test_password = account.get("password", "")
+        login_user = account.get("smtp_login") or account.get("email", "")
         
         try:
             context = ssl.create_default_context()
@@ -489,7 +493,7 @@ class EmailSender:
                     context=context,
                     timeout=10
                 ) as server:
-                    server.login(test_email, test_password)
+                    server.login(login_user, test_password)
                     return True, f"Connection successful! ({len(accounts)} accounts in pool)"
             else:
                 with smtplib.SMTP(
@@ -498,11 +502,11 @@ class EmailSender:
                     timeout=10
                 ) as server:
                     server.starttls(context=context)
-                    server.login(test_email, test_password)
+                    server.login(login_user, test_password)
                     return True, f"Connection successful! ({len(accounts)} accounts in pool)"
                     
         except smtplib.SMTPAuthenticationError:
-            return False, f"Authentication failed for {test_email}. Check credentials."
+            return False, f"Authentication failed for {login_user}. Check credentials."
         except smtplib.SMTPException as e:
             return False, f"SMTP error: {str(e)}"
         except Exception as e:
