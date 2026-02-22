@@ -22,20 +22,23 @@ LOGO_DIR = Path(__file__).parent / "pdf template"
 
 PUBLISHER_LOGOS = {
     "peninsula": LOGO_DIR / "Peninsula publishing press.jpg",
+    "brevo": LOGO_DIR / "Peninsula publishing press.jpg",
     "mesopotamian": LOGO_DIR / "mesopotamian academic press.jpg",
 }
 
 # Publisher branding colors
+_PENINSULA_COLORS = {
+    "primary": colors.HexColor('#1a365d'),      # Navy blue
+    "secondary": colors.HexColor('#2c5282'),    # Medium blue
+    "accent": colors.HexColor('#3182ce'),       # Light blue
+    "gold": colors.HexColor('#d69e2e'),         # Gold accent
+    "text": colors.HexColor('#2d3748'),         # Dark gray
+    "light": colors.HexColor('#e2e8f0'),        # Light gray
+    "bg_tint": colors.HexColor('#f7fafc'),      # Very light blue
+}
 PUBLISHER_COLORS = {
-    "peninsula": {
-        "primary": colors.HexColor('#1a365d'),      # Navy blue
-        "secondary": colors.HexColor('#2c5282'),    # Medium blue
-        "accent": colors.HexColor('#3182ce'),       # Light blue
-        "gold": colors.HexColor('#d69e2e'),         # Gold accent
-        "text": colors.HexColor('#2d3748'),         # Dark gray
-        "light": colors.HexColor('#e2e8f0'),        # Light gray
-        "bg_tint": colors.HexColor('#f7fafc'),      # Very light blue
-    },
+    "peninsula": _PENINSULA_COLORS,
+    "brevo": _PENINSULA_COLORS,
     "mesopotamian": {
         "primary": colors.HexColor('#7c2d12'),      # Burnt orange/brown
         "secondary": colors.HexColor('#9a3412'),    # Orange
@@ -48,13 +51,15 @@ PUBLISHER_COLORS = {
 }
 
 # Publisher contact info
+_PENINSULA_INFO = {
+    "name": "Peninsula Publishing Press",
+    "email": "info@peninsula-press.ae",
+    "website": "www.peninsula-press.ae",
+    "location": "Dubai, UAE"
+}
 PUBLISHER_INFO = {
-    "peninsula": {
-        "name": "Peninsula Publishing Press",
-        "email": "info@peninsula-press.ae",
-        "website": "www.peninsula-press.ae",
-        "location": "Dubai, UAE"
-    },
+    "peninsula": _PENINSULA_INFO,
+    "brevo": _PENINSULA_INFO,
     "mesopotamian": {
         "name": "Mesopotamian Academic Press", 
         "email": "info@mesopotamian.press",
@@ -67,10 +72,10 @@ PUBLISHER_INFO = {
 class PremiumPDFGenerator:
     """Generate premium PDF invitation letters with decorative borders and shapes."""
     
-    def __init__(self, publisher_id: str = "peninsula"):
+    def __init__(self, publisher_id: str = "brevo"):
         self.publisher_id = publisher_id
-        self.colors = PUBLISHER_COLORS.get(publisher_id, PUBLISHER_COLORS["peninsula"])
-        self.info = PUBLISHER_INFO.get(publisher_id, PUBLISHER_INFO["peninsula"])
+        self.colors = PUBLISHER_COLORS.get(publisher_id, PUBLISHER_COLORS["brevo"])
+        self.info = PUBLISHER_INFO.get(publisher_id, PUBLISHER_INFO["brevo"])
         self.page_width, self.page_height = A4
         self._setup_styles()
     
@@ -443,7 +448,7 @@ def generate_invitation_pdf(
     Generate a premium PDF invitation letter.
     
     Args:
-        publisher_id: Publisher ID ('peninsula' or 'mesopotamian')
+        publisher_id: Publisher ID ('brevo', 'peninsula', or 'mesopotamian')
         recipient_name: Name of the recipient
         email_body: The email body text
         subject: Email subject (used as title)

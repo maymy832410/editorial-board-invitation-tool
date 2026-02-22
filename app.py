@@ -126,7 +126,7 @@ def email_dialog(author: dict, filters: dict):
     """Dialog for composing and sending invitation email to a specific author."""
     
     journal_config = st.session_state.app_state.get('journal_config', {})
-    publisher_id = filters.get('publisher', 'peninsula')
+    publisher_id = filters.get('publisher', 'brevo')
     
     # Check if already notified (using Supabase)
     is_already_notified = is_author_notified(author.get('orcid_id', ''))
@@ -300,7 +300,7 @@ def render_sidebar():
             publishers = email_sender.get_publishers()
             publisher_options = {p['id']: f"{p['name']}" for p in publishers}
             
-            current_publisher = st.session_state.app_state.get('publisher', 'peninsula')
+            current_publisher = st.session_state.app_state.get('publisher', 'brevo')
             if publisher_options and current_publisher not in publisher_options:
                 current_publisher = list(publisher_options.keys())[0]
                 st.session_state.app_state['publisher'] = current_publisher
@@ -352,7 +352,7 @@ def render_sidebar():
                         st.error(msg)
         else:
             st.warning("Email credentials not found. Create email_credentials.json")
-            selected_publisher = 'peninsula'
+            selected_publisher = 'brevo'
         
         st.divider()
         
@@ -1126,7 +1126,7 @@ def render_invitation_section(filters):
     
     selected = st.session_state.selected_author
     journal_config = st.session_state.app_state.get('journal_config', {})
-    publisher_id = filters.get('publisher', 'peninsula')
+    publisher_id = filters.get('publisher', 'brevo')
     
     # Check if ready
     if not selected:

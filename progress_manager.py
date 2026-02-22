@@ -25,7 +25,7 @@ class StateManager:
     def _get_default_state(self) -> Dict:
         """Return default empty state."""
         return {
-            "publisher": "peninsula",
+            "publisher": "brevo",
             "journal_config": {
                 "name": "",
                 "issn": "",
