@@ -29,9 +29,6 @@ from templates import (
 )
 from pdf_generator import generate_invitation_pdf
 from supabase_client import get_storage as get_supabase_storage
-from email_validation import validate_email_for_send
-
-
 # Page config
 st.set_page_config(
     page_title="Editorial Board Invitation Tool",
@@ -171,26 +168,11 @@ def email_dialog(author: dict, filters: dict):
     )
     
     # Editable email fields
-    col_to, col_validate = st.columns([3, 1])
-    with col_to:
-        to_email = st.text_input(
-            "To (Email)",
-            value=author.get('email', ''),
-            key="dialog_to"
-        )
-    with col_validate:
-        st.caption(" ")  # align with input
-        if st.button("Validate email", key="dialog_validate_email", use_container_width=True):
-            if to_email:
-                with st.spinner("Checking..."):
-                    valid, msg = validate_email_for_send(to_email)
-                if valid:
-                    st.success("Valid for sending.")
-                else:
-                    st.error(msg)
-            else:
-                st.warning("Enter an email first.")
-    
+    to_email = st.text_input(
+        "To (Email)",
+        value=author.get('email', ''),
+        key="dialog_to"
+    )
     subject = st.text_input(
         "Subject",
         value=formatted['subject'],
@@ -251,55 +233,44 @@ def email_dialog(author: dict, filters: dict):
     with col2:
         send_disabled = not EMAIL_AVAILABLE or not to_email or (is_already_notified and not confirm_resend)
         if st.button("Send Email", type="primary", use_container_width=True, disabled=send_disabled):
-            with st.spinner("Validating email..."):
-                valid, validation_msg = validate_email_for_send(to_email)
-                if not valid:
-                    st.error(validation_msg)
-                else:
-                    with st.spinner("Sending..."):
-                        # Generate PDF if needed
-                        pdf_bytes = None
-                        if attach_pdf:
-                            try:
-                                pdf_bytes = generate_invitation_pdf(
-                                    publisher_id=publisher_id,
-                                    recipient_name=author['name'],
-                                    email_body=body,
-                                    subject=subject,
-                                    journal_name=journal_config.get('name', ''),
-                                    journal_link=journal_config.get('link', '')
-                                )
-                            except Exception as e:
-                                st.error(f"PDF generation failed: {str(e)}")
-                                pdf_bytes = None
-                        
-                        # Send email (use force_account if set)
-                        force_account = st.session_state.get('force_account')
-                        success, msg = email_sender.send_email(
+            with st.spinner("Sending..."):
+                pdf_bytes = None
+                if attach_pdf:
+                    try:
+                        pdf_bytes = generate_invitation_pdf(
                             publisher_id=publisher_id,
-                            to_email=to_email,
+                            recipient_name=author['name'],
+                            email_body=body,
                             subject=subject,
-                            body=body,
-                            to_name=author['name'],
-                            pdf_attachment=pdf_bytes,
-                            force_account_email=force_account
+                            journal_name=journal_config.get('name', ''),
+                            journal_link=journal_config.get('link', '')
                         )
-                        
-                        if success:
-                            # Mark as notified in Supabase (persistent)
-                            if to_email == author.get('email'):
-                                mark_author_notified(
-                                    author['orcid_id'],
-                                    author_name=author.get('name', ''),
-                                    email=to_email,
-                                    publisher=publisher_id
-                                )
-                            
-                            st.success(f"Email sent to {to_email}!")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(f"Failed: {msg}")
+                    except Exception as e:
+                        st.error(f"PDF generation failed: {str(e)}")
+                        pdf_bytes = None
+                
+                success, msg = email_sender.send_email(
+                    publisher_id=publisher_id,
+                    to_email=to_email,
+                    subject=subject,
+                    body=body,
+                    to_name=author['name'],
+                    pdf_attachment=pdf_bytes,
+                )
+                
+                if success:
+                    if to_email == author.get('email'):
+                        mark_author_notified(
+                            author['orcid_id'],
+                            author_name=author.get('name', ''),
+                            email=to_email,
+                            publisher=publisher_id
+                        )
+                    st.success(f"Email sent to {to_email}!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"Failed: {msg}")
     
     if not EMAIL_AVAILABLE:
         st.warning("Email sending not configured. Add email_credentials.json.")
@@ -347,55 +318,14 @@ def render_sidebar():
                 st.session_state.app_state['publisher'] = selected_publisher
                 save_state()
             
-            # Show pool info
-            pool_status = email_sender.get_pool_status(selected_publisher)
-            next_account = email_sender.peek_next_account(selected_publisher)
-            
-            avail = pool_status.get('available_accounts', pool_status['total'])
-            hourly_rem = pool_status.get('total_hourly_remaining', '?')
-            daily_rem = pool_status.get('total_daily_remaining', '?')
-            sent_today = pool_status.get('sends_today', 0)
-            
-            if avail == pool_status['total']:
-                st.caption(f"Pool: {pool_status['total']} accounts | Sent today: {sent_today}")
-            else:
-                st.warning(f"Pool: {avail}/{pool_status['total']} accounts available | Sent: {sent_today}")
-            st.caption(f"Remaining: {hourly_rem}/hr, {daily_rem}/day (limits: 40/hr, 90/day per account)")
-            
-            # Manual account selector
-            all_accounts = email_sender.get_all_accounts(selected_publisher)
-            account_options = ["Auto (round-robin)"] + all_accounts
-            
-            selected_account = st.selectbox(
-                "Send From Account",
-                options=account_options,
-                index=0,
-                key=f"account_select_{selected_publisher}",
-                help="Auto rotates through accounts. Select specific account if one is rate-limited."
-            )
-            
-            # Store selected account (None means auto)
-            if selected_account == "Auto (round-robin)":
-                force_account = None
-                if next_account:
-                    st.caption(f"Next auto: {next_account.get('email', 'N/A')}")
-            else:
-                force_account = selected_account
-                st.caption(f"Using: {force_account}")
-            
-            # Store in session state for use in send functions
-            st.session_state['force_account'] = force_account
-            
-            # Test connection button
             if st.button("Test Email Connection", use_container_width=True):
                 with st.spinner("Testing..."):
-                    success, msg = email_sender.test_connection(selected_publisher, force_account_email=force_account)
+                    success, msg = email_sender.test_connection(selected_publisher)
                 if success:
                     st.success(msg)
                 else:
                     st.error(msg)
             
-            # Send test email to any address
             st.caption("Send test email to any address:")
             test_email_to = st.text_input(
                 "Send test email to",
@@ -408,23 +338,18 @@ def render_sidebar():
                     st.warning("Enter an email address.")
                 else:
                     test_email_to = test_email_to.strip()
-                    valid, validation_msg = validate_email_for_send(test_email_to)
-                    if not valid:
-                        st.error(validation_msg)
+                    with st.spinner("Sending test email..."):
+                        success, msg = email_sender.send_email(
+                            selected_publisher,
+                            to_email=test_email_to,
+                            subject="Test email from Editorial Board Invitation Tool",
+                            body="This is a test email. If you received this, the sender is configured correctly.",
+                            to_name="Test recipient",
+                        )
+                    if success:
+                        st.success(f"Test email sent to {test_email_to}.")
                     else:
-                        with st.spinner("Sending test email..."):
-                            success, msg = email_sender.send_email(
-                                selected_publisher,
-                                to_email=test_email_to,
-                                subject="Test email from Editorial Board Invitation Tool",
-                                body="This is a test email. If you received this, the sender is configured correctly.",
-                                to_name="Test recipient",
-                                force_account_email=force_account
-                            )
-                        if success:
-                            st.success(f"Test email sent to {test_email_to}.")
-                        else:
-                            st.error(msg)
+                        st.error(msg)
         else:
             st.warning("Email credentials not found. Create email_credentials.json")
             selected_publisher = 'peninsula'
@@ -1263,26 +1188,12 @@ def render_invitation_section(filters):
     
     # To field - editable for testing
     default_to = selected.get('email', '') or ''
-    col_to_main, col_validate_main = st.columns([3, 1])
-    with col_to_main:
-        to_email = st.text_input(
-            "To (Author Email - editable)",
-            value=default_to,
-            placeholder="Enter email address (change for testing)",
-            key=f"email_to_{author_key}"
-        )
-    with col_validate_main:
-        st.caption(" ")
-        if st.button("Validate email", key="main_validate_email", use_container_width=True):
-            if to_email:
-                with st.spinner("Checking..."):
-                    valid, msg = validate_email_for_send(to_email)
-                if valid:
-                    st.success("Valid for sending.")
-                else:
-                    st.error(msg)
-            else:
-                st.warning("Enter an email first.")
+    to_email = st.text_input(
+        "To (Author Email - editable)",
+        value=default_to,
+        placeholder="Enter email address (change for testing)",
+        key=f"email_to_{author_key}"
+    )
     
     # Subject - editable
     subject = st.text_input(
@@ -1359,57 +1270,45 @@ def render_invitation_section(filters):
         if EMAIL_AVAILABLE and to_email and not send_blocked:
             send_label = "Send Email with PDF" if attach_pdf else "Send Email"
             if st.button(send_label, type="primary", use_container_width=True):
-                with st.spinner("Validating email..."):
-                    valid, validation_msg = validate_email_for_send(to_email)
-                if not valid:
-                    st.error(validation_msg)
-                else:
-                    with st.spinner("Sending..."):
-                        # Generate PDF if needed
-                        pdf_bytes = None
-                        if attach_pdf:
-                            try:
-                                pdf_bytes = generate_invitation_pdf(
-                                    publisher_id=publisher_id,
-                                    recipient_name=selected['name'],
-                                    email_body=body,
-                                    subject=subject,
-                                    journal_name=journal_config.get('name', ''),
-                                    journal_link=journal_config.get('link', '')
-                                )
-                            except Exception as e:
-                                st.error(f"PDF generation failed: {str(e)}")
-                                pdf_bytes = None
-                        
-                        # Send email (use force_account if set)
-                        force_account = st.session_state.get('force_account')
-                        success, msg = email_sender.send_email(
-                            publisher_id=publisher_id,
-                            to_email=to_email,
-                            subject=subject,
-                            body=body,
-                            to_name=selected['name'],
-                            pdf_attachment=pdf_bytes,
-                            force_account_email=force_account
-                        )
-                    
-                    if success:
-                        st.success(f"Email sent to {to_email}!")
-                        
-                        # Mark as sent in Supabase (persistent)
-                        if to_email == selected.get('email'):
-                            mark_author_notified(
-                                selected['orcid_id'],
-                                author_name=selected.get('name', ''),
-                                email=to_email,
-                                publisher=publisher_id
+                with st.spinner("Sending..."):
+                    pdf_bytes = None
+                    if attach_pdf:
+                        try:
+                            pdf_bytes = generate_invitation_pdf(
+                                publisher_id=publisher_id,
+                                recipient_name=selected['name'],
+                                email_body=body,
+                                subject=subject,
+                                journal_name=journal_config.get('name', ''),
+                                journal_link=journal_config.get('link', '')
                             )
-                        else:
-                            st.info("Note: Email was sent to a test address. Author not marked as notified.")
-                        
-                        st.rerun()
+                        except Exception as e:
+                            st.error(f"PDF generation failed: {str(e)}")
+                            pdf_bytes = None
+                    
+                    success, msg = email_sender.send_email(
+                        publisher_id=publisher_id,
+                        to_email=to_email,
+                        subject=subject,
+                        body=body,
+                        to_name=selected['name'],
+                        pdf_attachment=pdf_bytes,
+                    )
+                
+                if success:
+                    st.success(f"Email sent to {to_email}!")
+                    if to_email == selected.get('email'):
+                        mark_author_notified(
+                            selected['orcid_id'],
+                            author_name=selected.get('name', ''),
+                            email=to_email,
+                            publisher=publisher_id
+                        )
                     else:
-                        st.error(f"Failed: {msg}")
+                        st.info("Note: Email was sent to a test address. Author not marked as notified.")
+                    st.rerun()
+                else:
+                    st.error(f"Failed: {msg}")
         elif not to_email:
             st.warning("No email address. Enter one above.")
         elif send_blocked:
