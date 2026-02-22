@@ -330,6 +330,10 @@ def render_sidebar():
             publisher_options = {p['id']: f"{p['name']}" for p in publishers}
             
             current_publisher = st.session_state.app_state.get('publisher', 'peninsula')
+            if publisher_options and current_publisher not in publisher_options:
+                current_publisher = list(publisher_options.keys())[0]
+                st.session_state.app_state['publisher'] = current_publisher
+                save_state()
             
             selected_publisher = st.selectbox(
                 "Select Publisher",
@@ -390,6 +394,37 @@ def render_sidebar():
                     st.success(msg)
                 else:
                     st.error(msg)
+            
+            # Send test email to any address
+            st.caption("Send test email to any address:")
+            test_email_to = st.text_input(
+                "Send test email to",
+                placeholder="e.g. you@example.com",
+                key="test_email_to",
+                label_visibility="collapsed"
+            )
+            if st.button("Send test email", use_container_width=True):
+                if not test_email_to or not test_email_to.strip():
+                    st.warning("Enter an email address.")
+                else:
+                    test_email_to = test_email_to.strip()
+                    valid, validation_msg = validate_email_for_send(test_email_to)
+                    if not valid:
+                        st.error(validation_msg)
+                    else:
+                        with st.spinner("Sending test email..."):
+                            success, msg = email_sender.send_email(
+                                selected_publisher,
+                                to_email=test_email_to,
+                                subject="Test email from Editorial Board Invitation Tool",
+                                body="This is a test email. If you received this, the sender is configured correctly.",
+                                to_name="Test recipient",
+                                force_account_email=force_account
+                            )
+                        if success:
+                            st.success(f"Test email sent to {test_email_to}.")
+                        else:
+                            st.error(msg)
         else:
             st.warning("Email credentials not found. Create email_credentials.json")
             selected_publisher = 'peninsula'
