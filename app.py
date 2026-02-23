@@ -106,19 +106,20 @@ def is_author_notified(orcid_id: str) -> bool:
     return orcid_id in sent
 
 
-def mark_author_notified(orcid_id: str, author_name: str = "", email: str = "", publisher: str = ""):
-    """Mark author as notified in Supabase and local state."""
-    # Save to Supabase (persistent)
+def mark_author_notified(orcid_id: str, author_name: str = "", email: str = "", publisher: str = "") -> bool:
+    """Mark author as notified in Supabase and local state. Returns True if Supabase save succeeded (or DB not used)."""
+    supabase_ok = True
     if supabase_storage.available:
-        supabase_storage.mark_sent(orcid_id, author_name, email, publisher)
-    
-    # Also save to local state (backup)
+        supabase_ok = supabase_storage.mark_sent(orcid_id, author_name, email, publisher)
+
+    # Always update local state (backup / offline)
     sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(sent, list):
         sent = set(sent)
     sent.add(orcid_id)
     st.session_state.app_state['sent_invitations'] = sent
     save_state()
+    return supabase_ok
 
 
 @st.dialog("Send Invitation Email", width="large")
@@ -259,14 +260,15 @@ def email_dialog(author: dict, filters: dict):
                 )
                 
                 if success:
-                    if to_email == author.get('email'):
-                        mark_author_notified(
-                            author['orcid_id'],
-                            author_name=author.get('name', ''),
-                            email=to_email,
-                            publisher=publisher_id
-                        )
+                    db_ok = mark_author_notified(
+                        author['orcid_id'],
+                        author_name=author.get('name', ''),
+                        email=to_email,
+                        publisher=publisher_id
+                    )
                     st.success(f"Email sent to {to_email}!")
+                    if not db_ok:
+                        st.warning("Sent status could not be saved to the database; it may not persist across sessions.")
                     time.sleep(1)
                     st.rerun()
                 else:
@@ -1296,16 +1298,17 @@ def render_invitation_section(filters):
                     )
                 
                 if success:
+                    db_ok = mark_author_notified(
+                        selected['orcid_id'],
+                        author_name=selected.get('name', ''),
+                        email=to_email,
+                        publisher=publisher_id
+                    )
                     st.success(f"Email sent to {to_email}!")
-                    if to_email == selected.get('email'):
-                        mark_author_notified(
-                            selected['orcid_id'],
-                            author_name=selected.get('name', ''),
-                            email=to_email,
-                            publisher=publisher_id
-                        )
-                    else:
-                        st.info("Note: Email was sent to a test address. Author not marked as notified.")
+                    if not db_ok:
+                        st.warning("Sent status could not be saved to the database; it may not persist across sessions.")
+                    if to_email != selected.get('email'):
+                        st.info("Note: Email was sent to a different address; author is still marked as notified.")
                     st.rerun()
                 else:
                     st.error(f"Failed: {msg}")

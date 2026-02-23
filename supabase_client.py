@@ -58,22 +58,38 @@ class SupabaseStorage:
         """Mark an author as sent invitation."""
         if not self.available or not self.client:
             return False
-        
+
+        data = {
+            "orcid_id": orcid_id,
+            "author_name": author_name,
+            "email": email,
+            "publisher": publisher,
+            "sent_at": datetime.utcnow().isoformat()
+        }
+
         try:
-            data = {
-                "orcid_id": orcid_id,
-                "author_name": author_name,
-                "email": email,
-                "publisher": publisher,
-                "sent_at": datetime.utcnow().isoformat()
-            }
-            
-            # Upsert - insert or update if exists
+            # Upsert - requires UNIQUE(orcid_id) or PRIMARY KEY on orcid_id
             self.client.table(self.TABLE_NAME).upsert(data, on_conflict="orcid_id").execute()
             return True
-        except Exception as e:
-            print(f"Supabase mark_sent error: {e}")
-            return False
+        except Exception as e1:
+            print(f"Supabase mark_sent upsert error: {e1}")
+            try:
+                # Fallback: insert (table may use default id PK and no unique on orcid_id)
+                self.client.table(self.TABLE_NAME).insert(data).execute()
+                return True
+            except Exception as e2:
+                try:
+                    # Already exists: update by orcid_id
+                    self.client.table(self.TABLE_NAME).update({
+                        "author_name": author_name,
+                        "email": email,
+                        "publisher": publisher,
+                        "sent_at": data["sent_at"]
+                    }).eq("orcid_id", orcid_id).execute()
+                    return True
+                except Exception as e3:
+                    print(f"Supabase mark_sent fallback error: {e3}")
+                    return False
     
     def is_sent(self, orcid_id: str) -> bool:
         """Check if author has been sent invitation."""
