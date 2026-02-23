@@ -104,13 +104,29 @@ class SupabaseStorage:
             return False
     
     def get_all_sent(self) -> Set[str]:
-        """Get all sent ORCID IDs."""
+        """Get all sent ORCID IDs (paginated to fetch full table, not just first 1000)."""
         if not self.available or not self.client:
             return set()
-        
+
+        page_size = 1000
+        all_orcids: Set[str] = set()
+        offset = 0
         try:
-            result = self.client.table(self.TABLE_NAME).select("orcid_id").execute()
-            return {row["orcid_id"] for row in result.data}
+            while True:
+                result = (
+                    self.client.table(self.TABLE_NAME)
+                    .select("orcid_id")
+                    .range(offset, offset + page_size - 1)
+                    .execute()
+                )
+                rows = result.data or []
+                for row in rows:
+                    if row.get("orcid_id"):
+                        all_orcids.add(row["orcid_id"])
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+            return all_orcids
         except Exception as e:
             print(f"Supabase get_all_sent error: {e}")
             return set()

@@ -83,16 +83,15 @@ supabase_storage = get_supabase()
 
 
 def get_sent_invitations() -> set:
-    """Get sent invitations from Supabase (with local fallback)."""
-    # Try Supabase first (persistent)
-    if supabase_storage.available:
-        return supabase_storage.get_all_sent()
-    
-    # Fall back to local session state
-    sent = st.session_state.app_state.get('sent_invitations', set())
-    if isinstance(sent, list):
-        sent = set(sent)
-    return sent
+    """Get sent invitations: full list from Supabase (all rows) merged with local state so UI matches DB."""
+    # Supabase: fetch all sent (paginated so we get every record, not just first 1000)
+    db_sent = supabase_storage.get_all_sent() if supabase_storage.available else set()
+    # Local state (backup / same session)
+    local_sent = st.session_state.app_state.get('sent_invitations', set())
+    if isinstance(local_sent, list):
+        local_sent = set(local_sent)
+    # Union: show as sent if either DB or local has it (keeps UI in sync with all records)
+    return db_sent | local_sent
 
 
 def is_author_notified(orcid_id: str) -> bool:
@@ -877,7 +876,7 @@ def display_results(filters):
     with col_filter1:
         show_only_with_email = st.checkbox("Show only authors with email", value=False, key="filter_email")
     with col_filter2:
-        show_only_not_sent = st.checkbox("Hide already notified", value=False, key="filter_not_sent")
+        show_only_not_sent = st.checkbox("Hide already notified (show only pending)", value=False, key="filter_not_sent")
     
     # Apply email filter
     if show_only_with_email:
@@ -994,7 +993,7 @@ def display_results(filters):
     with header_cols[4]:
         st.markdown("**Email**")
     with header_cols[5]:
-        st.markdown("**Action**")
+        st.markdown("**Send / Re-send**")
     
     st.divider()
     
@@ -1083,7 +1082,7 @@ def display_results(filters):
         with cols[5]:
             if has_email:
                 if is_notified:
-                    btn_label = "⚠️ Re-send"
+                    btn_label = "Re-send"
                     btn_type = "secondary"
                 else:
                     btn_label = "Send"
