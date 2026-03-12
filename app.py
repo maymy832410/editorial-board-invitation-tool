@@ -183,14 +183,14 @@ def email_dialog(author: dict, filters: dict):
     subject = st.text_input(
         "Subject",
         value=formatted['subject'],
-        key="dialog_subject"
+        key=f"dialog_subject_{template_id}_{scopus_indexed}"
     )
     
     body = st.text_area(
         "Email Body",
         value=formatted['body'],
         height=300,
-        key="dialog_body"
+        key=f"dialog_body_{template_id}_{scopus_indexed}"
     )
     
     # PDF option
@@ -1211,7 +1211,7 @@ def render_invitation_section(filters):
     subject = st.text_input(
         "Subject",
         value=formatted['subject'],
-        key=f"email_subject_{author_key}_{template_id}"
+        key=f"email_subject_{author_key}_{template_id}_{scopus_indexed}"
     )
     
     # Body - editable
@@ -1219,7 +1219,7 @@ def render_invitation_section(filters):
         "Email Body",
         value=formatted['body'],
         height=350,
-        key=f"email_body_{author_key}_{template_id}"
+        key=f"email_body_{author_key}_{template_id}_{scopus_indexed}"
     )
     
     st.divider()
