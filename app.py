@@ -27,7 +27,7 @@ from templates import (
     TEMPLATE_MANAGING_EDITOR,
     TEMPLATE_EDITOR_IN_CHIEF,
 )
-from pdf_generator import generate_invitation_pdf
+from pdf_generator import generate_invitation_pdf, PUBLISHER_INFO
 from supabase_client import get_storage as get_supabase_storage
 # Page config
 st.set_page_config(
@@ -151,8 +151,10 @@ def email_dialog(author: dict, filters: dict):
         key="dialog_template"
     )
     
-    # Format template
-    publisher_name = email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else ""
+    # Format template - publisher name and location come from PUBLISHER_INFO (follows selected publisher)
+    pub_info = PUBLISHER_INFO.get(publisher_id, {})
+    publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
+    publisher_location = pub_info.get('location') or journal_config.get('location', '')
     sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
     
     formatted = format_template(
@@ -164,7 +166,7 @@ def email_dialog(author: dict, filters: dict):
         editor_in_chief_name=journal_config.get('editor_in_chief', ''),
         publisher_name=publisher_name,
         sender_email=sender_email,
-        publisher_location=journal_config.get('location', '')
+        publisher_location=publisher_location
     )
     
     # Editable email fields
@@ -1163,8 +1165,10 @@ def render_invitation_section(filters):
         else:
             st.warning("No email available")
     
-    # Format template
-    publisher_name = email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else ""
+    # Format template - publisher name and location come from PUBLISHER_INFO (follows selected publisher)
+    pub_info = PUBLISHER_INFO.get(publisher_id, {})
+    publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
+    publisher_location = pub_info.get('location') or journal_config.get('location', '')
     sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
     
     formatted = format_template(
@@ -1176,7 +1180,7 @@ def render_invitation_section(filters):
         editor_in_chief_name=journal_config.get('editor_in_chief', ''),
         publisher_name=publisher_name,
         sender_email=sender_email,
-        publisher_location=journal_config.get('location', '')
+        publisher_location=publisher_location
     )
     
     st.divider()
