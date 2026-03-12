@@ -1004,8 +1004,8 @@ def display_results(filters):
     
     st.divider()
     
-    # Display rows with Send buttons (paginated for performance)
-    page_size = 50
+    # Display rows with Send buttons (paginated)
+    page_size = 25
     total_pages = (len(filtered) + page_size - 1) // page_size
     
     if 'results_page' not in st.session_state:
@@ -1030,13 +1030,142 @@ def display_results(filters):
     end_idx = min(start_idx + page_size, len(filtered))
     page_results = filtered[start_idx:end_idx]
     
-    # Display rows
+    # --- Bulk send controls ---
+    from datetime import date as _date
+    DAILY_CAP = 280
+    if 'bulk_send_date' not in st.session_state or st.session_state.bulk_send_date != str(_date.today()):
+        st.session_state.bulk_send_date = str(_date.today())
+        st.session_state.bulk_sends_today = 0
+    
+    page_with_email = [a for a in page_results if a.get('email')]
+    page_not_sent = [a for a in page_with_email if a.get('orcid_id', '') not in sent_invitations]
+    
+    col_sel, col_skip, col_bulk = st.columns([1.2, 1.2, 1.6])
+    with col_sel:
+        select_all = st.checkbox(
+            f"Select all on page ({len(page_with_email)} with email)",
+            key=f"select_all_page_{st.session_state.results_page}"
+        )
+    with col_skip:
+        skip_notified = st.checkbox("Skip already notified", value=True, key="bulk_skip_notified")
+    
+    eligible = page_not_sent if skip_notified else page_with_email
+    remaining_today = max(0, DAILY_CAP - st.session_state.bulk_sends_today)
+    batch_size = min(len(eligible), remaining_today) if select_all else 0
+    
+    with col_bulk:
+        if remaining_today == 0:
+            st.warning("Daily limit reached (280/day)")
+        elif select_all and batch_size < len(eligible):
+            st.caption(f"Capped to {batch_size} (daily limit: {remaining_today} left)")
+        
+        bulk_send_clicked = st.button(
+            f"Send Bulk ({batch_size} emails)" if select_all else "Select all to bulk send",
+            type="primary" if select_all and batch_size > 0 and EMAIL_AVAILABLE else "secondary",
+            disabled=not (select_all and batch_size > 0 and EMAIL_AVAILABLE),
+            use_container_width=True,
+            key=f"bulk_send_{st.session_state.results_page}"
+        )
+    
+    st.caption(f"Brevo daily sends: {st.session_state.bulk_sends_today}/{DAILY_CAP} used today")
+    
+    # --- Execute bulk send ---
+    if bulk_send_clicked and select_all and batch_size > 0:
+        journal_config = st.session_state.app_state.get('journal_config', {})
+        publisher_id = filters.get('publisher', 'brevo')
+        template_id = st.session_state.get('template_select', TEMPLATE_BOARD_MEMBER)
+        scopus_indexed = st.session_state.get('main_scopus', False)
+        attach_pdf = st.session_state.get('attach_pdf', True)
+        
+        pub_info = PUBLISHER_INFO.get(publisher_id, {})
+        publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
+        publisher_location = pub_info.get('location') or journal_config.get('location', '')
+        sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
+        
+        batch = eligible[:batch_size]
+        sent_ok = 0
+        failed = 0
+        errors = []
+        
+        progress_bar = st.progress(0, text="Starting bulk send...")
+        status_area = st.empty()
+        
+        for i, author in enumerate(batch):
+            author_name = author.get('name', 'Unknown')
+            to_email = author.get('email', '')
+            
+            status_area.info(f"Sending {i+1}/{len(batch)}: {author_name} ({to_email})")
+            
+            formatted = format_template(
+                template_id=template_id,
+                author_name=author_name,
+                journal_name=journal_config.get('name', ''),
+                journal_issn=journal_config.get('issn', ''),
+                journal_link=journal_config.get('link', ''),
+                editor_in_chief_name=journal_config.get('editor_in_chief', ''),
+                publisher_name=publisher_name,
+                sender_email=sender_email,
+                publisher_location=publisher_location,
+                scopus_indexed=scopus_indexed
+            )
+            
+            pdf_bytes = None
+            if attach_pdf:
+                try:
+                    pdf_bytes = generate_invitation_pdf(
+                        publisher_id=publisher_id,
+                        recipient_name=author_name,
+                        email_body=formatted['body'],
+                        subject=formatted['subject'],
+                        journal_name=journal_config.get('name', ''),
+                        journal_link=journal_config.get('link', '')
+                    )
+                except Exception:
+                    pdf_bytes = None
+            
+            success, msg = email_sender.send_email(
+                publisher_id=publisher_id,
+                to_email=to_email,
+                subject=formatted['subject'],
+                body=formatted['body'],
+                to_name=author_name,
+                pdf_attachment=pdf_bytes,
+            )
+            
+            if success:
+                sent_ok += 1
+                st.session_state.bulk_sends_today += 1
+                mark_author_notified(
+                    author.get('orcid_id', ''),
+                    author_name=author_name,
+                    email=to_email,
+                    publisher=publisher_id
+                )
+            else:
+                failed += 1
+                errors.append(f"{author_name}: {msg}")
+            
+            progress_bar.progress((i + 1) / len(batch), text=f"Sent {sent_ok}, failed {failed} of {len(batch)}")
+            
+            if i < len(batch) - 1:
+                time.sleep(2)
+        
+        progress_bar.progress(1.0, text="Done!")
+        if sent_ok > 0:
+            st.success(f"Bulk send complete: {sent_ok}/{len(batch)} sent successfully.")
+        if failed > 0:
+            st.warning(f"{failed} failed:")
+            for err in errors:
+                st.caption(f"  - {err}")
+        time.sleep(2)
+        st.rerun()
+    
+    # --- Display rows ---
     for idx, author in enumerate(page_results):
         orcid_id = author.get('orcid_id', '')
         is_notified = orcid_id in sent_invitations
         has_email = bool(author.get('email'))
         
-        # Row styling based on status
         if is_notified:
             row_class = "notified-row"
         elif has_email:
@@ -1058,7 +1187,6 @@ def display_results(filters):
         
         with cols[2]:
             specialty = author.get('specialty', '') or ''
-            # Truncate long specialty names
             if len(specialty) > 30:
                 specialty = specialty[:27] + "..."
             st.write(specialty)
@@ -1070,14 +1198,11 @@ def display_results(filters):
             email = author.get('email', '')
             all_emails = author.get('all_emails', '')
             if email:
-                # Show all emails if multiple found, otherwise just primary
                 display_email = all_emails if all_emails else email
-                # Truncate long emails
                 if len(display_email) > 30:
                     email_display = display_email[:27] + "..."
                 else:
                     email_display = display_email
-                # Show source indicator
                 source = author.get('email_source', 'orcid')
                 if source == 'web_search':
                     st.write(f"🔍 {email_display}")
@@ -1095,7 +1220,6 @@ def display_results(filters):
                     btn_label = "Send"
                     btn_type = "primary"
                 if st.button(btn_label, key=f"send_{orcid_id}_{start_idx + idx}", type=btn_type, use_container_width=True):
-                    # Open dialog for this author
                     email_dialog(author, filters)
             else:
                 st.button("—", disabled=True, key=f"no_email_{start_idx + idx}", use_container_width=True)
@@ -1114,7 +1238,6 @@ def display_results(filters):
             use_container_width=True
         )
     with col2:
-        # Export only with emails
         df_with_email = df[df['Email'] != '']
         if not df_with_email.empty:
             csv_email = df_with_email.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
