@@ -144,12 +144,16 @@ def email_dialog(author: dict, filters: dict):
     
     # Template selection
     template_names = get_template_names()
-    template_id = st.selectbox(
-        "Invitation Type",
-        options=list(template_names.keys()),
-        format_func=lambda x: template_names[x],
-        key="dialog_template"
-    )
+    col_type, col_scopus = st.columns([2, 1])
+    with col_type:
+        template_id = st.selectbox(
+            "Invitation Type",
+            options=list(template_names.keys()),
+            format_func=lambda x: template_names[x],
+            key="dialog_template"
+        )
+    with col_scopus:
+        scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key="dialog_scopus")
     
     # Format template - publisher name and location come from PUBLISHER_INFO (follows selected publisher)
     pub_info = PUBLISHER_INFO.get(publisher_id, {})
@@ -166,7 +170,8 @@ def email_dialog(author: dict, filters: dict):
         editor_in_chief_name=journal_config.get('editor_in_chief', ''),
         publisher_name=publisher_name,
         sender_email=sender_email,
-        publisher_location=publisher_location
+        publisher_location=publisher_location,
+        scopus_indexed=scopus_indexed
     )
     
     # Editable email fields
@@ -1157,6 +1162,7 @@ def render_invitation_section(filters):
             format_func=lambda x: template_names[x],
             key="template_select"
         )
+        scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key="main_scopus")
     
     with col2:
         st.markdown(f"**Selected Author:** {selected['name']}")
@@ -1180,7 +1186,8 @@ def render_invitation_section(filters):
         editor_in_chief_name=journal_config.get('editor_in_chief', ''),
         publisher_name=publisher_name,
         sender_email=sender_email,
-        publisher_location=publisher_location
+        publisher_location=publisher_location,
+        scopus_indexed=scopus_indexed
     )
     
     st.divider()
