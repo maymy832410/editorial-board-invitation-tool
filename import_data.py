@@ -26,7 +26,7 @@ def get_conn():
         dbname=parsed.path.lstrip("/"),
         user=parsed.username,
         password=parsed.password,
-        sslmode="require",
+        sslmode="disable",
     )
     conn.autocommit = True
     return conn

@@ -22,7 +22,7 @@ def _get_connection_params():
         "dbname": parsed.path.lstrip("/"),
         "user": parsed.username,
         "password": parsed.password,
-        "sslmode": "require",
+        "sslmode": "disable",
     }
 
 
