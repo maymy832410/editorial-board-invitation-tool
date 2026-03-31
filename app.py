@@ -82,6 +82,103 @@ def get_db():
 db_storage = get_db()
 
 
+def _import_sent_csv(uploaded_file):
+    """Import sent invitations from an uploaded CSV file."""
+    import csv, io
+    try:
+        text = uploaded_file.read().decode("utf-8")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = []
+        for row in reader:
+            orcid_id = row.get("orcid_id", "").strip()
+            if not orcid_id:
+                continue
+            rows.append((
+                orcid_id,
+                row.get("author_name", "").strip(),
+                row.get("email", "").strip(),
+                row.get("publisher", "").strip(),
+                row.get("sent_at", "").strip() or None,
+            ))
+        if not rows:
+            st.warning("No valid rows found in CSV.")
+            return
+        with st.spinner(f"Importing {len(rows)} sent invitations..."):
+            import psycopg2.extras
+            with db_storage._get_cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO sent_invitations (orcid_id, author_name, email, publisher, sent_at)
+                       VALUES %s ON CONFLICT (orcid_id) DO NOTHING""",
+                    rows,
+                    page_size=1000,
+                )
+        st.success(f"Imported {len(rows)} sent invitations.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Import failed: {e}")
+
+
+def _import_retraction_csv(uploaded_file):
+    """Import retraction watch data from an uploaded CSV file."""
+    import csv, io
+    try:
+        existing = db_storage.get_retracted_count()
+        if existing > 0:
+            st.warning(f"retracted_authors already has {existing} rows. Clear first to re-import.")
+            return
+        text = uploaded_file.read().decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        total = 0
+        batch = []
+        batch_size = 5000
+        progress = st.progress(0, text="Reading retraction data...")
+        import psycopg2.extras
+        for i, row in enumerate(reader):
+            authors_str = row.get("Author", "")
+            if not authors_str:
+                continue
+            record_id = row.get("Record ID", "").strip()
+            journal = row.get("Journal", "").strip()
+            publisher = row.get("Publisher", "").strip()
+            retraction_date = row.get("RetractionDate", "").strip()
+            reason = row.get("Reason", "").strip()
+            for name in authors_str.split(";"):
+                name = name.strip()
+                if not name:
+                    continue
+                batch.append((name, name.lower(), record_id, journal, publisher, retraction_date, reason))
+            if len(batch) >= batch_size:
+                with db_storage._get_cursor() as cur:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """INSERT INTO retracted_authors
+                           (author_name, author_name_lower, record_id, journal, publisher, retraction_date, reason)
+                           VALUES %s""",
+                        batch,
+                        page_size=2000,
+                    )
+                total += len(batch)
+                batch = []
+                progress.progress(min(i / 70000, 0.99), text=f"Inserted {total} author entries...")
+        if batch:
+            with db_storage._get_cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO retracted_authors
+                       (author_name, author_name_lower, record_id, journal, publisher, retraction_date, reason)
+                       VALUES %s""",
+                    batch,
+                    page_size=2000,
+                )
+            total += len(batch)
+        progress.progress(1.0, text="Done!")
+        st.success(f"Imported {total} retracted author entries.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Import failed: {e}")
+
+
 def get_sent_invitations() -> set:
     """Get sent invitations: full list from DB (all rows) merged with local state so UI matches DB."""
     db_sent = db_storage.get_all_sent() if db_storage.available else set()
@@ -514,6 +611,42 @@ def render_sidebar():
         
         if use_tavily or use_openai_web:
             st.caption("🔍 Searches faculty pages, Google Scholar, ResearchGate")
+        
+        st.divider()
+        
+        # Data Import Section
+        with st.expander("📥 Data Import (Admin)"):
+            st.caption("Import CSV data into the database")
+            
+            # Sent Invitations Import
+            sent_file = st.file_uploader(
+                "Sent Invitations CSV",
+                type=["csv"],
+                help="CSV with columns: orcid_id, author_name, email, publisher, sent_at",
+                key="sent_csv_upload"
+            )
+            if sent_file and st.button("Import Sent Invitations", key="btn_import_sent"):
+                _import_sent_csv(sent_file)
+            
+            st.divider()
+            
+            # Retraction Watch Import
+            retract_file = st.file_uploader(
+                "Retraction Watch CSV",
+                type=["csv"],
+                help="CSV with columns: Author (semicolon-separated), Record ID, Journal, Publisher, RetractionDate, Reason",
+                key="retract_csv_upload"
+            )
+            if retract_file and st.button("Import Retraction Watch", key="btn_import_retract"):
+                _import_retraction_csv(retract_file)
+            
+            # Show current counts
+            try:
+                sent_count = db_storage.get_sent_count()
+                retracted_count = db_storage.get_retracted_count()
+                st.info(f"DB: {sent_count} sent invitations, {retracted_count} retracted authors")
+            except Exception:
+                pass
         
         st.divider()
         
