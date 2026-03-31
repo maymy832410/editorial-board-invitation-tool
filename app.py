@@ -28,7 +28,7 @@ from templates import (
     TEMPLATE_EDITOR_IN_CHIEF,
 )
 from pdf_generator import generate_invitation_pdf, PUBLISHER_INFO
-from supabase_client import get_storage as get_supabase_storage
+from db_client import get_storage as get_db_storage
 # Page config
 st.set_page_config(
     page_title="Editorial Board Invitation Tool",
@@ -73,31 +73,29 @@ def save_state():
     state_mgr.save_state(st.session_state.app_state)
 
 
-# Supabase storage for persistent sent tracking
+# PostgreSQL storage for persistent sent tracking
 @st.cache_resource
-def get_supabase():
-    """Get cached Supabase storage instance."""
-    return get_supabase_storage()
+def get_db():
+    """Get cached PostgreSQL storage instance."""
+    return get_db_storage()
 
-supabase_storage = get_supabase()
+db_storage = get_db()
 
 
 def get_sent_invitations() -> set:
-    """Get sent invitations: full list from Supabase (all rows) merged with local state so UI matches DB."""
-    # Supabase: fetch all sent (paginated so we get every record, not just first 1000)
-    db_sent = supabase_storage.get_all_sent() if supabase_storage.available else set()
+    """Get sent invitations: full list from DB (all rows) merged with local state so UI matches DB."""
+    db_sent = db_storage.get_all_sent() if db_storage.available else set()
     # Local state (backup / same session)
     local_sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(local_sent, list):
         local_sent = set(local_sent)
-    # Union: show as sent if either DB or local has it (keeps UI in sync with all records)
     return db_sent | local_sent
 
 
 def is_author_notified(orcid_id: str) -> bool:
-    """Check if author was notified (Supabase with local fallback)."""
-    if supabase_storage.available:
-        return supabase_storage.is_sent(orcid_id)
+    """Check if author was notified (DB with local fallback)."""
+    if db_storage.available:
+        return db_storage.is_sent(orcid_id)
     
     sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(sent, list):
@@ -106,10 +104,10 @@ def is_author_notified(orcid_id: str) -> bool:
 
 
 def mark_author_notified(orcid_id: str, author_name: str = "", email: str = "", publisher: str = "") -> bool:
-    """Mark author as notified in Supabase and local state. Returns True if Supabase save succeeded (or DB not used)."""
-    supabase_ok = True
-    if supabase_storage.available:
-        supabase_ok = supabase_storage.mark_sent(orcid_id, author_name, email, publisher)
+    """Mark author as notified in DB and local state. Returns True if DB save succeeded."""
+    db_ok = True
+    if db_storage.available:
+        db_ok = db_storage.mark_sent(orcid_id, author_name, email, publisher)
 
     # Always update local state (backup / offline)
     sent = st.session_state.app_state.get('sent_invitations', set())
@@ -118,7 +116,7 @@ def mark_author_notified(orcid_id: str, author_name: str = "", email: str = "", 
     sent.add(orcid_id)
     st.session_state.app_state['sent_invitations'] = sent
     save_state()
-    return supabase_ok
+    return db_ok
 
 
 @st.dialog("Send Invitation Email", width="large")
@@ -128,7 +126,6 @@ def email_dialog(author: dict, filters: dict):
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'brevo')
     
-    # Check if already notified (using Supabase)
     is_already_notified = is_author_notified(author.get('orcid_id', ''))
     
     # WARNING BANNER for already notified authors
@@ -291,7 +288,7 @@ def render_sidebar():
         st.title("Configuration")
         
         # Database Status Indicator
-        db_status = supabase_storage.get_status()
+        db_status = db_storage.get_status()
         if db_status["available"]:
             st.success("🟢 Database: Connected")
         else:
@@ -654,9 +651,10 @@ def run_search(filters):
         progress_bar.progress(1.0)
         status_text.text(f"Completed! Fetched {len(results)} authors.")
         
-        # Save results
+        # Save results and reset stale state
         st.session_state.app_state['search_results'] = results
         st.session_state.app_state['processed_orcids'] = set()
+        st.session_state.filtered_authors = []  # clear stale filtered list
         st.session_state.app_state['search_params'] = {
             'keyword_tags': keyword_tags,
             'h_index_min': filters['h_min'],
@@ -831,8 +829,15 @@ def display_results(filters):
     
     filtered = results.copy()
     
-    # Get sent invitations from Supabase (persistent)
+    # Get sent invitations from DB (persistent)
     sent_invitations = get_sent_invitations()
+    
+    # Get retracted author names from DB (lowercased set for fast matching)
+    retracted_names = db_storage.get_retracted_names() if db_storage.available else set()
+    
+    # Tag each author with retraction and sent status
+    for r in filtered:
+        r['is_retracted'] = r.get('name', '').lower() in retracted_names
     
     # Collect unique disciplines and specialties from results
     all_disciplines = set()
@@ -879,11 +884,13 @@ def display_results(filters):
         ]
     
     # Filter options - Row 2: Checkboxes
-    col_filter1, col_filter2 = st.columns(2)
+    col_filter1, col_filter2, col_filter3 = st.columns(3)
     with col_filter1:
         show_only_with_email = st.checkbox("Show only authors with email", value=False, key="filter_email")
     with col_filter2:
-        show_only_not_sent = st.checkbox("Hide already notified (show only pending)", value=False, key="filter_not_sent")
+        show_only_not_sent = st.checkbox("Hide already notified", value=False, key="filter_not_sent")
+    with col_filter3:
+        hide_retracted = st.checkbox("Hide retracted authors", value=True, key="filter_retracted")
     
     # Apply email filter
     if show_only_with_email:
@@ -892,6 +899,10 @@ def display_results(filters):
     # Apply sent filter
     if show_only_not_sent:
         filtered = [r for r in filtered if r.get('orcid_id') not in sent_invitations]
+    
+    # Apply retraction filter
+    if hide_retracted:
+        filtered = [r for r in filtered if not r.get('is_retracted')]
     
     # Store filtered list in session state for email fetching
     st.session_state.filtered_authors = filtered
@@ -920,17 +931,20 @@ def display_results(filters):
         run_email_fetch_filtered(filters)
     
     # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("Filtered Authors", len(filtered))
+        st.metric("Total", len(filtered))
     with col2:
         with_email = sum(1 for r in filtered if r.get('email'))
         st.metric("With Email", with_email)
     with col3:
-        sent_count = sum(1 for r in filtered if r.get('orcid_id') in sent_invitations)
-        st.metric("Notified", sent_count)
+        st.metric("Without Email", without_email)
     with col4:
-        st.metric("Need Email", without_email)
+        retracted_count = sum(1 for r in filtered if r.get('is_retracted'))
+        st.metric("Retracted", retracted_count)
+    with col5:
+        sent_count = sum(1 for r in filtered if r.get('orcid_id') in sent_invitations)
+        st.metric("Previously Sent", sent_count)
     
     st.divider()
     
@@ -945,6 +959,11 @@ def display_results(filters):
     df_data = []
     for r in filtered:
         orcid_id = r.get('orcid_id', '')
+        status = ''
+        if r.get('is_retracted'):
+            status = '🚫 RETRACTED'
+        elif orcid_id in sent_invitations:
+            status = '✅ SENT'
         df_data.append({
             'Name': r.get('name', ''),
             'H-Index': r.get('h_index', ''),
@@ -954,7 +973,7 @@ def display_results(filters):
             'All_Emails': r.get('all_emails', '') or r.get('email', '') or '',
             'Institution': r.get('institution', ''),
             'Country': r.get('country', ''),
-            'Status': '✅ SENT' if orcid_id in sent_invitations else '',
+            'Status': status,
             'orcid_id': orcid_id,
             'all_topics': r.get('all_topics', [])
         })
@@ -967,6 +986,13 @@ def display_results(filters):
     .notified-row {
         background-color: #d4edda !important;
         border-left: 4px solid #28a745;
+        padding: 5px;
+        margin: 2px 0;
+        border-radius: 4px;
+    }
+    .retracted-row {
+        background-color: #f8d7da !important;
+        border-left: 4px solid #dc3545;
         padding: 5px;
         margin: 2px 0;
         border-radius: 4px;
@@ -1038,7 +1064,7 @@ def display_results(filters):
         st.session_state.bulk_sends_today = 0
     
     page_with_email = [a for a in page_results if a.get('email')]
-    page_not_sent = [a for a in page_with_email if a.get('orcid_id', '') not in sent_invitations]
+    page_not_sent = [a for a in page_with_email if a.get('orcid_id', '') not in sent_invitations and not a.get('is_retracted')]
     
     col_sel, col_skip, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_sel:
@@ -1164,9 +1190,12 @@ def display_results(filters):
     for idx, author in enumerate(page_results):
         orcid_id = author.get('orcid_id', '')
         is_notified = orcid_id in sent_invitations
+        is_retracted = author.get('is_retracted', False)
         has_email = bool(author.get('email'))
         
-        if is_notified:
+        if is_retracted:
+            row_class = "retracted-row"
+        elif is_notified:
             row_class = "notified-row"
         elif has_email:
             row_class = "pending-row"
@@ -1177,7 +1206,9 @@ def display_results(filters):
         
         with cols[0]:
             name_display = author.get('name', '')
-            if is_notified:
+            if is_retracted:
+                st.markdown(f"🚫 ~~{name_display}~~ :red[RETRACTED]")
+            elif is_notified:
                 st.markdown(f"✅ **{name_display}** :green[SENT]")
             else:
                 st.write(name_display)
@@ -1212,7 +1243,9 @@ def display_results(filters):
                 st.caption("No email")
         
         with cols[5]:
-            if has_email:
+            if is_retracted:
+                st.button("🚫", disabled=True, key=f"retracted_{orcid_id}_{start_idx + idx}", use_container_width=True)
+            elif has_email:
                 if is_notified:
                     btn_label = "Re-send"
                     btn_type = "secondary"
@@ -1268,7 +1301,6 @@ def render_invitation_section(filters):
         st.warning("Please configure journal details in the sidebar.")
         return
     
-    # Check if already notified - show warning at TOP (using Supabase)
     is_already_notified = is_author_notified(selected.get('orcid_id', ''))
     
     if is_already_notified:

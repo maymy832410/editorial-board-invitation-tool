@@ -2,6 +2,11 @@
 email_credentials.json
 .streamlit/secrets.toml
 
+# Large CSV data files (import via script, not git)
+retraction_watch.csv
+sent_invitations_rows*.csv
+Attachment_*.txt
+
 # Data folder
 data/
 
