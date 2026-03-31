@@ -1,6 +1,7 @@
 """Email sender for sending invitations via SMTP (Brevo or other)."""
 
 import json
+import os
 import smtplib
 import ssl
 from email.mime.text import MIMEText
@@ -48,6 +49,14 @@ class EmailSender:
                     return credentials
         except Exception:
             pass
+
+        # Try EMAIL_CREDENTIALS environment variable (JSON string)
+        env_creds = os.environ.get("EMAIL_CREDENTIALS", "")
+        if env_creds:
+            try:
+                return json.loads(env_creds)
+            except json.JSONDecodeError:
+                pass
 
         cred_path = Path(__file__).parent / self.CREDENTIALS_FILE
         if not cred_path.exists():
