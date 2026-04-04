@@ -948,8 +948,15 @@ def run_email_fetch_filtered(filters):
         save_state()
     
     total_found = orcid_emails_found + openai_emails_found
-    status_text.text(f"Complete! Found {total_found} emails ({orcid_emails_found} ORCID + {openai_emails_found} Web)")
     st.session_state.stop_fetching = False
+    
+    # Save result message and rerun to ensure display refreshes with updated emails
+    st.session_state.last_fetch_result = (
+        f"Found {total_found} emails from {total} authors "
+        f"({orcid_emails_found} ORCID + {openai_emails_found} Web)"
+    )
+    save_state()
+    st.rerun()
 
 
 def display_results(filters):
@@ -960,6 +967,10 @@ def display_results(filters):
     if not results:
         st.info("No results yet. Use the search button above.")
         return
+    
+    # Show email fetch result message from previous run
+    if st.session_state.get('last_fetch_result'):
+        st.success(st.session_state.pop('last_fetch_result'))
     
     filtered = results.copy()
     
@@ -1061,6 +1072,12 @@ def display_results(filters):
     # Count authors without email in filtered list
     without_email = sum(1 for r in filtered if not r.get('email'))
     
+    # Check how many have been processed already
+    processed = st.session_state.app_state.get('processed_orcids', set())
+    if isinstance(processed, list):
+        processed = set(processed)
+    already_processed = sum(1 for r in filtered if r.get('orcid_id') in processed)
+    
     # Fetch Emails button - only for filtered authors
     st.divider()
     col_btn1, col_btn2 = st.columns([2, 1])
@@ -1074,6 +1091,16 @@ def display_results(filters):
         )
     with col_btn2:
         stop_clicked = st.button("Stop Fetching", use_container_width=True)
+    
+    # Show tip about email rates if many processed but few found
+    if already_processed > 0 and without_email > 0:
+        with_email_count = sum(1 for r in filtered if r.get('email'))
+        rate = (with_email_count / already_processed * 100) if already_processed > 0 else 0
+        if rate < 20:
+            st.caption(
+                f"ℹ️ ORCID public emails: ~10-15% of academics share their email publicly. "
+                f"Enable **Tavily search** or **OpenAI web search** in sidebar for more results."
+            )
     
     if stop_clicked:
         st.session_state.stop_fetching = True

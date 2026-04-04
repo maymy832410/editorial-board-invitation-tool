@@ -33,3 +33,4 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+test_openai_email.py

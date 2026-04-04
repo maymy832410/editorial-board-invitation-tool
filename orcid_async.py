@@ -54,25 +54,47 @@ class AsyncOrcidClient:
             Email if found, None otherwise
         """
         async with self.semaphore:
+            # Try /email endpoint first
             url = f"{self.base_url}/{orcid_id}/email"
             
             try:
                 async with self.session.get(url) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return self._parse_email(data)
+                        email = self._parse_email(data)
+                        if email:
+                            return email
                     elif response.status == 429:
-                        # Rate limited - wait and don't retry (will be handled by batch delay)
                         await asyncio.sleep(2)
                         return None
-                    else:
-                        return None
             except Exception:
-                return None
+                pass
+            
+            # Fallback: try /person endpoint (emails + researcher-urls)
+            try:
+                person_url = f"{self.base_url}/{orcid_id}/person"
+                async with self.session.get(person_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._parse_person_email(data)
+            except Exception:
+                pass
+            
+            return None
     
     def _parse_email(self, data: dict) -> Optional[str]:
-        """Parse email from ORCID API response."""
+        """Parse email from ORCID API /email response."""
         emails = data.get("email", [])
+        for email_entry in emails:
+            email = email_entry.get("email")
+            if email:
+                return email
+        return None
+    
+    def _parse_person_email(self, data: dict) -> Optional[str]:
+        """Parse email from ORCID API /person response (emails section)."""
+        emails_section = data.get("emails", {})
+        emails = emails_section.get("email", [])
         for email_entry in emails:
             email = email_entry.get("email")
             if email:
