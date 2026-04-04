@@ -1192,7 +1192,7 @@ def display_results(filters):
     """, unsafe_allow_html=True)
     
     # Table header
-    header_cols = st.columns([2.5, 0.7, 2, 1.5, 2, 1])
+    header_cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
     with header_cols[0]:
         st.markdown("**Name**")
     with header_cols[1]:
@@ -1202,8 +1202,10 @@ def display_results(filters):
     with header_cols[3]:
         st.markdown("**Discipline**")
     with header_cols[4]:
-        st.markdown("**Email**")
+        st.markdown("**Country**")
     with header_cols[5]:
+        st.markdown("**Email**")
+    with header_cols[6]:
         st.markdown("**Send / Re-send**")
     
     st.divider()
@@ -1380,7 +1382,7 @@ def display_results(filters):
         else:
             row_class = "no-email-row"
         
-        cols = st.columns([2.5, 0.7, 2, 1.5, 2, 1])
+        cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
         
         with cols[0]:
             name_display = author.get('name', '')
@@ -1404,6 +1406,10 @@ def display_results(filters):
             st.write(author.get('discipline', ''))
         
         with cols[4]:
+            country_code = author.get('country', '')
+            st.write(country_code or '—')
+        
+        with cols[5]:
             email = author.get('email', '')
             all_emails = author.get('all_emails', '')
             if email:
@@ -1420,7 +1426,7 @@ def display_results(filters):
             else:
                 st.caption("No email")
         
-        with cols[5]:
+        with cols[6]:
             if is_retracted:
                 st.button("🚫", disabled=True, key=f"retracted_{orcid_id}_{start_idx + idx}", use_container_width=True)
             elif has_email:
