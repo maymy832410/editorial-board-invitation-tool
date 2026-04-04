@@ -549,11 +549,12 @@ def render_sidebar():
                 key="h_max"
             )
         
-        countries = st.multiselect(
-            "Countries",
+        countries_to_exclude = st.multiselect(
+            "Exclude Countries",
             options=list(COUNTRIES.keys()),
-            default=search_params.get('countries', []),
-            key="countries"
+            default=search_params.get('exclude_countries', []),
+            key="exclude_countries",
+            help="Authors from these countries will be excluded from results"
         )
         
         max_results = st.number_input(
@@ -666,7 +667,7 @@ def render_sidebar():
             'keyword_tags': keyword_tags,
             'h_min': h_min,
             'h_max': h_max,
-            'countries': countries,
+            'exclude_countries': countries_to_exclude,
             'max_results': max_results,
             'concurrent': concurrent,
             'delay': delay,
@@ -707,7 +708,7 @@ def render_search_section(filters):
 def run_search(filters):
     """Execute the author search with keyword-based topic filtering."""
     
-    country_codes = [COUNTRIES[c] for c in filters['countries']] if filters['countries'] else None
+    exclude_country_codes = [COUNTRIES[c] for c in filters['exclude_countries']] if filters['exclude_countries'] else None
     
     client = OpenAlexClient()
     
@@ -737,8 +738,8 @@ def run_search(filters):
     
     # Show search info
     search_info = f"H-index: {filters['h_min']}-{filters['h_max']}"
-    if filters['countries']:
-        search_info += f" | Countries: {', '.join(filters['countries'])}"
+    if filters['exclude_countries']:
+        search_info += f" | Excluding: {', '.join(filters['exclude_countries'])}"
     if keywords:
         search_info += f" | Keywords: {', '.join(keywords[:3])}{'...' if len(keywords) > 3 else ''}"
     st.info(f"Searching: {search_info}")
@@ -748,7 +749,7 @@ def run_search(filters):
         total_count = client.get_total_count(
             h_index_min=filters['h_min'],
             h_index_max=filters['h_max'],
-            country_codes=country_codes,
+            exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=True
         )
@@ -768,7 +769,7 @@ def run_search(filters):
         for i, author in enumerate(client.search_authors(
             h_index_min=filters['h_min'],
             h_index_max=filters['h_max'],
-            country_codes=country_codes,
+            exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=True,
             max_results=filters['max_results']
@@ -792,7 +793,7 @@ def run_search(filters):
             'keyword_tags': keyword_tags,
             'h_index_min': filters['h_min'],
             'h_index_max': filters['h_max'],
-            'countries': filters['countries'],
+            'exclude_countries': filters['exclude_countries'],
             'max_results': filters['max_results']
         }
         save_state()
@@ -1015,6 +1016,23 @@ def display_results(filters):
             r for r in filtered 
             if selected_specialty in (r.get('all_topics') or []) or r.get('specialty') == selected_specialty
         ]
+    
+    # Country exclusion post-filter (supplements API-level exclusion)
+    all_countries = sorted({r.get('country') for r in results if r.get('country')})
+    if all_countries:
+        # Reverse-map codes to names for display
+        code_to_name = {v: k for k, v in COUNTRIES.items()}
+        country_options = [f"{code_to_name.get(c, c)} ({c})" for c in all_countries]
+        excluded_display = st.multiselect(
+            "Exclude Countries (post-filter)",
+            options=country_options,
+            default=[],
+            key="exclude_countries_postfilter",
+            help="Exclude authors from these countries in the results below"
+        )
+        if excluded_display:
+            excluded_codes = {opt.split("(")[-1].rstrip(")") for opt in excluded_display}
+            filtered = [r for r in filtered if r.get('country') not in excluded_codes]
     
     # Filter options - Row 2: Checkboxes
     col_filter1, col_filter2, col_filter3 = st.columns(3)

@@ -115,7 +115,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
-        country_codes: Optional[list[str]] = None,
+        exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True
     ) -> str:
@@ -128,10 +128,10 @@ class OpenAlexClient:
         if h_index_max is not None:
             filters.append(f"summary_stats.h_index:<{h_index_max + 1}")
         
-        if country_codes:
-            # OpenAlex uses pipe for OR within a filter
-            country_filter = "|".join(country_codes)
-            filters.append(f"last_known_institutions.country_code:{country_filter}")
+        if exclude_country_codes:
+            # Negate each country code with ! and join with pipe (OR negation)
+            negated = "|".join(f"!{code}" for code in exclude_country_codes)
+            filters.append(f"last_known_institutions.country_code:{negated}")
         
         if topic_ids:
             # Use OR operator (pipe) to match any of the topics
@@ -147,7 +147,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
-        country_codes: Optional[list[str]] = None,
+        exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True,
         max_results: int = 1000,
@@ -159,7 +159,7 @@ class OpenAlexClient:
         Args:
             h_index_min: Minimum h-index
             h_index_max: Maximum h-index
-            country_codes: List of country codes to filter by
+            exclude_country_codes: List of country codes to exclude
             topic_ids: List of OpenAlex topic IDs to filter by (OR logic)
             require_orcid: Only return authors with ORCID
             max_results: Maximum number of results to return
@@ -170,7 +170,7 @@ class OpenAlexClient:
         filter_str = self.build_filter(
             h_index_min=h_index_min,
             h_index_max=h_index_max,
-            country_codes=country_codes,
+            exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=require_orcid
         )
@@ -207,7 +207,6 @@ class OpenAlexClient:
     
     def _parse_author(self, author: dict) -> dict:
         """Parse author data into a cleaner format."""
-        from disciplines import get_discipline_from_topics
         
         # Extract ORCID ID from URL
         orcid_url = author.get("orcid")
@@ -248,8 +247,17 @@ class OpenAlexClient:
         # Get top 3 topics for display
         top_topics = all_topics[:3] if all_topics else []
         
-        # Get discipline from topics
-        discipline = get_discipline_from_topics(topics)
+        # Get discipline from OpenAlex field.display_name (most frequent across topics)
+        field_counts = {}
+        for t in topics:
+            field_data = t.get("field", {})
+            field_name = field_data.get("display_name")
+            if field_name:
+                field_counts[field_name] = field_counts.get(field_name, 0) + 1
+        if field_counts:
+            discipline = max(field_counts, key=field_counts.get)
+        else:
+            discipline = "Other"
         
         return {
             "author_id": author.get("id"),
@@ -272,7 +280,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
-        country_codes: Optional[list[str]] = None,
+        exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True
     ) -> int:
@@ -280,7 +288,7 @@ class OpenAlexClient:
         filter_str = self.build_filter(
             h_index_min=h_index_min,
             h_index_max=h_index_max,
-            country_codes=country_codes,
+            exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=require_orcid
         )
