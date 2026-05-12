@@ -73,6 +73,155 @@ def save_state():
     state_mgr.save_state(st.session_state.app_state)
 
 
+def _get_search_pagination_state():
+    """Return the active OpenAlex search pagination state."""
+    return st.session_state.app_state.setdefault('search_pagination', {})
+
+
+def _get_result_limit(search_state):
+    """Return the capped result count for the active search."""
+    total_count = int(search_state.get('total_count', 0) or 0)
+    max_results = int(search_state.get('max_results', total_count) or total_count)
+    if total_count <= 0:
+        return 0
+    return min(total_count, max_results) if max_results > 0 else total_count
+
+
+def _set_current_batch(search_state, batch_payload, start_cursor):
+    """Persist the currently visible batch in session and saved app state."""
+    checkpoints = search_state.setdefault('checkpoints', {'0': '*'})
+    batch_cache = search_state.setdefault('batch_cache', {})
+
+    for author in batch_payload['results']:
+        author.setdefault('email', None)
+
+    next_cursor = batch_payload.get('next_cursor')
+    if next_cursor:
+        checkpoints[str(batch_payload['batch_index'] + 1)] = next_cursor
+
+    current_count = batch_payload.get('count', 0)
+    search_state['active'] = True
+    search_state['current_batch_index'] = batch_payload['batch_index']
+    search_state['current_cursor'] = start_cursor
+    search_state['next_cursor'] = next_cursor
+    search_state['current_batch_results'] = batch_payload['results']
+    search_state['current_range_start'] = batch_payload['start_index'] + 1 if current_count else 0
+    search_state['current_range_end'] = batch_payload['end_index']
+    batch_cache[str(batch_payload['batch_index'])] = batch_payload['results']
+
+    st.session_state.app_state['search_results'] = batch_payload['results']
+    st.session_state.results_page = 0
+    st.session_state.filtered_authors = []
+
+
+def _sync_current_batch_cache():
+    """Keep the cached current batch aligned with the visible search results."""
+    search_state = _get_search_pagination_state()
+    if not search_state.get('active'):
+        return
+
+    batch_index = int(search_state.get('current_batch_index', 0) or 0)
+    results = st.session_state.app_state.get('search_results', [])
+    search_state.setdefault('batch_cache', {})[str(batch_index)] = results
+    search_state['current_batch_results'] = results
+
+
+def load_search_batch(target_batch_index, jump_size=None, reset=False):
+    """Load one cursor-based batch for the active search, using known checkpoints."""
+    search_state = _get_search_pagination_state()
+    search_filters = search_state.get('filters')
+    if not search_filters:
+        return False
+
+    current_jump_size = int(search_state.get('jump_size', 250) or 250)
+    if jump_size is not None:
+        jump_size = int(jump_size)
+    else:
+        jump_size = current_jump_size
+
+    if reset or jump_size != current_jump_size:
+        search_state['jump_size'] = jump_size
+        search_state['checkpoints'] = {'0': '*'}
+        search_state['current_batch_index'] = 0
+        search_state['current_cursor'] = '*'
+        search_state['next_cursor'] = None
+        search_state['current_batch_results'] = []
+        target_batch_index = 0
+
+    total_limit = _get_result_limit(search_state)
+    if total_limit <= 0:
+        search_state['total_batches'] = 0
+        st.session_state.app_state['search_results'] = []
+        save_state()
+        return True
+
+    total_batches = (total_limit + jump_size - 1) // jump_size
+    target_batch_index = max(0, min(int(target_batch_index), max(total_batches - 1, 0)))
+    search_state['jump_size'] = jump_size
+    search_state['total_batches'] = total_batches
+
+    checkpoints = search_state.setdefault('checkpoints', {'0': '*'})
+    batch_cache = search_state.setdefault('batch_cache', {})
+    known_batches = sorted(int(batch) for batch in checkpoints)
+    start_batch = max(batch for batch in known_batches if batch <= target_batch_index)
+    start_cursor = checkpoints[str(start_batch)]
+
+    cache_key = str(target_batch_index)
+    if not reset and cache_key in batch_cache:
+        cached_results = batch_cache[cache_key]
+        current_payload = {
+            'results': cached_results,
+            'next_cursor': checkpoints.get(str(target_batch_index + 1)),
+            'batch_index': target_batch_index,
+            'batch_size': jump_size,
+            'count': len(cached_results),
+            'start_index': target_batch_index * jump_size,
+            'end_index': (target_batch_index * jump_size) + len(cached_results),
+            'has_more': bool(checkpoints.get(str(target_batch_index + 1))),
+        }
+        _set_current_batch(search_state, current_payload, checkpoints.get(cache_key, '*'))
+        save_state()
+        return True
+
+    client = OpenAlexClient()
+    cursor = start_cursor
+    current_payload = None
+
+    for batch_index in range(start_batch, target_batch_index + 1):
+        remaining = total_limit - (batch_index * jump_size)
+        if remaining <= 0:
+            break
+
+        batch_payload = client.fetch_author_batch(
+            h_index_min=search_filters.get('h_index_min'),
+            h_index_max=search_filters.get('h_index_max'),
+            exclude_country_codes=search_filters.get('exclude_country_codes'),
+            topic_ids=search_filters.get('topic_ids'),
+            require_orcid=search_filters.get('require_orcid', True),
+            cursor=cursor,
+            batch_size=min(jump_size, remaining),
+            batch_index=batch_index,
+        )
+
+        if batch_index == target_batch_index:
+            current_payload = batch_payload
+
+        next_cursor = batch_payload.get('next_cursor')
+        if next_cursor:
+            checkpoints[str(batch_index + 1)] = next_cursor
+            cursor = next_cursor
+        else:
+            cursor = None
+            break
+
+    if current_payload is None:
+        return False
+
+    _set_current_batch(search_state, current_payload, start_cursor)
+    save_state()
+    return True
+
+
 # PostgreSQL storage for persistent sent tracking
 @st.cache_resource
 def get_db():
@@ -560,10 +709,18 @@ def render_sidebar():
         max_results = st.number_input(
             "Max Results",
             min_value=10,
-            max_value=5000,
+            max_value=100000,
             value=search_params.get('max_results', DEFAULT_MAX_RESULTS),
             step=100,
             key="max_results"
+        )
+
+        jump_size = st.selectbox(
+            "Jump Size",
+            options=[250, 500, 1000],
+            index=[250, 500, 1000].index(search_params.get('jump_size', 250)),
+            key="jump_size",
+            help="Load and navigate OpenAlex results in batches of this size"
         )
         
         st.divider()
@@ -669,6 +826,7 @@ def render_sidebar():
             'h_max': h_max,
             'exclude_countries': countries_to_exclude,
             'max_results': max_results,
+            'jump_size': jump_size,
             'concurrent': concurrent,
             'delay': delay,
             'publisher': selected_publisher,
@@ -758,46 +916,61 @@ def run_search(filters):
         st.warning("No authors found. Try adjusting filters or keywords.")
         return
     
-    st.success(f"Found {total_count:,} authors. Fetching up to {filters['max_results']:,}...")
-    
-    # Step 3: Fetch authors with topic filter
-    results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    try:
-        for i, author in enumerate(client.search_authors(
-            h_index_min=filters['h_min'],
-            h_index_max=filters['h_max'],
-            exclude_country_codes=exclude_country_codes,
-            topic_ids=topic_ids,
-            require_orcid=True,
-            max_results=filters['max_results']
-        )):
-            # Add email field (to be filled later)
-            author['email'] = None
-            results.append(author)
-            
-            progress = min((i + 1) / min(total_count, filters['max_results']), 1.0)
-            progress_bar.progress(progress)
-            status_text.text(f"Fetched {i + 1} authors...")
-        
-        progress_bar.progress(1.0)
-        status_text.text(f"Completed! Fetched {len(results)} authors.")
-        
-        # Save results and reset stale state
-        st.session_state.app_state['search_results'] = results
-        st.session_state.app_state['processed_orcids'] = set()
-        st.session_state.filtered_authors = []  # clear stale filtered list
-        st.session_state.app_state['search_params'] = {
-            'keyword_tags': keyword_tags,
+    visible_limit = min(total_count, filters['max_results'])
+    st.success(f"Found {total_count:,} authors. Loading the first {filters['jump_size']:,}-result batch out of {visible_limit:,} visible results...")
+
+    search_state = {
+        'active': True,
+        'filters': {
             'h_index_min': filters['h_min'],
             'h_index_max': filters['h_max'],
-            'exclude_countries': filters['exclude_countries'],
-            'max_results': filters['max_results']
-        }
+            'exclude_country_codes': exclude_country_codes,
+            'topic_ids': topic_ids,
+            'require_orcid': True,
+        },
+        'total_count': total_count,
+        'max_results': filters['max_results'],
+        'jump_size': filters['jump_size'],
+        'total_batches': 0,
+        'current_batch_index': 0,
+        'current_cursor': '*',
+        'next_cursor': None,
+        'checkpoints': {'0': '*'},
+        'batch_cache': {},
+        'current_batch_results': [],
+    }
+
+    st.session_state.app_state['search_pagination'] = search_state
+    st.session_state.app_state['search_results'] = []
+    st.session_state.app_state['processed_orcids'] = set()
+    st.session_state.filtered_authors = []
+    st.session_state.app_state['search_params'] = {
+        'keyword_tags': keyword_tags,
+        'h_index_min': filters['h_min'],
+        'h_index_max': filters['h_max'],
+        'exclude_countries': filters['exclude_countries'],
+        'max_results': filters['max_results'],
+        'jump_size': filters['jump_size'],
+    }
+
+    try:
+        with st.spinner("Loading first OpenAlex batch..."):
+            loaded = load_search_batch(0, jump_size=filters['jump_size'], reset=True)
+
+        if not loaded:
+            st.warning("Unable to load the first OpenAlex batch for this search.")
+            return
+
+        current_batch = st.session_state.app_state.get('search_results', [])
+        search_state = _get_search_pagination_state()
+        st.success(
+            f"Loaded results {search_state.get('current_range_start', 0):,}-"
+            f"{search_state.get('current_range_end', 0):,} of {visible_limit:,}."
+        )
+
+        _sync_current_batch_cache()
         save_state()
-        
+
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
@@ -932,6 +1105,7 @@ def run_email_fetch_filtered(filters):
             loop.close()
         
         st.session_state.app_state['processed_orcids'] = processed
+        _sync_current_batch_cache()
         
         # Update metrics
         processed_count = batch_start + len(batch)
@@ -963,6 +1137,7 @@ def display_results(filters):
     """Display search results with selection and filtering."""
     
     results = st.session_state.app_state.get('search_results', [])
+    search_state = _get_search_pagination_state()
     
     if not results:
         st.info("No results yet. Use the search button above.")
@@ -971,6 +1146,56 @@ def display_results(filters):
     # Show email fetch result message from previous run
     if st.session_state.get('last_fetch_result'):
         st.success(st.session_state.pop('last_fetch_result'))
+
+    total_visible_results = _get_result_limit(search_state) if search_state.get('active') else len(results)
+
+    if search_state.get('active'):
+        current_jump_size = int(search_state.get('jump_size', 250) or 250)
+        selected_jump_size = st.selectbox(
+            "Batch Jump Size",
+            options=[250, 500, 1000],
+            index=[250, 500, 1000].index(current_jump_size),
+            key="batch_jump_size_control",
+            help="Reload OpenAlex result batches using the selected jump size"
+        )
+        if selected_jump_size != current_jump_size:
+            load_search_batch(0, jump_size=selected_jump_size, reset=True)
+            st.rerun()
+
+        total_batches = max(int(search_state.get('total_batches', 0) or 0), 1)
+        current_batch_index = int(search_state.get('current_batch_index', 0) or 0)
+        current_start = int(search_state.get('current_range_start', 0) or 0)
+        current_end = int(search_state.get('current_range_end', 0) or 0)
+
+        st.caption(
+            f"Visible OpenAlex range: {current_start:,}-{current_end:,} of {total_visible_results:,} | "
+            f"Batch {current_batch_index + 1} of {total_batches}"
+        )
+
+        batch_prev_col, batch_num_col, batch_go_col, batch_next_col = st.columns([1, 1.2, 0.8, 1])
+        with batch_prev_col:
+            if st.button("← Previous Batch", disabled=current_batch_index == 0, use_container_width=True):
+                load_search_batch(current_batch_index - 1)
+                st.rerun()
+        with batch_num_col:
+            target_batch = st.number_input(
+                "Jump to Batch",
+                min_value=1,
+                max_value=total_batches,
+                value=current_batch_index + 1,
+                step=1,
+                key="target_batch_number"
+            )
+        with batch_go_col:
+            if st.button("Go", use_container_width=True):
+                load_search_batch(int(target_batch) - 1)
+                st.rerun()
+        with batch_next_col:
+            if st.button("Next Batch →", disabled=current_batch_index >= total_batches - 1, use_container_width=True):
+                load_search_batch(current_batch_index + 1)
+                st.rerun()
+
+        st.caption("OpenAlex deep paging is cursor-based, so batch jumps reuse saved checkpoints rather than direct page numbers.")
     
     filtered = results.copy()
     

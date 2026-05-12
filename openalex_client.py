@@ -1,7 +1,7 @@
 """OpenAlex API client for searching authors."""
 
 import time
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 import requests
 
 from config import OPENALEX_BASE_URL, OPENALEX_EMAIL
@@ -204,6 +204,53 @@ class OpenAlexClient:
             
             # Small delay to be polite
             time.sleep(0.1)
+
+    def fetch_author_batch(
+        self,
+        h_index_min: Optional[int] = None,
+        h_index_max: Optional[int] = None,
+        exclude_country_codes: Optional[list[str]] = None,
+        topic_ids: Optional[list[str]] = None,
+        require_orcid: bool = True,
+        cursor: str = "*",
+        batch_size: int = 250,
+        batch_index: int = 0,
+    ) -> dict[str, Any]:
+        """Fetch a single cursor-based batch of authors with pagination metadata."""
+        filter_str = self.build_filter(
+            h_index_min=h_index_min,
+            h_index_max=h_index_max,
+            exclude_country_codes=exclude_country_codes,
+            topic_ids=topic_ids,
+            require_orcid=require_orcid,
+        )
+
+        params = {
+            "filter": filter_str,
+            "select": "id,display_name,orcid,summary_stats,last_known_institutions,works_count,cited_by_count,topics",
+            "per_page": min(max(batch_size, 1), 200),
+            "cursor": cursor or "*",
+        }
+
+        data = self._make_request("authors", params)
+        results = data.get("results", [])
+        parsed_results = [self._parse_author(author) for author in results]
+        next_cursor = data.get("meta", {}).get("next_cursor")
+        start_index = batch_index * batch_size
+        end_index = start_index + len(parsed_results)
+
+        time.sleep(0.1)
+
+        return {
+            "results": parsed_results,
+            "next_cursor": next_cursor,
+            "batch_index": batch_index,
+            "batch_size": batch_size,
+            "count": len(parsed_results),
+            "start_index": start_index,
+            "end_index": end_index,
+            "has_more": bool(parsed_results) and bool(next_cursor),
+        }
     
     def _parse_author(self, author: dict) -> dict:
         """Parse author data into a cleaner format."""

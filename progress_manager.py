@@ -37,9 +37,11 @@ class StateManager:
                 "h_index_max": 50,
                 "countries": [],
                 "disciplines": [],
-                "max_results": 500
+                "max_results": 500,
+                "jump_size": 250
             },
             "search_results": [],
+            "search_pagination": {},
             "processed_orcids": [],
             "sent_invitations": [],
             "last_updated": None
