@@ -22,7 +22,12 @@ from disciplines import ALL_DISCIPLINES
 from email_sender import EmailSender
 from templates import (
     get_template_names,
+    get_publication_template_ids,
     format_template,
+    format_recent_publications,
+    choose_rotating_template,
+    INVITATION_TYPE_EDITORIAL,
+    INVITATION_TYPE_PUBLICATION,
     TEMPLATE_BOARD_MEMBER,
     TEMPLATE_MANAGING_EDITOR,
     TEMPLATE_EDITOR_IN_CHIEF,
@@ -71,6 +76,60 @@ if 'edited_email' not in st.session_state:
 def save_state():
     """Save current state to file."""
     state_mgr.save_state(st.session_state.app_state)
+
+
+def _safe_select_index(options, value, default=0):
+    """Return the index for a Streamlit selectbox value with a safe fallback."""
+    try:
+        return options.index(value)
+    except ValueError:
+        return default
+
+
+def _invitation_type_label(invitation_type: str) -> str:
+    """Return a user-friendly invitation type label."""
+    if invitation_type == INVITATION_TYPE_PUBLICATION:
+        return "Publication Submission"
+    return "Editorial Role"
+
+
+def _tracking_journal_name(invitation_type: str, journal_config: dict) -> str:
+    """Publication invitations are tracked per journal; editorial legacy tracking is global."""
+    if invitation_type == INVITATION_TYPE_PUBLICATION:
+        return journal_config.get('name', '') or ''
+    return ""
+
+
+def _typed_invitation_key(orcid_id: str, invitation_type: str, journal_name: str = "") -> str:
+    """Build a stable local key for offline typed invitation tracking."""
+    return f"{invitation_type}::{journal_name or ''}::{orcid_id or ''}"
+
+
+def _get_recent_publications(author: dict, limit: int = 3, force_refresh: bool = False) -> list:
+    """Fetch and cache recent OpenAlex publications for one author."""
+    if not force_refresh and author.get('recent_publications_cached'):
+        return author.get('recent_publications', []) or []
+
+    author_id = author.get('author_id')
+    if not author_id:
+        author['recent_publications'] = []
+        author['recent_publications_cached'] = True
+        return []
+
+    client = OpenAlexClient()
+    publications = client.fetch_recent_works(author_id, limit=limit)
+    author['recent_publications'] = publications
+    author['recent_publications_cached'] = True
+
+    # Keep cached publications with the visible results batch when possible.
+    for result in st.session_state.app_state.get('search_results', []):
+        if result.get('orcid_id') == author.get('orcid_id'):
+            result['recent_publications'] = publications
+            result['recent_publications_cached'] = True
+            break
+    _sync_current_batch_cache()
+    save_state()
+    return publications
 
 
 def _get_search_pagination_state():
@@ -262,6 +321,19 @@ def _import_sent_csv(uploaded_file):
                     rows,
                     page_size=1000,
                 )
+                typed_rows = [
+                    (orcid_id, "editorial", author_name, email, publisher, "", "", "", "", sent_at)
+                    for orcid_id, author_name, email, publisher, sent_at in rows
+                ]
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO author_invitations
+                       (orcid_id, invitation_type, author_name, email, publisher, journal_name,
+                        template_id, cite_score, quartile, sent_at)
+                       VALUES %s ON CONFLICT (orcid_id, invitation_type, journal_name) DO NOTHING""",
+                    typed_rows,
+                    page_size=1000,
+                )
         st.success(f"Imported {len(rows)} sent invitations.")
         st.rerun()
     except Exception as e:
@@ -328,39 +400,103 @@ def _import_retraction_csv(uploaded_file):
         st.error(f"Import failed: {e}")
 
 
-def get_sent_invitations() -> set:
-    """Get sent invitations: full list from DB (all rows) merged with local state so UI matches DB."""
-    db_sent = db_storage.get_all_sent() if db_storage.available else set()
-    # Local state (backup / same session)
+def get_sent_invitations(
+    invitation_type: str = INVITATION_TYPE_EDITORIAL,
+    journal_name: str = ""
+) -> set:
+    """Get sent ORCID IDs for the selected invitation type, merged with local state."""
+    journal_filter = journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
+    db_sent = db_storage.get_all_sent(invitation_type, journal_filter) if db_storage.available else set()
+
     local_sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(local_sent, list):
         local_sent = set(local_sent)
-    return db_sent | local_sent
+
+    local_records = st.session_state.app_state.get('sent_invitation_records', [])
+    typed_local = {
+        record.get('orcid_id')
+        for record in local_records
+        if record.get('invitation_type') == invitation_type
+        and record.get('journal_name', '') == (journal_name or '')
+    }
+
+    if invitation_type == INVITATION_TYPE_EDITORIAL:
+        typed_local |= local_sent
+
+    return db_sent | {orcid for orcid in typed_local if orcid}
 
 
-def is_author_notified(orcid_id: str) -> bool:
-    """Check if author was notified (DB with local fallback)."""
+def is_author_notified(
+    orcid_id: str,
+    invitation_type: str = INVITATION_TYPE_EDITORIAL,
+    journal_name: str = ""
+) -> bool:
+    """Check if author was notified for the selected invitation type."""
+    journal_filter = journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
     if db_storage.available:
-        return db_storage.is_sent(orcid_id)
+        return db_storage.is_sent(orcid_id, invitation_type, journal_filter)
     
     sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(sent, list):
         sent = set(sent)
-    return orcid_id in sent
+    if invitation_type == INVITATION_TYPE_EDITORIAL and orcid_id in sent:
+        return True
+
+    local_records = st.session_state.app_state.get('sent_invitation_records', [])
+    expected_key = _typed_invitation_key(orcid_id, invitation_type, journal_name)
+    for record in local_records:
+        if _typed_invitation_key(
+            record.get('orcid_id'),
+            record.get('invitation_type'),
+            record.get('journal_name', '')
+        ) == expected_key:
+            return True
+    return False
 
 
-def mark_author_notified(orcid_id: str, author_name: str = "", email: str = "", publisher: str = "") -> bool:
+def mark_author_notified(
+    orcid_id: str,
+    author_name: str = "",
+    email: str = "",
+    publisher: str = "",
+    invitation_type: str = INVITATION_TYPE_EDITORIAL,
+    journal_name: str = "",
+    template_id: str = "",
+    cite_score: str = "",
+    quartile: str = ""
+) -> bool:
     """Mark author as notified in DB and local state. Returns True if DB save succeeded."""
     db_ok = True
     if db_storage.available:
-        db_ok = db_storage.mark_sent(orcid_id, author_name, email, publisher)
+        db_ok = db_storage.mark_sent(
+            orcid_id,
+            author_name,
+            email,
+            publisher,
+            invitation_type=invitation_type,
+            journal_name=journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else "",
+            template_id=template_id,
+            cite_score=cite_score,
+            quartile=quartile,
+        )
 
     # Always update local state (backup / offline)
     sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(sent, list):
         sent = set(sent)
-    sent.add(orcid_id)
+    if invitation_type == INVITATION_TYPE_EDITORIAL:
+        sent.add(orcid_id)
     st.session_state.app_state['sent_invitations'] = sent
+
+    local_records = st.session_state.app_state.setdefault('sent_invitation_records', [])
+    record = {
+        'orcid_id': orcid_id,
+        'invitation_type': invitation_type,
+        'journal_name': journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else ""
+    }
+    if record not in local_records:
+        local_records.append(record)
+
     save_state()
     return db_ok
 
@@ -371,32 +507,81 @@ def email_dialog(author: dict, filters: dict):
     
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'brevo')
+    author_key = author.get('orcid_id') or author.get('author_id') or author.get('name', 'author')
+    invitation_type_options = [INVITATION_TYPE_EDITORIAL, INVITATION_TYPE_PUBLICATION]
+    default_invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+
+    invitation_type = st.selectbox(
+        "Invitation Mode",
+        options=invitation_type_options,
+        format_func=_invitation_type_label,
+        index=_safe_select_index(invitation_type_options, default_invitation_type),
+        key=f"dialog_invitation_type_{author_key}"
+    )
+    tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
     
-    is_already_notified = is_author_notified(author.get('orcid_id', ''))
+    is_already_notified = is_author_notified(
+        author.get('orcid_id', ''),
+        invitation_type=invitation_type,
+        journal_name=tracking_journal_name
+    )
     
     # WARNING BANNER for already notified authors
     if is_already_notified:
-        st.error("⚠️ WARNING: This author has ALREADY been notified! Sending again will result in a DUPLICATE invitation.")
+        st.error(f"⚠️ WARNING: This author has ALREADY been sent a {_invitation_type_label(invitation_type)} invitation for this tracking scope.")
     
     # Author info header
     st.markdown(f"### To: **{author['name']}**")
     if author.get('institution'):
         st.caption(f"{author.get('institution')} | H-index: {author.get('h_index', 'N/A')}")
+    if invitation_type == INVITATION_TYPE_PUBLICATION:
+        st.caption("Publication invitation subjects include the author name automatically.")
     
     st.divider()
+
+    recent_publications_text = ""
+    if invitation_type == INVITATION_TYPE_PUBLICATION:
+        if not journal_config.get('submission_link'):
+            st.warning("Add a journal submission link in the sidebar before sending publication invitations.")
+
+        include_publications = st.checkbox(
+            "Mention recent OpenAlex publications",
+            value=True,
+            key=f"dialog_include_publications_{author_key}"
+        )
+        if include_publications:
+            refresh_publications = st.button(
+                "Refresh recent publications",
+                key=f"dialog_refresh_publications_{author_key}"
+            )
+            with st.spinner("Loading recent publications from OpenAlex..."):
+                recent_publications = _get_recent_publications(author, limit=3, force_refresh=refresh_publications)
+            if recent_publications:
+                with st.expander("Recent publications used for personalization", expanded=True):
+                    for publication in recent_publications:
+                        year = publication.get('year') or 'N/A'
+                        source = publication.get('source') or 'Unknown source'
+                        st.write(f"- {publication.get('title', '')} ({year}, {source})")
+                recent_publications_text = format_recent_publications(recent_publications)
+            else:
+                st.caption("No recent OpenAlex publications were available; the template will still send without that section.")
     
     # Template selection
-    template_names = get_template_names()
+    template_names = get_template_names(invitation_type)
     col_type, col_scopus = st.columns([2, 1])
     with col_type:
         template_id = st.selectbox(
-            "Invitation Type",
+            "Template",
             options=list(template_names.keys()),
             format_func=lambda x: template_names[x],
-            key="dialog_template"
+            key=f"dialog_template_{invitation_type}_{author_key}"
         )
     with col_scopus:
-        scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key="dialog_scopus")
+        if invitation_type == INVITATION_TYPE_EDITORIAL:
+            scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key=f"dialog_scopus_{author_key}")
+        else:
+            scopus_indexed = False
+            st.caption("Publication templates use the journal metadata fields.")
     
     # Format template - publisher name and location come from PUBLISHER_INFO (follows selected publisher)
     pub_info = PUBLISHER_INFO.get(publisher_id, {})
@@ -414,7 +599,15 @@ def email_dialog(author: dict, filters: dict):
         publisher_name=publisher_name,
         sender_email=sender_email,
         publisher_location=publisher_location,
-        scopus_indexed=scopus_indexed
+        scopus_indexed=scopus_indexed,
+        journal_submission_link=journal_config.get('submission_link', ''),
+        journal_cite_score=journal_config.get('cite_score', ''),
+        journal_quartile=journal_config.get('quartile', ''),
+        journal_indexing_status=journal_config.get('indexing_status', ''),
+        author_specialty=author.get('specialty') or author.get('research_areas') or '',
+        author_recent_publications=recent_publications_text,
+        journal_scope=journal_config.get('scope', ''),
+        invitation_goal=journal_config.get('invitation_goal', '')
     )
     
     # Editable email fields
@@ -426,14 +619,14 @@ def email_dialog(author: dict, filters: dict):
     subject = st.text_input(
         "Subject",
         value=formatted['subject'],
-        key=f"dialog_subject_{template_id}_{scopus_indexed}"
+        key=f"dialog_subject_{author_key}_{invitation_type}_{template_id}_{scopus_indexed}_{bool(recent_publications_text)}"
     )
     
     body = st.text_area(
         "Email Body",
         value=formatted['body'],
         height=300,
-        key=f"dialog_body_{template_id}_{scopus_indexed}"
+        key=f"dialog_body_{author_key}_{invitation_type}_{template_id}_{scopus_indexed}_{bool(recent_publications_text)}"
     )
     
     # PDF option
@@ -456,7 +649,7 @@ def email_dialog(author: dict, filters: dict):
                 st.download_button(
                     "Download PDF Preview",
                     data=pdf_bytes,
-                    file_name="Invitation_Letter_Preview.pdf",
+                    file_name="Publication_Invitation_Preview.pdf" if invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter_Preview.pdf",
                     mime="application/pdf"
                 )
             except Exception as e:
@@ -468,9 +661,9 @@ def email_dialog(author: dict, filters: dict):
     confirm_resend = True  # Default to allowed
     if is_already_notified:
         confirm_resend = st.checkbox(
-            "I confirm I want to send ANOTHER invitation to this already-notified author",
+            f"I confirm I want to send ANOTHER {_invitation_type_label(invitation_type)} invitation to this author",
             value=False,
-            key="dialog_confirm_resend"
+            key=f"dialog_confirm_resend_{invitation_type}_{author_key}"
         )
     
     # Action buttons
@@ -506,6 +699,7 @@ def email_dialog(author: dict, filters: dict):
                     body=body,
                     to_name=author['name'],
                     pdf_attachment=pdf_bytes,
+                    attachment_filename="Publication_Invitation_Letter.pdf" if invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter.pdf",
                 )
                 
                 if success:
@@ -513,7 +707,12 @@ def email_dialog(author: dict, filters: dict):
                         author['orcid_id'],
                         author_name=author.get('name', ''),
                         email=to_email,
-                        publisher=publisher_id
+                        publisher=publisher_id,
+                        invitation_type=invitation_type,
+                        journal_name=tracking_journal_name,
+                        template_id=template_id,
+                        cite_score=journal_config.get('cite_score', ''),
+                        quartile=journal_config.get('quartile', '')
                     )
                     st.success(f"Email sent to {to_email}!")
                     if not db_ok:
@@ -604,6 +803,25 @@ def render_sidebar():
         else:
             st.warning("Email credentials not found. Create email_credentials.json")
             selected_publisher = 'brevo'
+
+        st.divider()
+
+        # Invitation workflow selection
+        st.subheader("Invitation Workflow")
+        invitation_type_options = [INVITATION_TYPE_EDITORIAL, INVITATION_TYPE_PUBLICATION]
+        current_invitation_type = st.session_state.app_state.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+        invitation_type = st.selectbox(
+            "Invitation Mode",
+            options=invitation_type_options,
+            format_func=_invitation_type_label,
+            index=_safe_select_index(invitation_type_options, current_invitation_type),
+            key="invitation_type_select",
+            help="Choose whether sent status, templates, and bulk send use editorial or publication invitations."
+        )
+
+        if invitation_type != current_invitation_type:
+            st.session_state.app_state['invitation_type'] = invitation_type
+            save_state()
         
         st.divider()
         
@@ -646,6 +864,56 @@ def render_sidebar():
             placeholder="e.g., Prof. John Smith",
             key="editor_name"
         )
+
+        st.markdown("**Publication Invitation Details**")
+
+        submission_link = st.text_input(
+            "Journal Submission Link",
+            value=journal_config.get('submission_link', ''),
+            placeholder="e.g., https://journal.example.com/submit",
+            key="journal_submission_link"
+        )
+
+        col_metric1, col_metric2 = st.columns(2)
+        with col_metric1:
+            cite_score = st.text_input(
+                "CiteScore",
+                value=journal_config.get('cite_score', ''),
+                placeholder="e.g., 2.4",
+                key="journal_cite_score"
+            )
+        with col_metric2:
+            quartile_options = ["", "Q1", "Q2", "Q3", "Q4"]
+            quartile = st.selectbox(
+                "Quartile",
+                options=quartile_options,
+                index=_safe_select_index(quartile_options, journal_config.get('quartile', '')),
+                key="journal_quartile"
+            )
+
+        indexing_options = ["", "Not indexed", "Scopus", "Web of Science", "DOAJ", "Other"]
+        indexing_status = st.selectbox(
+            "Indexing Status",
+            options=indexing_options,
+            index=_safe_select_index(indexing_options, journal_config.get('indexing_status', '')),
+            key="journal_indexing_status"
+        )
+
+        goal_options = ["Regular submission", "Special issue", "Review article", "Fast-track consideration"]
+        invitation_goal = st.selectbox(
+            "Invitation Goal",
+            options=goal_options,
+            index=_safe_select_index(goal_options, journal_config.get('invitation_goal', 'Regular submission')),
+            key="journal_invitation_goal"
+        )
+
+        journal_scope = st.text_area(
+            "Journal Scope / Fit Note",
+            value=journal_config.get('scope', ''),
+            placeholder="Optional: short description of the journal scope or current call for papers",
+            height=80,
+            key="journal_scope"
+        )
         
         # Auto-save journal config on change
         new_config = {
@@ -653,7 +921,13 @@ def render_sidebar():
             'issn': journal_issn,
             'link': journal_link,
             'location': publisher_location,
-            'editor_in_chief': editor_name
+            'editor_in_chief': editor_name,
+            'submission_link': submission_link,
+            'cite_score': cite_score,
+            'quartile': quartile,
+            'indexing_status': indexing_status,
+            'invitation_goal': invitation_goal,
+            'scope': journal_scope,
         }
         
         if new_config != journal_config:
@@ -830,6 +1104,7 @@ def render_sidebar():
             'concurrent': concurrent,
             'delay': delay,
             'publisher': selected_publisher,
+            'invitation_type': invitation_type,
             'use_tavily': use_tavily,
             'use_openai_web': use_openai_web
         }
@@ -1138,6 +1413,9 @@ def display_results(filters):
     
     results = st.session_state.app_state.get('search_results', [])
     search_state = _get_search_pagination_state()
+    journal_config = st.session_state.app_state.get('journal_config', {})
+    invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
     
     if not results:
         st.info("No results yet. Use the search button above.")
@@ -1199,8 +1477,8 @@ def display_results(filters):
     
     filtered = results.copy()
     
-    # Get sent invitations from DB (persistent)
-    sent_invitations = get_sent_invitations()
+    # Get sent invitations from DB (persistent) for the active invitation workflow.
+    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
     
     # Get retracted author names from DB (lowercased set for fast matching)
     retracted_names = db_storage.get_retracted_names() if db_storage.available else set()
@@ -1275,7 +1553,11 @@ def display_results(filters):
     with col_filter1:
         show_only_with_email = st.checkbox("Show only authors with email", value=False, key="filter_email")
     with col_filter2:
-        show_only_not_sent = st.checkbox("Hide already notified", value=False, key="filter_not_sent")
+        show_only_not_sent = st.checkbox(
+            f"Hide already sent ({_invitation_type_label(invitation_type)})",
+            value=False,
+            key="filter_not_sent"
+        )
     with col_filter3:
         hide_retracted = st.checkbox("Hide retracted authors", value=True, key="filter_retracted")
     
@@ -1347,7 +1629,7 @@ def display_results(filters):
         st.metric("Retracted", retracted_count)
     with col5:
         sent_count = sum(1 for r in filtered if r.get('orcid_id') in sent_invitations)
-        st.metric("Previously Sent", sent_count)
+        st.metric(f"Sent ({_invitation_type_label(invitation_type)})", sent_count)
     
     st.divider()
     
@@ -1366,7 +1648,7 @@ def display_results(filters):
         if r.get('is_retracted'):
             status = '🚫 RETRACTED'
         elif orcid_id in sent_invitations:
-            status = '✅ SENT'
+            status = f"✅ SENT {_invitation_type_label(invitation_type).upper()}"
         df_data.append({
             'Name': r.get('name', ''),
             'H-Index': r.get('h_index', ''),
@@ -1470,6 +1752,39 @@ def display_results(filters):
     
     page_with_email = [a for a in page_results if a.get('email')]
     page_not_sent = [a for a in page_with_email if a.get('orcid_id', '') not in sent_invitations and not a.get('is_retracted')]
+
+    st.markdown(f"**Bulk Send Settings ({_invitation_type_label(invitation_type)})**")
+    bulk_template_names = get_template_names(invitation_type)
+    bulk_col1, bulk_col2, bulk_col3 = st.columns([1.4, 1.4, 1.2])
+    with bulk_col1:
+        selected_bulk_template = st.selectbox(
+            "Bulk Template",
+            options=list(bulk_template_names.keys()),
+            format_func=lambda x: bulk_template_names[x],
+            key=f"bulk_template_select_{invitation_type}"
+        )
+    with bulk_col2:
+        if invitation_type == INVITATION_TYPE_PUBLICATION:
+            bulk_template_strategy = st.selectbox(
+                "Template Strategy",
+                options=["Rotate publication templates", "Use selected template"],
+                key="bulk_publication_template_strategy"
+            )
+            bulk_scopus_indexed = False
+        else:
+            bulk_template_strategy = "Use selected template"
+            bulk_scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key="bulk_scopus_indexed")
+    with bulk_col3:
+        bulk_attach_pdf = st.checkbox("Attach PDF", value=True, key=f"bulk_attach_pdf_{invitation_type}")
+        if invitation_type == INVITATION_TYPE_PUBLICATION:
+            bulk_include_cached_publications = st.checkbox(
+                "Use cached publications",
+                value=True,
+                key="bulk_include_cached_publications",
+                help="Bulk sends use already-loaded OpenAlex publications only to avoid slow batch sends."
+            )
+        else:
+            bulk_include_cached_publications = False
     
     col_sel, col_skip, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_sel:
@@ -1504,9 +1819,7 @@ def display_results(filters):
     if bulk_send_clicked and select_all and batch_size > 0:
         journal_config = st.session_state.app_state.get('journal_config', {})
         publisher_id = filters.get('publisher', 'brevo')
-        template_id = st.session_state.get('template_select', TEMPLATE_BOARD_MEMBER)
-        scopus_indexed = st.session_state.get('main_scopus', False)
-        attach_pdf = st.session_state.get('attach_pdf', True)
+        attach_pdf = bulk_attach_pdf
         
         pub_info = PUBLISHER_INFO.get(publisher_id, {})
         publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
@@ -1526,6 +1839,15 @@ def display_results(filters):
             to_email = author.get('email', '')
             
             status_area.info(f"Sending {i+1}/{len(batch)}: {author_name} ({to_email})")
+
+            if invitation_type == INVITATION_TYPE_PUBLICATION and bulk_template_strategy == "Rotate publication templates":
+                template_id = choose_rotating_template(get_publication_template_ids(), i)
+            else:
+                template_id = selected_bulk_template
+
+            recent_publications_text = ""
+            if invitation_type == INVITATION_TYPE_PUBLICATION and bulk_include_cached_publications:
+                recent_publications_text = format_recent_publications(author.get('recent_publications') or [])
             
             formatted = format_template(
                 template_id=template_id,
@@ -1537,7 +1859,15 @@ def display_results(filters):
                 publisher_name=publisher_name,
                 sender_email=sender_email,
                 publisher_location=publisher_location,
-                scopus_indexed=scopus_indexed
+                scopus_indexed=bulk_scopus_indexed,
+                journal_submission_link=journal_config.get('submission_link', ''),
+                journal_cite_score=journal_config.get('cite_score', ''),
+                journal_quartile=journal_config.get('quartile', ''),
+                journal_indexing_status=journal_config.get('indexing_status', ''),
+                author_specialty=author.get('specialty') or author.get('research_areas') or '',
+                author_recent_publications=recent_publications_text,
+                journal_scope=journal_config.get('scope', ''),
+                invitation_goal=journal_config.get('invitation_goal', '')
             )
             
             pdf_bytes = None
@@ -1561,6 +1891,7 @@ def display_results(filters):
                 body=formatted['body'],
                 to_name=author_name,
                 pdf_attachment=pdf_bytes,
+                attachment_filename="Publication_Invitation_Letter.pdf" if invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter.pdf",
             )
             
             if success:
@@ -1570,7 +1901,12 @@ def display_results(filters):
                     author.get('orcid_id', ''),
                     author_name=author_name,
                     email=to_email,
-                    publisher=publisher_id
+                    publisher=publisher_id,
+                    invitation_type=invitation_type,
+                    journal_name=tracking_journal_name,
+                    template_id=template_id,
+                    cite_score=journal_config.get('cite_score', ''),
+                    quartile=journal_config.get('quartile', '')
                 )
             else:
                 failed += 1
@@ -1614,7 +1950,7 @@ def display_results(filters):
             if is_retracted:
                 st.markdown(f"🚫 ~~{name_display}~~ :red[RETRACTED]")
             elif is_notified:
-                st.markdown(f"✅ **{name_display}** :green[SENT]")
+                st.markdown(f"✅ **{name_display}** :green[SENT {_invitation_type_label(invitation_type)}]")
             else:
                 st.write(name_display)
         

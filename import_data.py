@@ -8,13 +8,14 @@ Usage:
 import csv
 import os
 import sys
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.extras
 
 
-def get_conn():
+def get_conn() -> Any:
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
         print("ERROR: DATABASE_URL environment variable not set.")
@@ -32,7 +33,7 @@ def get_conn():
     return conn
 
 
-def ensure_tables(conn):
+def ensure_tables(conn: Any) -> None:
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sent_invitations (
@@ -42,6 +43,29 @@ def ensure_tables(conn):
                 publisher   TEXT DEFAULT '',
                 sent_at     TIMESTAMPTZ DEFAULT NOW()
             );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS author_invitations (
+                id              SERIAL PRIMARY KEY,
+                orcid_id        TEXT NOT NULL,
+                invitation_type TEXT NOT NULL DEFAULT 'editorial',
+                author_name     TEXT DEFAULT '',
+                email           TEXT DEFAULT '',
+                publisher       TEXT DEFAULT '',
+                journal_name    TEXT DEFAULT '',
+                template_id     TEXT DEFAULT '',
+                cite_score      TEXT DEFAULT '',
+                quartile        TEXT DEFAULT '',
+                sent_at         TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_author_invitations_unique
+            ON author_invitations (orcid_id, invitation_type, journal_name);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_author_invitations_type
+            ON author_invitations (invitation_type);
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS retracted_authors (
@@ -62,12 +86,12 @@ def ensure_tables(conn):
     print("Tables ensured.")
 
 
-def import_sent_invitations(conn, csv_path="sent_invitations_rows(1).csv"):
+def import_sent_invitations(conn: Any, csv_path: str = "sent_invitations_rows(1).csv") -> None:
     if not os.path.exists(csv_path):
         print(f"SKIP: {csv_path} not found.")
         return
 
-    rows = []
+    rows: list[tuple[str, str, str, str, Optional[str]]] = []
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -88,7 +112,7 @@ def import_sent_invitations(conn, csv_path="sent_invitations_rows(1).csv"):
 
     print(f"Importing {len(rows)} sent invitations...")
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
+        psycopg2.extras.execute_values(  # type: ignore[reportUnknownMemberType]
             cur,
             """
             INSERT INTO sent_invitations (orcid_id, author_name, email, publisher, sent_at)
@@ -98,6 +122,22 @@ def import_sent_invitations(conn, csv_path="sent_invitations_rows(1).csv"):
             rows,
             page_size=1000,
         )
+        typed_rows: list[tuple[str, str, str, str, str, str, str, str, str, Optional[str]]] = [
+            (orcid_id, "editorial", author_name, email, publisher, "", "", "", "", sent_at)
+            for orcid_id, author_name, email, publisher, sent_at in rows
+        ]
+        psycopg2.extras.execute_values(  # type: ignore[reportUnknownMemberType]
+            cur,
+            """
+            INSERT INTO author_invitations
+                (orcid_id, invitation_type, author_name, email, publisher, journal_name,
+                 template_id, cite_score, quartile, sent_at)
+            VALUES %s
+            ON CONFLICT (orcid_id, invitation_type, journal_name) DO NOTHING;
+            """,
+            typed_rows,
+            page_size=1000,
+        )
     # Verify
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM sent_invitations;")
@@ -105,7 +145,7 @@ def import_sent_invitations(conn, csv_path="sent_invitations_rows(1).csv"):
     print(f"Done. sent_invitations table now has {count} rows.")
 
 
-def import_retraction_watch(conn, csv_path="retraction_watch.csv"):
+def import_retraction_watch(conn: Any, csv_path: str = "retraction_watch.csv") -> None:
     if not os.path.exists(csv_path):
         print(f"SKIP: {csv_path} not found.")
         return
@@ -119,7 +159,7 @@ def import_retraction_watch(conn, csv_path="retraction_watch.csv"):
         return
 
     print("Reading retraction_watch.csv...")
-    batch = []
+    batch: list[tuple[str, str, str, str, str, str, str]] = []
     total = 0
     batch_size = 5000
 
@@ -168,9 +208,9 @@ def import_retraction_watch(conn, csv_path="retraction_watch.csv"):
     print(f"Done. retracted_authors: {count} rows, {unique} unique author names.")
 
 
-def _insert_retraction_batch(conn, batch):
+def _insert_retraction_batch(conn: Any, batch: list[tuple[str, str, str, str, str, str, str]]) -> None:
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
+        psycopg2.extras.execute_values(  # type: ignore[reportUnknownMemberType]
             cur,
             """
             INSERT INTO retracted_authors

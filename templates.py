@@ -1,14 +1,25 @@
-"""Professional email invitation templates for editorial positions."""
+"""Professional email invitation templates for editorial and publication invitations."""
 
-from typing import Dict
+from typing import Dict, Iterable
 
 
+INVITATION_TYPE_EDITORIAL = "editorial"
+INVITATION_TYPE_PUBLICATION = "publication"
 TEMPLATE_BOARD_MEMBER = "board_member"
 TEMPLATE_MANAGING_EDITOR = "managing_editor"
 TEMPLATE_EDITOR_IN_CHIEF = "editor_in_chief"
+TEMPLATE_PUBLICATION_RECENT_WORK = "publication_recent_work"
+TEMPLATE_PUBLICATION_TOPIC_FIT = "publication_topic_fit"
+TEMPLATE_PUBLICATION_METRICS = "publication_metrics"
 
 # Base template IDs that appear in the UI dropdown
-_BASE_TEMPLATES = [TEMPLATE_BOARD_MEMBER, TEMPLATE_MANAGING_EDITOR, TEMPLATE_EDITOR_IN_CHIEF]
+_EDITORIAL_BASE_TEMPLATES = [TEMPLATE_BOARD_MEMBER, TEMPLATE_MANAGING_EDITOR, TEMPLATE_EDITOR_IN_CHIEF]
+_PUBLICATION_TEMPLATES = [
+    TEMPLATE_PUBLICATION_RECENT_WORK,
+    TEMPLATE_PUBLICATION_TOPIC_FIT,
+    TEMPLATE_PUBLICATION_METRICS,
+]
+_BASE_TEMPLATES = _EDITORIAL_BASE_TEMPLATES
 
 TEMPLATES = {
     # ── Editorial Board Member (non-Scopus) ──
@@ -245,17 +256,157 @@ With deepest respect and warm regards,
 Email: {sender_email}
 Website: {journal_link}"""
     },
+
+    # -- Publication invitation: recent-work admiration --
+    TEMPLATE_PUBLICATION_RECENT_WORK: {
+        "name": "Publish Invitation - Recent Work",
+        "subject": "{author_name}, invitation to submit your work to {journal_name}",
+        "body": """Dear Professor {author_name},
+
+I hope this message finds you well.
+
+I am writing on behalf of {journal_name} (ISSN: {journal_issn}) to invite you to consider submitting a manuscript to the journal.
+
+We noticed your recent scholarly work and believe your research profile is highly relevant to our readership.{author_recent_publications}
+
+{journal_name} welcomes rigorous contributions in {author_specialty}. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+
+If you have a manuscript in preparation, we would be pleased to receive it through our submission portal:
+{journal_submission_link}
+
+You may also review the journal scope and published articles here:
+{journal_link}
+
+We would be honored to consider a contribution from you and would be happy to answer any questions about fit, scope, or the submission process.
+
+Warm regards,
+
+Editorial Office
+{journal_name}
+{publisher_name}
+Email: {sender_email}
+Website: {journal_link}"""
+    },
+
+    # -- Publication invitation: topic fit --
+    TEMPLATE_PUBLICATION_TOPIC_FIT: {
+        "name": "Publish Invitation - Topic Fit",
+        "subject": "{author_name}, your research aligns with {journal_name}",
+        "body": """Dear Professor {author_name},
+
+Greetings from the Editorial Office of {journal_name}.
+
+Your research background in {author_specialty} appears to align well with the journal's current publishing interests. We would therefore like to invite you to submit a manuscript for consideration in {journal_name} (ISSN: {journal_issn}).
+
+{author_recent_publications}
+
+The journal is seeking high-quality original articles, reviews, and scholarly contributions that can support meaningful discussion in the field. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+
+For submission, please use the journal portal:
+{journal_submission_link}
+
+Journal website:
+{journal_link}
+
+If you are considering a suitable manuscript, we would be glad to hear from you or receive your submission through the portal.
+
+Sincerely,
+
+Editorial Office
+{journal_name}
+{publisher_name}
+Email: {sender_email}"""
+    },
+
+    # -- Publication invitation: journal value and metrics --
+    TEMPLATE_PUBLICATION_METRICS: {
+        "name": "Publish Invitation - Journal Metrics",
+        "subject": "{author_name}, publication invitation from {journal_name}",
+        "body": """Dear Professor {author_name},
+
+I hope you are doing well.
+
+On behalf of {journal_name}, I am pleased to invite you to submit a manuscript for publication consideration.
+
+{journal_name} is committed to rigorous peer review, ethical publication practices, and international scholarly visibility. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+
+Your work in {author_specialty} would be a valuable fit for the journal's audience.{author_recent_publications}
+
+Submission link:
+{journal_submission_link}
+
+Journal website:
+{journal_link}
+
+We would be pleased to consider an original article, review article, or other suitable scholarly contribution from your research group.
+
+With best regards,
+
+Editorial Office
+{journal_name}
+{publisher_name}
+Email: {sender_email}
+Website: {journal_link}"""
+    },
 }
 
 
-def get_template_names() -> Dict[str, str]:
-    """Get dictionary of base template IDs to display names (excludes Scopus variants)."""
-    return {key: TEMPLATES[key]["name"] for key in _BASE_TEMPLATES}
+def get_template_names(invitation_type: str = INVITATION_TYPE_EDITORIAL) -> Dict[str, str]:
+    """Get dictionary of template IDs to display names for the selected invitation type."""
+    template_ids = _PUBLICATION_TEMPLATES if invitation_type == INVITATION_TYPE_PUBLICATION else _EDITORIAL_BASE_TEMPLATES
+    return {key: TEMPLATES[key]["name"] for key in template_ids}
+
+
+def get_publication_template_ids() -> list[str]:
+    """Return publication template IDs in their rotation order."""
+    return list(_PUBLICATION_TEMPLATES)
 
 
 def get_template(template_id: str) -> Dict:
     """Get a template by ID."""
     return TEMPLATES.get(template_id, TEMPLATES[TEMPLATE_BOARD_MEMBER])
+
+
+def build_journal_metrics(
+    journal_cite_score: str = "",
+    journal_quartile: str = "",
+    journal_indexing_status: str = "",
+) -> str:
+    """Build a compact sentence with optional journal metrics."""
+    details = []
+    if journal_cite_score:
+        details.append(f"CiteScore: {journal_cite_score}")
+    if journal_quartile:
+        details.append(f"Quartile: {journal_quartile}")
+    if journal_indexing_status:
+        details.append(f"Indexing status: {journal_indexing_status}")
+    if not details:
+        return ""
+    return "Journal details: " + "; ".join(details) + "."
+
+
+def format_recent_publications(publications: Iterable[dict]) -> str:
+    """Format recent OpenAlex publications for inclusion in an email template."""
+    lines = []
+    for publication in publications or []:
+        title = (publication.get("title") or "").strip()
+        if not title:
+            continue
+        year = (publication.get("year") or "").strip()
+        source = (publication.get("source") or "").strip()
+        suffix_parts = [part for part in [year, source] if part]
+        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+        lines.append(f"- {title}{suffix}")
+    if not lines:
+        return ""
+    return "\n\nWe particularly noted recent publications such as:\n" + "\n".join(lines)
+
+
+def choose_rotating_template(template_ids: list[str], position: int) -> str:
+    """Choose a template ID by deterministic rotation."""
+    if not template_ids:
+        return TEMPLATE_PUBLICATION_RECENT_WORK
+    return template_ids[position % len(template_ids)]
 
 
 def format_template(
@@ -268,7 +419,15 @@ def format_template(
     publisher_name: str,
     sender_email: str,
     publisher_location: str = "",
-    scopus_indexed: bool = False
+    scopus_indexed: bool = False,
+    journal_submission_link: str = "",
+    journal_cite_score: str = "",
+    journal_quartile: str = "",
+    journal_indexing_status: str = "",
+    author_specialty: str = "",
+    author_recent_publications: str = "",
+    journal_scope: str = "",
+    invitation_goal: str = ""
 ) -> Dict[str, str]:
     """
     Format a template with the provided values.
@@ -281,6 +440,14 @@ def format_template(
     effective_id = f"{template_id}_scopus" if scopus_indexed else template_id
     template = get_template(effective_id)
 
+    journal_metrics = build_journal_metrics(
+        journal_cite_score=journal_cite_score,
+        journal_quartile=journal_quartile,
+        journal_indexing_status=journal_indexing_status,
+    )
+    invitation_goal_note = f" Current invitation focus: {invitation_goal}." if invitation_goal else ""
+    journal_scope_note = f"\n\nScope note: {journal_scope}" if journal_scope else ""
+
     replacements = {
         "{author_name}": author_name,
         "{journal_name}": journal_name,
@@ -290,6 +457,17 @@ def format_template(
         "{publisher_name}": publisher_name,
         "{sender_email}": sender_email,
         "{publisher_location}": publisher_location,
+        "{journal_submission_link}": journal_submission_link,
+        "{journal_cite_score}": journal_cite_score,
+        "{journal_quartile}": journal_quartile,
+        "{journal_indexing_status}": journal_indexing_status,
+        "{author_specialty}": author_specialty or "your field",
+        "{author_recent_publications}": author_recent_publications,
+        "{journal_scope}": journal_scope,
+        "{invitation_goal}": invitation_goal,
+        "{journal_metrics}": journal_metrics,
+        "{invitation_goal_note}": invitation_goal_note,
+        "{journal_scope_note}": journal_scope_note,
     }
 
     subject = template["subject"]
@@ -316,4 +494,15 @@ def get_all_placeholders() -> list:
         "{publisher_name}",
         "{sender_email}",
         "{publisher_location}",
+        "{journal_submission_link}",
+        "{journal_cite_score}",
+        "{journal_quartile}",
+        "{journal_indexing_status}",
+        "{author_specialty}",
+        "{author_recent_publications}",
+        "{journal_scope}",
+        "{invitation_goal}",
+        "{journal_metrics}",
+        "{invitation_goal_note}",
+        "{journal_scope_note}",
     ]

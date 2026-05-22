@@ -9,6 +9,10 @@ import psycopg2
 import psycopg2.extras
 
 
+INVITATION_TYPE_EDITORIAL = "editorial"
+INVITATION_TYPE_PUBLICATION = "publication"
+
+
 def _get_connection_params():
     """Get PostgreSQL connection params from DATABASE_URL (Railway provides this)."""
     database_url = os.environ.get("DATABASE_URL", "")
@@ -30,6 +34,7 @@ class PostgresStorage:
     """Persistent storage using PostgreSQL for sent invitations."""
 
     TABLE_NAME = "sent_invitations"
+    INVITATION_TABLE_NAME = "author_invitations"
 
     def __init__(self):
         self.available = False
@@ -68,6 +73,29 @@ class PostgresStorage:
                     sent_at    TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.INVITATION_TABLE_NAME} (
+                    id              SERIAL PRIMARY KEY,
+                    orcid_id        TEXT NOT NULL,
+                    invitation_type TEXT NOT NULL DEFAULT '{INVITATION_TYPE_EDITORIAL}',
+                    author_name     TEXT DEFAULT '',
+                    email           TEXT DEFAULT '',
+                    publisher       TEXT DEFAULT '',
+                    journal_name    TEXT DEFAULT '',
+                    template_id     TEXT DEFAULT '',
+                    cite_score      TEXT DEFAULT '',
+                    quartile        TEXT DEFAULT '',
+                    sent_at         TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute(f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_author_invitations_unique
+                ON {self.INVITATION_TABLE_NAME} (orcid_id, invitation_type, journal_name);
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_author_invitations_type
+                ON {self.INVITATION_TABLE_NAME} (invitation_type);
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS retracted_authors (
                     id              SERIAL PRIMARY KEY,
@@ -96,6 +124,53 @@ class PostgresStorage:
                 self._conn.autocommit = True
         return self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
+    def _mark_invitation_record(
+        self,
+        orcid_id: str,
+        author_name: str = "",
+        email: str = "",
+        publisher: str = "",
+        invitation_type: str = INVITATION_TYPE_EDITORIAL,
+        journal_name: str = "",
+        template_id: str = "",
+        cite_score: str = "",
+        quartile: str = "",
+    ) -> bool:
+        """Upsert the invitation-type-aware send log."""
+        if not self.available or not orcid_id:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(f"""
+                    INSERT INTO {self.INVITATION_TABLE_NAME}
+                        (orcid_id, invitation_type, author_name, email, publisher, journal_name,
+                         template_id, cite_score, quartile, sent_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (orcid_id, invitation_type, journal_name) DO UPDATE SET
+                        author_name = EXCLUDED.author_name,
+                        email       = EXCLUDED.email,
+                        publisher   = EXCLUDED.publisher,
+                        template_id = EXCLUDED.template_id,
+                        cite_score  = EXCLUDED.cite_score,
+                        quartile    = EXCLUDED.quartile,
+                        sent_at     = EXCLUDED.sent_at;
+                """, (
+                    orcid_id,
+                    invitation_type,
+                    author_name,
+                    email,
+                    publisher,
+                    journal_name,
+                    template_id,
+                    cite_score,
+                    quartile,
+                    datetime.now(timezone.utc),
+                ))
+            return True
+        except Exception as e:
+            print(f"PostgreSQL mark invitation record error: {e}")
+            return False
+
     def get_status(self) -> Dict:
         """Get database status for UI display."""
         return {
@@ -104,10 +179,36 @@ class PostgresStorage:
             "table": self.TABLE_NAME,
         }
 
-    def mark_sent(self, orcid_id: str, author_name: str = "", email: str = "", publisher: str = "") -> bool:
-        """Mark an author as sent invitation (upsert)."""
+    def mark_sent(
+        self,
+        orcid_id: str,
+        author_name: str = "",
+        email: str = "",
+        publisher: str = "",
+        invitation_type: str = INVITATION_TYPE_EDITORIAL,
+        journal_name: str = "",
+        template_id: str = "",
+        cite_score: str = "",
+        quartile: str = "",
+    ) -> bool:
+        """Mark an author as sent an invitation, with invitation-type tracking."""
         if not self.available:
             return False
+        typed_ok = self._mark_invitation_record(
+            orcid_id=orcid_id,
+            author_name=author_name,
+            email=email,
+            publisher=publisher,
+            invitation_type=invitation_type,
+            journal_name=journal_name,
+            template_id=template_id,
+            cite_score=cite_score,
+            quartile=quartile,
+        )
+
+        if invitation_type != INVITATION_TYPE_EDITORIAL:
+            return typed_ok
+
         try:
             with self._get_cursor() as cur:
                 cur.execute(f"""
@@ -119,34 +220,88 @@ class PostgresStorage:
                         publisher   = EXCLUDED.publisher,
                         sent_at     = EXCLUDED.sent_at;
                 """, (orcid_id, author_name, email, publisher, datetime.now(timezone.utc)))
-            return True
+            return typed_ok
         except Exception as e:
             print(f"PostgreSQL mark_sent error: {e}")
-            return False
+            return typed_ok
 
-    def is_sent(self, orcid_id: str) -> bool:
-        """Check if author has been sent invitation."""
+    def is_sent(
+        self,
+        orcid_id: str,
+        invitation_type: str = INVITATION_TYPE_EDITORIAL,
+        journal_name: Optional[str] = None,
+    ) -> bool:
+        """Check if author has been sent an invitation of the requested type."""
         if not self.available:
             return False
         try:
             with self._get_cursor() as cur:
-                cur.execute(
-                    f"SELECT 1 FROM {self.TABLE_NAME} WHERE orcid_id = %s LIMIT 1;",
-                    (orcid_id,),
-                )
-                return cur.fetchone() is not None
+                if journal_name is None:
+                    cur.execute(
+                        f"""
+                        SELECT 1 FROM {self.INVITATION_TABLE_NAME}
+                        WHERE orcid_id = %s AND invitation_type = %s
+                        LIMIT 1;
+                        """,
+                        (orcid_id, invitation_type),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT 1 FROM {self.INVITATION_TABLE_NAME}
+                        WHERE orcid_id = %s AND invitation_type = %s AND journal_name = %s
+                        LIMIT 1;
+                        """,
+                        (orcid_id, invitation_type, journal_name),
+                    )
+                if cur.fetchone() is not None:
+                    return True
+
+                if invitation_type == INVITATION_TYPE_EDITORIAL:
+                    cur.execute(
+                        f"SELECT 1 FROM {self.TABLE_NAME} WHERE orcid_id = %s LIMIT 1;",
+                        (orcid_id,),
+                    )
+                    return cur.fetchone() is not None
+
+                return False
         except Exception as e:
             print(f"PostgreSQL is_sent error: {e}")
             return False
 
-    def get_all_sent(self) -> Set[str]:
-        """Get all sent ORCID IDs."""
+    def get_all_sent(
+        self,
+        invitation_type: str = INVITATION_TYPE_EDITORIAL,
+        journal_name: Optional[str] = None,
+    ) -> Set[str]:
+        """Get all ORCID IDs sent an invitation of the requested type."""
         if not self.available:
             return set()
         try:
             with self._get_cursor() as cur:
-                cur.execute(f"SELECT orcid_id FROM {self.TABLE_NAME};")
-                return {row["orcid_id"] for row in cur.fetchall()}
+                if journal_name is None:
+                    cur.execute(
+                        f"""
+                        SELECT orcid_id FROM {self.INVITATION_TABLE_NAME}
+                        WHERE invitation_type = %s;
+                        """,
+                        (invitation_type,),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT orcid_id FROM {self.INVITATION_TABLE_NAME}
+                        WHERE invitation_type = %s AND journal_name = %s;
+                        """,
+                        (invitation_type, journal_name),
+                    )
+                sent = {row["orcid_id"] for row in cur.fetchall()}
+
+                if invitation_type == INVITATION_TYPE_EDITORIAL:
+                    cur.execute(f"SELECT orcid_id FROM {self.TABLE_NAME};")
+                    sent |= {row["orcid_id"] for row in cur.fetchall()}
+
+                return sent
         except Exception as e:
             print(f"PostgreSQL get_all_sent error: {e}")
             return set()

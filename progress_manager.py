@@ -26,11 +26,19 @@ class StateManager:
         """Return default empty state."""
         return {
             "publisher": "brevo",
+            "invitation_type": "editorial",
             "journal_config": {
                 "name": "",
                 "issn": "",
                 "link": "",
-                "editor_in_chief": ""
+                "location": "",
+                "editor_in_chief": "",
+                "submission_link": "",
+                "cite_score": "",
+                "quartile": "",
+                "indexing_status": "",
+                "invitation_goal": "Regular submission",
+                "scope": ""
             },
             "search_params": {
                 "h_index_min": 10,
@@ -44,6 +52,7 @@ class StateManager:
             "search_pagination": {},
             "processed_orcids": [],
             "sent_invitations": [],
+            "sent_invitation_records": [],
             "last_updated": None
         }
     
@@ -66,6 +75,12 @@ class StateManager:
             for key in default:
                 if key not in state:
                     state[key] = default[key]
+
+            if not isinstance(state.get('journal_config'), dict):
+                state['journal_config'] = default['journal_config'].copy()
+            else:
+                for key, value in default['journal_config'].items():
+                    state['journal_config'].setdefault(key, value)
             
             # Convert lists to sets where needed for lookup
             state['processed_orcids'] = set(state.get('processed_orcids', []))
@@ -165,6 +180,25 @@ class StateManager:
             state['sent_invitations'].add(orcid_id)
         
         self.save_state(state)
+
+    def mark_typed_invitation_sent(
+        self,
+        orcid_id: str,
+        invitation_type: str = "editorial",
+        journal_name: str = ""
+    ):
+        """Mark a local typed invitation as sent for offline duplicate checks."""
+        state = self.load_state()
+        records = state.get('sent_invitation_records', [])
+        key = {
+            "orcid_id": orcid_id,
+            "invitation_type": invitation_type,
+            "journal_name": journal_name or ""
+        }
+        if key not in records:
+            records.append(key)
+        state['sent_invitation_records'] = records
+        self.save_state(state)
     
     def is_invitation_sent(self, orcid_id: str) -> bool:
         """Check if invitation was sent to an author."""
@@ -173,6 +207,22 @@ class StateManager:
         if isinstance(sent, list):
             sent = set(sent)
         return orcid_id in sent
+
+    def is_typed_invitation_sent(
+        self,
+        orcid_id: str,
+        invitation_type: str = "editorial",
+        journal_name: str = ""
+    ) -> bool:
+        """Check if a local typed invitation was sent to an author."""
+        state = self.load_state()
+        records = state.get('sent_invitation_records', [])
+        expected = {
+            "orcid_id": orcid_id,
+            "invitation_type": invitation_type,
+            "journal_name": journal_name or ""
+        }
+        return expected in records
     
     def get_search_results(self) -> List[Dict]:
         """Get saved search results."""

@@ -251,6 +251,44 @@ class OpenAlexClient:
             "end_index": end_index,
             "has_more": bool(parsed_results) and bool(next_cursor),
         }
+
+    def fetch_recent_works(self, author_id: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Fetch recent publications for one author using their OpenAlex author ID."""
+        if not author_id:
+            return []
+
+        normalized_author_id = str(author_id).rstrip("/").split("/")[-1]
+        params = {
+            "filter": f"authorships.author.id:{normalized_author_id}",
+            "sort": "publication_date:desc",
+            "select": "id,title,display_name,publication_year,publication_date,primary_location,doi",
+            "per_page": max(1, min(int(limit or 3), 10)),
+        }
+
+        try:
+            data = self._make_request("works", params)
+        except Exception:
+            return []
+
+        works = []
+        for work in data.get("results", []):
+            title = work.get("title") or work.get("display_name") or ""
+            if not title:
+                continue
+
+            primary_location = work.get("primary_location") or {}
+            source = primary_location.get("source") or {}
+            works.append({
+                "id": work.get("id", ""),
+                "title": title,
+                "year": str(work.get("publication_year") or ""),
+                "publication_date": work.get("publication_date") or "",
+                "source": source.get("display_name") or "",
+                "doi": work.get("doi") or "",
+            })
+
+        time.sleep(0.1)
+        return works
     
     def _parse_author(self, author: dict) -> dict:
         """Parse author data into a cleaner format."""
