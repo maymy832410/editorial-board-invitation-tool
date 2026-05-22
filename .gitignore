@@ -12,6 +12,7 @@ data/
 
 # App state
 app_state.json
+logs*.csv
 
 # Python
 __pycache__/
