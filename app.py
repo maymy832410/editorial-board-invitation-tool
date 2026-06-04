@@ -34,6 +34,11 @@ from templates import (
 )
 from pdf_generator import generate_invitation_pdf, PUBLISHER_INFO
 from db_client import get_storage as get_db_storage
+
+WORKFLOW_AUTHOR = "author"
+WORKFLOW_EDITORIAL = "editorial"
+
+
 # Page config
 st.set_page_config(
     page_title="Editorial Board Invitation Tool",
@@ -93,6 +98,25 @@ def _invitation_type_label(invitation_type: str) -> str:
     return "Editorial Role"
 
 
+def _workflow_label(workflow: str) -> str:
+    """Return the visible label for a top-level workflow tab."""
+    if workflow == WORKFLOW_AUTHOR:
+        return "Author Invitation"
+    return "Editorial Invitation"
+
+
+def _workflow_invitation_type(workflow: str) -> str:
+    """Map UI workflow names to persistence invitation types."""
+    if workflow == WORKFLOW_AUTHOR:
+        return INVITATION_TYPE_PUBLICATION
+    return INVITATION_TYPE_EDITORIAL
+
+
+def _scope_key(scope: str, key: str) -> str:
+    """Build a deterministic widget/session key scoped to one workflow tab."""
+    return f"{scope}_{key}"
+
+
 def _tracking_journal_name(invitation_type: str, journal_config: dict) -> str:
     """Publication invitations are tracked per journal; editorial legacy tracking is global."""
     if invitation_type == INVITATION_TYPE_PUBLICATION:
@@ -103,6 +127,126 @@ def _tracking_journal_name(invitation_type: str, journal_config: dict) -> str:
 def _typed_invitation_key(orcid_id: str, invitation_type: str, journal_name: str = "") -> str:
     """Build a stable local key for offline typed invitation tracking."""
     return f"{invitation_type}::{journal_name or ''}::{orcid_id or ''}"
+
+
+def _clean_domain_label(value: str) -> str:
+    """Normalize spacing for domain labels while preserving readable casing."""
+    return " ".join((value or "").strip().split())
+
+
+def _extract_author_domains(author: dict) -> set[str]:
+    """Collect scientific-domain style labels from one author record."""
+    domains: set[str] = set()
+
+    scientific_domain = _clean_domain_label(author.get('scientific_domain', ''))
+    if scientific_domain:
+        domains.add(scientific_domain)
+
+    discipline = _clean_domain_label(author.get('discipline', ''))
+    if discipline:
+        domains.add(discipline)
+
+    specialty = _clean_domain_label(author.get('specialty', ''))
+    if specialty:
+        domains.add(specialty)
+
+    for topic in author.get('all_topics') or []:
+        topic_label = _clean_domain_label(topic)
+        if topic_label:
+            domains.add(topic_label)
+
+    return domains
+
+
+def _hydrate_result_emails_from_db(authors: list[dict]) -> bool:
+    """Fill missing result profile fields from database records using ORCID IDs."""
+    if not db_storage.available or not authors:
+        return False
+
+    missing_orcids = sorted({
+        author.get('orcid_id', '')
+        for author in authors
+        if author.get('orcid_id') and (not author.get('email') or not author.get('scientific_domain'))
+    })
+    if not missing_orcids:
+        return False
+
+    profile_emails: dict[str, str] = {}
+    profile_domains: dict[str, str] = {}
+    sent_emails: dict[str, str] = {}
+    sent_domains: dict[str, str] = {}
+
+    try:
+        with db_storage._get_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT orcid_id, email, COALESCE(scientific_domain, '') AS scientific_domain
+                FROM {db_storage.PROFILE_TABLE_NAME}
+                WHERE orcid_id = ANY(%s)
+                  AND (email <> '' OR COALESCE(scientific_domain, '') <> '');
+                """,
+                (missing_orcids,),
+            )
+            for row in cur.fetchall():
+                orcid_id = row.get('orcid_id', '')
+                email = row.get('email', '')
+                scientific_domain = row.get('scientific_domain', '')
+                if orcid_id and email:
+                    profile_emails[orcid_id] = email
+                if orcid_id and scientific_domain:
+                    profile_domains[orcid_id] = scientific_domain
+
+            try:
+                cur.execute(
+                    f"""
+                    SELECT orcid_id, email, COALESCE(scientific_domain, '') AS scientific_domain
+                    FROM {db_storage.TABLE_NAME}
+                    WHERE orcid_id = ANY(%s)
+                      AND (email <> '' OR COALESCE(scientific_domain, '') <> '');
+                    """,
+                    (missing_orcids,),
+                )
+            except Exception:
+                cur.execute(
+                    f"""
+                    SELECT orcid_id, email, '' AS scientific_domain
+                    FROM {db_storage.TABLE_NAME}
+                    WHERE orcid_id = ANY(%s)
+                      AND email <> '';
+                    """,
+                    (missing_orcids,),
+                )
+            for row in cur.fetchall():
+                orcid_id = row.get('orcid_id', '')
+                email = row.get('email', '')
+                scientific_domain = row.get('scientific_domain', '')
+                if orcid_id and email:
+                    sent_emails[orcid_id] = email
+                if orcid_id and scientific_domain:
+                    sent_domains[orcid_id] = scientific_domain
+    except Exception:
+        return False
+
+    changed = False
+    for author in authors:
+        orcid_id = author.get('orcid_id', '')
+        if not orcid_id:
+            continue
+
+        if not author.get('email'):
+            recovered_email = profile_emails.get(orcid_id) or sent_emails.get(orcid_id)
+            if recovered_email:
+                author['email'] = recovered_email
+                author['email_source'] = 'db'
+                changed = True
+
+        if not author.get('scientific_domain'):
+            recovered_domain = profile_domains.get(orcid_id) or sent_domains.get(orcid_id)
+            if recovered_domain:
+                author['scientific_domain'] = recovered_domain
+                changed = True
+
+    return changed
 
 
 def _get_recent_publications(author: dict, limit: int = 3, force_refresh: bool = False) -> list:
@@ -508,16 +652,12 @@ def email_dialog(author: dict, filters: dict):
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'brevo')
     author_key = author.get('orcid_id') or author.get('author_id') or author.get('name', 'author')
-    invitation_type_options = [INVITATION_TYPE_EDITORIAL, INVITATION_TYPE_PUBLICATION]
-    default_invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    if invitation_type not in {INVITATION_TYPE_EDITORIAL, INVITATION_TYPE_PUBLICATION}:
+        invitation_type = INVITATION_TYPE_EDITORIAL
 
-    invitation_type = st.selectbox(
-        "Invitation Mode",
-        options=invitation_type_options,
-        format_func=_invitation_type_label,
-        index=_safe_select_index(invitation_type_options, default_invitation_type),
-        key=f"dialog_invitation_type_{author_key}"
-    )
+    workflow = WORKFLOW_AUTHOR if invitation_type == INVITATION_TYPE_PUBLICATION else WORKFLOW_EDITORIAL
+    st.caption(f"Workflow: {_workflow_label(workflow)}")
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
     
     is_already_notified = is_author_notified(
@@ -614,7 +754,7 @@ def email_dialog(author: dict, filters: dict):
     to_email = st.text_input(
         "To (Email)",
         value=author.get('email', ''),
-        key="dialog_to"
+        key=f"dialog_to_{author_key}_{invitation_type}"
     )
     subject = st.text_input(
         "Subject",
@@ -632,7 +772,7 @@ def email_dialog(author: dict, filters: dict):
     # PDF option
     col1, col2 = st.columns(2)
     with col1:
-        attach_pdf = st.checkbox("Attach PDF invitation letter", value=True, key="dialog_pdf")
+        attach_pdf = st.checkbox("Attach PDF invitation letter", value=True, key=f"dialog_pdf_{author_key}_{invitation_type}")
     
     # Preview PDF
     if attach_pdf:
@@ -805,28 +945,10 @@ def render_sidebar():
             selected_publisher = 'brevo'
 
         st.divider()
-
-        # Invitation workflow selection
-        st.subheader("Invitation Workflow")
-        invitation_type_options = [INVITATION_TYPE_EDITORIAL, INVITATION_TYPE_PUBLICATION]
-        current_invitation_type = st.session_state.app_state.get('invitation_type', INVITATION_TYPE_EDITORIAL)
-        invitation_type = st.selectbox(
-            "Invitation Mode",
-            options=invitation_type_options,
-            format_func=_invitation_type_label,
-            index=_safe_select_index(invitation_type_options, current_invitation_type),
-            key="invitation_type_select",
-            help="Choose whether sent status, templates, and bulk send use editorial or publication invitations."
-        )
-
-        if invitation_type != current_invitation_type:
-            st.session_state.app_state['invitation_type'] = invitation_type
-            save_state()
-        
-        st.divider()
         
         # Journal Configuration
-        st.subheader("Journal Details")
+        st.subheader("Editorial Invitation Settings")
+        st.caption("Used by the Editorial Invitation tab.")
         
         journal_config = st.session_state.app_state.get('journal_config', {})
         
@@ -864,6 +986,10 @@ def render_sidebar():
             placeholder="e.g., Prof. John Smith",
             key="editor_name"
         )
+
+        st.divider()
+        st.subheader("Author Invitation Settings")
+        st.caption("Used by the Author Invitation tab.")
 
         st.markdown("**Publication Invitation Details**")
 
@@ -1104,25 +1230,31 @@ def render_sidebar():
             'concurrent': concurrent,
             'delay': delay,
             'publisher': selected_publisher,
-            'invitation_type': invitation_type,
             'use_tavily': use_tavily,
             'use_openai_web': use_openai_web
         }
 
 
-def render_search_section(filters):
+def render_search_section(filters, ui_scope: str):
     """Render the search and results section."""
-    
+    invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+
     st.header("Search Authors")
+    st.caption(f"Active workflow: {_invitation_type_label(invitation_type)}")
     
     # Search button
     col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
-        search_clicked = st.button("Search OpenAlex", type="primary", use_container_width=True)
+        search_clicked = st.button(
+            "Search OpenAlex",
+            type="primary",
+            use_container_width=True,
+            key=_scope_key(ui_scope, "search_openalex")
+        )
     
     with col2:
-        stop_clicked = st.button("Stop", use_container_width=True)
+        stop_clicked = st.button("Stop", use_container_width=True, key=_scope_key(ui_scope, "stop_search"))
     
     with col3:
         pass  # Reserved for future use
@@ -1132,13 +1264,13 @@ def render_search_section(filters):
     
     # Handle search
     if search_clicked:
-        run_search(filters)
+        run_search(filters, ui_scope)
     
     # Display results (returns filtered list for email fetching)
-    display_results(filters)
+    display_results(filters, ui_scope)
 
 
-def run_search(filters):
+def run_search(filters, ui_scope: str):
     """Execute the author search with keyword-based topic filtering."""
     
     exclude_country_codes = [COUNTRIES[c] for c in filters['exclude_countries']] if filters['exclude_countries'] else None
@@ -1218,7 +1350,8 @@ def run_search(filters):
     st.session_state.app_state['search_pagination'] = search_state
     st.session_state.app_state['search_results'] = []
     st.session_state.app_state['processed_orcids'] = set()
-    st.session_state.filtered_authors = []
+    st.session_state[_scope_key(ui_scope, "filtered_authors")] = []
+    st.session_state[_scope_key(ui_scope, "results_page")] = 0
     st.session_state.app_state['search_params'] = {
         'keyword_tags': keyword_tags,
         'h_index_min': filters['h_min'],
@@ -1250,14 +1383,15 @@ def run_search(filters):
         st.error(f"Error: {str(e)}")
 
 
-def run_email_fetch_filtered(filters):
+def run_email_fetch_filtered(filters, ui_scope: str):
     """Fetch emails ONLY for currently filtered authors.
     
     Uses ORCID API first, then falls back to OpenAI inference for missing emails.
     """
     
     # Get filtered authors from session state
-    filtered_authors = st.session_state.get('filtered_authors', [])
+    filtered_authors_key = _scope_key(ui_scope, "filtered_authors")
+    filtered_authors = st.session_state.get(filtered_authors_key, st.session_state.get('filtered_authors', []))
     if not filtered_authors:
         st.warning("No filtered authors to process.")
         return
@@ -1408,7 +1542,7 @@ def run_email_fetch_filtered(filters):
     st.rerun()
 
 
-def display_results(filters):
+def display_results(filters, ui_scope: str):
     """Display search results with selection and filtering."""
     
     results = st.session_state.app_state.get('search_results', [])
@@ -1433,7 +1567,7 @@ def display_results(filters):
             "Batch Jump Size",
             options=[250, 500, 1000],
             index=[250, 500, 1000].index(current_jump_size),
-            key="batch_jump_size_control",
+            key=_scope_key(ui_scope, "batch_jump_size_control"),
             help="Reload OpenAlex result batches using the selected jump size"
         )
         if selected_jump_size != current_jump_size:
@@ -1452,7 +1586,12 @@ def display_results(filters):
 
         batch_prev_col, batch_num_col, batch_go_col, batch_next_col = st.columns([1, 1.2, 0.8, 1])
         with batch_prev_col:
-            if st.button("← Previous Batch", disabled=current_batch_index == 0, use_container_width=True):
+            if st.button(
+                "← Previous Batch",
+                disabled=current_batch_index == 0,
+                use_container_width=True,
+                key=_scope_key(ui_scope, "prev_batch")
+            ):
                 load_search_batch(current_batch_index - 1)
                 st.rerun()
         with batch_num_col:
@@ -1462,20 +1601,30 @@ def display_results(filters):
                 max_value=total_batches,
                 value=current_batch_index + 1,
                 step=1,
-                key="target_batch_number"
+                key=_scope_key(ui_scope, "target_batch_number")
             )
         with batch_go_col:
-            if st.button("Go", use_container_width=True):
+            if st.button("Go", use_container_width=True, key=_scope_key(ui_scope, "go_batch")):
                 load_search_batch(int(target_batch) - 1)
                 st.rerun()
         with batch_next_col:
-            if st.button("Next Batch →", disabled=current_batch_index >= total_batches - 1, use_container_width=True):
+            if st.button(
+                "Next Batch →",
+                disabled=current_batch_index >= total_batches - 1,
+                use_container_width=True,
+                key=_scope_key(ui_scope, "next_batch")
+            ):
                 load_search_batch(current_batch_index + 1)
                 st.rerun()
 
         st.caption("OpenAlex deep paging is cursor-based, so batch jumps reuse saved checkpoints rather than direct page numbers.")
     
     filtered = results.copy()
+
+    # Reuse known database emails so invitations can be sent without refetching.
+    if _hydrate_result_emails_from_db(filtered):
+        _sync_current_batch_cache()
+        save_state()
     
     # Get sent invitations from DB (persistent) for the active invitation workflow.
     sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
@@ -1487,9 +1636,10 @@ def display_results(filters):
     for r in filtered:
         r['is_retracted'] = r.get('name', '').lower() in retracted_names
     
-    # Collect unique disciplines and specialties from results
+    # Collect unique disciplines, specialties, and author domains from results.
     all_disciplines = set()
     all_specialties = set()
+    all_author_domains = set()
     for r in results:
         if r.get('discipline'):
             all_disciplines.add(r['discipline'])
@@ -1497,6 +1647,7 @@ def display_results(filters):
             all_specialties.update(r['all_topics'])
         elif r.get('specialty'):
             all_specialties.add(r['specialty'])
+        all_author_domains.update(_extract_author_domains(r))
     
     # Filter options - Row 1: Discipline and Specialty filters
     col_f1, col_f2 = st.columns(2)
@@ -1507,7 +1658,7 @@ def display_results(filters):
             "Filter by Discipline",
             options=sorted(all_disciplines),
             default=[],
-            key="discipline_filter",
+            key=_scope_key(ui_scope, "discipline_filter"),
             help="Filter by broad discipline category"
         )
     
@@ -1516,7 +1667,7 @@ def display_results(filters):
         selected_specialty = st.selectbox(
             "Filter by Specialty",
             options=["All Specialties"] + sorted(all_specialties),
-            key="specialty_filter",
+            key=_scope_key(ui_scope, "specialty_filter"),
             help="Select a specific research topic"
         )
     
@@ -1541,25 +1692,69 @@ def display_results(filters):
             "Exclude Countries (post-filter)",
             options=country_options,
             default=[],
-            key="exclude_countries_postfilter",
+            key=_scope_key(ui_scope, "exclude_countries_postfilter"),
             help="Exclude authors from these countries in the results below"
         )
         if excluded_display:
             excluded_codes = {opt.split("(")[-1].rstrip(")") for opt in excluded_display}
             filtered = [r for r in filtered if r.get('country') not in excluded_codes]
+
+    # Scientific-domain targeting filters (for example Computer Science, Biology).
+    selected_domain_labels: list[str] = []
+    excluded_domain_labels: list[str] = []
+    if all_author_domains:
+        col_domain1, col_domain2 = st.columns(2)
+        with col_domain1:
+            selected_domain_labels = st.multiselect(
+                "Include Author Domains",
+                options=sorted(all_author_domains),
+                default=[],
+                key=_scope_key(ui_scope, "include_author_domains_filter"),
+                help="Show only authors whose scientific domains match the selected values."
+            )
+        with col_domain2:
+            excluded_domain_labels = st.multiselect(
+                "Exclude Author Domains",
+                options=sorted(all_author_domains),
+                default=[],
+                key=_scope_key(ui_scope, "exclude_author_domains_filter"),
+                help="Hide authors whose scientific domains match the selected values."
+            )
+
+    selected_domain_lookup = {label.lower() for label in selected_domain_labels}
+    if selected_domain_lookup:
+        filtered = [
+            r for r in filtered
+            if selected_domain_lookup.intersection({value.lower() for value in _extract_author_domains(r)})
+        ]
+
+    excluded_domain_lookup = {label.lower() for label in excluded_domain_labels}
+    if excluded_domain_lookup:
+        filtered = [
+            r for r in filtered
+            if not excluded_domain_lookup.intersection({value.lower() for value in _extract_author_domains(r)})
+        ]
     
     # Filter options - Row 2: Checkboxes
     col_filter1, col_filter2, col_filter3 = st.columns(3)
     with col_filter1:
-        show_only_with_email = st.checkbox("Show only authors with email", value=False, key="filter_email")
+        show_only_with_email = st.checkbox(
+            "Show only authors with email",
+            value=False,
+            key=_scope_key(ui_scope, "filter_email")
+        )
     with col_filter2:
         show_only_not_sent = st.checkbox(
             f"Hide already sent ({_invitation_type_label(invitation_type)})",
             value=False,
-            key="filter_not_sent"
+            key=_scope_key(ui_scope, "filter_not_sent")
         )
     with col_filter3:
-        hide_retracted = st.checkbox("Hide retracted authors", value=True, key="filter_retracted")
+        hide_retracted = st.checkbox(
+            "Hide retracted authors",
+            value=True,
+            key=_scope_key(ui_scope, "filter_retracted")
+        )
     
     # Apply email filter
     if show_only_with_email:
@@ -1574,6 +1769,7 @@ def display_results(filters):
         filtered = [r for r in filtered if not r.get('is_retracted')]
     
     # Store filtered list in session state for email fetching
+    st.session_state[_scope_key(ui_scope, "filtered_authors")] = filtered
     st.session_state.filtered_authors = filtered
     
     # Count authors without email in filtered list
@@ -1594,10 +1790,15 @@ def display_results(filters):
             fetch_btn_label,
             type="primary" if without_email > 0 else "secondary",
             use_container_width=True,
-            disabled=without_email == 0
+            disabled=without_email == 0,
+            key=_scope_key(ui_scope, "fetch_emails")
         )
     with col_btn2:
-        stop_clicked = st.button("Stop Fetching", use_container_width=True)
+        stop_clicked = st.button(
+            "Stop Fetching",
+            use_container_width=True,
+            key=_scope_key(ui_scope, "stop_fetching")
+        )
     
     # Show tip about email rates if many processed but few found
     if already_processed > 0 and without_email > 0:
@@ -1613,7 +1814,7 @@ def display_results(filters):
         st.session_state.stop_fetching = True
     
     if fetch_emails_clicked:
-        run_email_fetch_filtered(filters)
+        run_email_fetch_filtered(filters, ui_scope)
     
     # Summary metrics
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -1733,26 +1934,35 @@ def display_results(filters):
     # Display rows with Send buttons (paginated)
     page_size = 25
     total_pages = (len(filtered) + page_size - 1) // page_size
-    
-    if 'results_page' not in st.session_state:
-        st.session_state.results_page = 0
+    results_page_key = _scope_key(ui_scope, "results_page")
+    if results_page_key not in st.session_state:
+        st.session_state[results_page_key] = 0
+    current_results_page = st.session_state[results_page_key]
     
     # Pagination controls
     if total_pages > 1:
         col_prev, col_page, col_next = st.columns([1, 2, 1])
         with col_prev:
-            if st.button("← Previous", disabled=st.session_state.results_page == 0):
-                st.session_state.results_page -= 1
+            if st.button(
+                "← Previous",
+                disabled=current_results_page == 0,
+                key=_scope_key(ui_scope, "prev_results_page")
+            ):
+                st.session_state[results_page_key] = max(0, current_results_page - 1)
                 st.rerun()
         with col_page:
-            st.markdown(f"<center>Page {st.session_state.results_page + 1} of {total_pages}</center>", unsafe_allow_html=True)
+            st.markdown(f"<center>Page {current_results_page + 1} of {total_pages}</center>", unsafe_allow_html=True)
         with col_next:
-            if st.button("Next →", disabled=st.session_state.results_page >= total_pages - 1):
-                st.session_state.results_page += 1
+            if st.button(
+                "Next →",
+                disabled=current_results_page >= total_pages - 1,
+                key=_scope_key(ui_scope, "next_results_page")
+            ):
+                st.session_state[results_page_key] = min(total_pages - 1, current_results_page + 1)
                 st.rerun()
     
     # Get current page of results
-    start_idx = st.session_state.results_page * page_size
+    start_idx = current_results_page * page_size
     end_idx = min(start_idx + page_size, len(filtered))
     page_results = filtered[start_idx:end_idx]
     
@@ -1774,26 +1984,34 @@ def display_results(filters):
             "Bulk Template",
             options=list(bulk_template_names.keys()),
             format_func=lambda x: bulk_template_names[x],
-            key=f"bulk_template_select_{invitation_type}"
+            key=_scope_key(ui_scope, f"bulk_template_select_{invitation_type}")
         )
     with bulk_col2:
         if invitation_type == INVITATION_TYPE_PUBLICATION:
             bulk_template_strategy = st.selectbox(
                 "Template Strategy",
                 options=["Rotate publication templates", "Use selected template"],
-                key="bulk_publication_template_strategy"
+                key=_scope_key(ui_scope, "bulk_publication_template_strategy")
             )
             bulk_scopus_indexed = False
         else:
             bulk_template_strategy = "Use selected template"
-            bulk_scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key="bulk_scopus_indexed")
+            bulk_scopus_indexed = st.checkbox(
+                "Journal is Scopus indexed",
+                value=False,
+                key=_scope_key(ui_scope, "bulk_scopus_indexed")
+            )
     with bulk_col3:
-        bulk_attach_pdf = st.checkbox("Attach PDF", value=True, key=f"bulk_attach_pdf_{invitation_type}")
+        bulk_attach_pdf = st.checkbox(
+            "Attach PDF",
+            value=True,
+            key=_scope_key(ui_scope, f"bulk_attach_pdf_{invitation_type}")
+        )
         if invitation_type == INVITATION_TYPE_PUBLICATION:
             bulk_include_cached_publications = st.checkbox(
                 "Use cached publications",
                 value=True,
-                key="bulk_include_cached_publications",
+                key=_scope_key(ui_scope, "bulk_include_cached_publications"),
                 help="Bulk sends use already-loaded OpenAlex publications only to avoid slow batch sends."
             )
         else:
@@ -1803,10 +2021,14 @@ def display_results(filters):
     with col_sel:
         select_all = st.checkbox(
             f"Select all on page ({len(page_with_email)} with email)",
-            key=f"select_all_page_{st.session_state.results_page}"
+            key=_scope_key(ui_scope, f"select_all_page_{current_results_page}")
         )
     with col_skip:
-        skip_notified = st.checkbox("Skip already notified", value=True, key="bulk_skip_notified")
+        skip_notified = st.checkbox(
+            "Skip already notified",
+            value=True,
+            key=_scope_key(ui_scope, "bulk_skip_notified")
+        )
     
     eligible = page_not_sent if skip_notified else page_with_email
     remaining_today = max(0, DAILY_CAP - st.session_state.bulk_sends_today)
@@ -1823,7 +2045,7 @@ def display_results(filters):
             type="primary" if select_all and batch_size > 0 and EMAIL_AVAILABLE else "secondary",
             disabled=not (select_all and batch_size > 0 and EMAIL_AVAILABLE),
             use_container_width=True,
-            key=f"bulk_send_{st.session_state.results_page}"
+            key=_scope_key(ui_scope, f"bulk_send_{current_results_page}")
         )
     
     st.caption(f"Brevo daily sends: {st.session_state.bulk_sends_today}/{DAILY_CAP} used today")
@@ -1948,15 +2170,6 @@ def display_results(filters):
         is_retracted = author.get('is_retracted', False)
         has_email = bool(author.get('email'))
         
-        if is_retracted:
-            row_class = "retracted-row"
-        elif is_notified:
-            row_class = "notified-row"
-        elif has_email:
-            row_class = "pending-row"
-        else:
-            row_class = "no-email-row"
-        
         cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
         
         with cols[0]:
@@ -2005,7 +2218,12 @@ def display_results(filters):
         
         with cols[6]:
             if is_retracted:
-                st.button("🚫", disabled=True, key=f"retracted_{orcid_id}_{start_idx + idx}", use_container_width=True)
+                st.button(
+                    "🚫",
+                    disabled=True,
+                    key=_scope_key(ui_scope, f"retracted_{orcid_id}_{start_idx + idx}"),
+                    use_container_width=True
+                )
             elif has_email:
                 if is_notified:
                     btn_label = "Re-send"
@@ -2013,10 +2231,20 @@ def display_results(filters):
                 else:
                     btn_label = "Send"
                     btn_type = "primary"
-                if st.button(btn_label, key=f"send_{orcid_id}_{start_idx + idx}", type=btn_type, use_container_width=True):
+                if st.button(
+                    btn_label,
+                    key=_scope_key(ui_scope, f"send_{orcid_id}_{start_idx + idx}"),
+                    type=btn_type,
+                    use_container_width=True
+                ):
                     email_dialog(author, filters)
             else:
-                st.button("—", disabled=True, key=f"no_email_{start_idx + idx}", use_container_width=True)
+                st.button(
+                    "—",
+                    disabled=True,
+                    key=_scope_key(ui_scope, f"no_email_{start_idx + idx}"),
+                    use_container_width=True
+                )
     
     st.divider()
     
@@ -2029,7 +2257,8 @@ def display_results(filters):
             data=csv,
             file_name="authors.csv",
             mime="text/csv",
-            use_container_width=True
+            use_container_width=True,
+            key=_scope_key(ui_scope, "export_csv")
         )
     with col2:
         df_with_email = df[df['Email'] != '']
@@ -2040,7 +2269,8 @@ def display_results(filters):
                 data=csv_email,
                 file_name="authors_with_email.csv",
                 mime="text/csv",
-                use_container_width=True
+                use_container_width=True,
+                key=_scope_key(ui_scope, "export_with_email_csv")
             )
 
 
@@ -2249,14 +2479,28 @@ def render_invitation_section(filters):
 def main():
     """Main app entry point."""
     
-    st.title("Editorial Board Invitation Tool")
-    st.caption("Find academic authors and send editorial board invitations")
+    st.title("Editorial And Author Invitation Tool")
+    st.caption("Find academic authors and send separate author or editorial invitations")
     
     # Render sidebar and get filters
-    filters = render_sidebar()
-    
-    # Main content
-    render_search_section(filters)
+    shared_filters = render_sidebar()
+
+    author_tab, editorial_tab = st.tabs([
+        _workflow_label(WORKFLOW_AUTHOR),
+        _workflow_label(WORKFLOW_EDITORIAL),
+    ])
+
+    with author_tab:
+        st.caption("Publication-submission invitations with scientific-domain targeting.")
+        author_filters = dict(shared_filters)
+        author_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_AUTHOR)
+        render_search_section(author_filters, WORKFLOW_AUTHOR)
+
+    with editorial_tab:
+        st.caption("Editorial board-role invitations with editorial templates.")
+        editorial_filters = dict(shared_filters)
+        editorial_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_EDITORIAL)
+        render_search_section(editorial_filters, WORKFLOW_EDITORIAL)
 
 
 if __name__ == "__main__":
