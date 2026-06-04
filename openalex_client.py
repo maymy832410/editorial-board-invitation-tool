@@ -1,5 +1,6 @@
 """OpenAlex API client for searching authors."""
 
+import os
 import time
 from typing import Any, Generator, Optional
 import requests
@@ -15,49 +16,95 @@ def _normalize_orcid(orcid_value: str) -> str:
     return normalized.replace("https://orcid.org/", "").replace("http://orcid.org/", "")
 
 
+def _read_env_int(name: str, default: int, minimum: int) -> int:
+    """Read an integer env var with fallback and lower bound."""
+    raw_value = (os.environ.get(name, "") or "").strip()
+    if not raw_value:
+        return max(int(default), minimum)
+    try:
+        return max(int(raw_value), minimum)
+    except ValueError:
+        return max(int(default), minimum)
+
+
+def _read_env_float(name: str, default: float, minimum: float) -> float:
+    """Read a float env var with fallback and lower bound."""
+    raw_value = (os.environ.get(name, "") or "").strip()
+    if not raw_value:
+        return max(float(default), minimum)
+    try:
+        return max(float(raw_value), minimum)
+    except ValueError:
+        return max(float(default), minimum)
+
+
 class OpenAlexClient:
     """Client for querying OpenAlex API for author data."""
     
     def __init__(self, email: str = OPENALEX_EMAIL):
         self.email = email
         self.base_url = OPENALEX_BASE_URL
+        self.max_retries = _read_env_int("OPENALEX_MAX_RETRIES", 3, minimum=1)
+        self.request_timeout_seconds = _read_env_int("OPENALEX_REQUEST_TIMEOUT_SEC", 30, minimum=5)
+        self.backoff_base_seconds = _read_env_float("OPENALEX_BACKOFF_BASE_SEC", 2.0, minimum=0.1)
+        self.request_pause_seconds = _read_env_float("OPENALEX_REQUEST_PAUSE_SEC", 0.1, minimum=0.0)
+        self.request_stats: dict[str, int] = {
+            "requests": 0,
+            "rate_limited": 0,
+            "server_errors": 0,
+            "network_errors": 0,
+            "retry_exhausted": 0,
+        }
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": f"AuthorEmailFinder/1.0 (mailto:{email})"
         })
+
+    def _pause_between_requests(self) -> None:
+        """Apply a configurable delay between OpenAlex requests."""
+        if self.request_pause_seconds > 0:
+            time.sleep(self.request_pause_seconds)
     
-    def _make_request(self, endpoint: str, params: dict, max_retries: int = 3) -> dict:
+    def _make_request(self, endpoint: str, params: dict, max_retries: Optional[int] = None) -> dict:
         """Make a request with retry logic and exponential backoff."""
+        retries = max(1, int(max_retries)) if max_retries is not None else self.max_retries
         params["mailto"] = self.email
         url = f"{self.base_url}/{endpoint}"
         
-        for attempt in range(max_retries):
+        for attempt in range(retries):
             try:
-                response = self.session.get(url, params=params, timeout=30)
+                self.request_stats["requests"] += 1
+                response = self.session.get(url, params=params, timeout=self.request_timeout_seconds)
                 
                 if response.status_code == 200:
                     return response.json()
                 elif response.status_code == 429:
                     # Rate limited - wait and retry
-                    wait_time = (2 ** attempt) * 2
+                    self.request_stats["rate_limited"] += 1
+                    wait_time = (2 ** attempt) * self.backoff_base_seconds
                     time.sleep(wait_time)
                     continue
                 elif response.status_code >= 500:
                     # Server error - retry
-                    wait_time = (2 ** attempt) * 2
+                    self.request_stats["server_errors"] += 1
+                    wait_time = (2 ** attempt) * self.backoff_base_seconds
                     time.sleep(wait_time)
                     continue
                 else:
                     response.raise_for_status()
                     
             except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 2
+                self.request_stats["network_errors"] += 1
+                if attempt < retries - 1:
+                    wait_time = (2 ** attempt) * self.backoff_base_seconds
                     time.sleep(wait_time)
                     continue
+                self.request_stats["retry_exhausted"] += 1
                 raise e
+
+        self.request_stats["retry_exhausted"] += 1
         
-        raise Exception(f"Failed to fetch data after {max_retries} retries")
+        raise Exception(f"Failed to fetch data after {retries} retries")
     
     def search_topics(
         self, 
@@ -111,7 +158,7 @@ class OpenAlexClient:
                         })
                 
                 # Small delay between keyword searches
-                time.sleep(0.1)
+                self._pause_between_requests()
                 
             except Exception:
                 # Continue with other keywords if one fails
@@ -211,7 +258,7 @@ class OpenAlexClient:
             cursor = data.get("meta", {}).get("next_cursor")
             
             # Small delay to be polite
-            time.sleep(0.1)
+            self._pause_between_requests()
 
     def fetch_author_batch(
         self,
@@ -247,7 +294,7 @@ class OpenAlexClient:
         start_index = batch_index * batch_size
         end_index = start_index + len(parsed_results)
 
-        time.sleep(0.1)
+        self._pause_between_requests()
 
         return {
             "results": parsed_results,
@@ -295,7 +342,7 @@ class OpenAlexClient:
                 "doi": work.get("doi") or "",
             })
 
-        time.sleep(0.1)
+        self._pause_between_requests()
         return works
 
     def fetch_author_by_orcid(self, orcid_id: str) -> Optional[dict[str, Any]]:

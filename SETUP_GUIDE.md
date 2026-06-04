@@ -233,6 +233,47 @@ streamlit run app.py
 
 ---
 
+## Long-Run OpenAlex Enrichment (20k+ Profiles)
+
+The importer now runs OpenAlex enrichment in repeated chunks and uses DB status fields as resume state.
+If the process stops, re-running `import_data.py` continues from remaining `unknown` rows.
+
+### Enrichment controls
+
+- `OPENALEX_ENRICH_BATCH_SIZE` (default: `500`) - rows per batch
+- `OPENALEX_ENRICH_MAX_TOTAL` (default: `0`) - hard cap for one run (`0` means unbounded)
+- `OPENALEX_ENRICH_PROGRESS_EVERY` (default: `50`) - progress print interval
+- `OPENALEX_ENRICH_BATCH_PAUSE_SEC` (default: `0`) - pause between DB batches
+- `OPENALEX_ENRICH_INCLUDE_PENDING_MANUAL` (default: `false`) - include `pending_manual` rows in queue
+- `OPENALEX_ENRICH_LIMIT` (legacy fallback) - used only when batch size is not set
+
+### OpenAlex request controls
+
+- `OPENALEX_MAX_RETRIES` (default: `3`)
+- `OPENALEX_REQUEST_TIMEOUT_SEC` (default: `30`)
+- `OPENALEX_BACKOFF_BASE_SEC` (default: `2`)
+- `OPENALEX_REQUEST_PAUSE_SEC` (default: `0.1`)
+
+### Example run
+
+```bash
+OPENALEX_ENRICH_BATCH_SIZE=300 \
+OPENALEX_ENRICH_MAX_TOTAL=20000 \
+OPENALEX_ENRICH_PROGRESS_EVERY=100 \
+OPENALEX_ENRICH_BATCH_PAUSE_SEC=0.2 \
+OPENALEX_MAX_RETRIES=4 \
+python import_data.py
+```
+
+### Recommended operation
+
+1. Run once with small limits to verify logging and status transitions.
+2. Start a larger run for production volume.
+3. If interrupted, restart with the same command; processed rows are skipped automatically.
+4. Keep `OPENALEX_ENRICH_INCLUDE_PENDING_MANUAL=false` for normal runs to avoid retry loops.
+
+---
+
 ## Contact/Accounts
 
 - GitHub: maymy832410

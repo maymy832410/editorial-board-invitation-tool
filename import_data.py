@@ -8,6 +8,7 @@ Usage:
 import csv
 import os
 import sys
+import time
 from typing import Any, Optional, cast
 from urllib.parse import urlparse
 
@@ -322,75 +323,209 @@ def backfill_profiles_and_counters(max_rows: Optional[int] = None) -> None:
     )
 
 
+def _read_env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read an integer environment variable with fallback and clamping."""
+    raw_value = (os.environ.get(name, "") or "").strip()
+    if not raw_value:
+        return max(int(default), minimum)
+    try:
+        return max(int(raw_value), minimum)
+    except ValueError:
+        print(f"WARN: invalid {name}={raw_value!r}; using {default}")
+        return max(int(default), minimum)
+
+
+def _read_env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Read a float environment variable with fallback and clamping."""
+    raw_value = (os.environ.get(name, "") or "").strip()
+    if not raw_value:
+        return max(float(default), minimum)
+    try:
+        return max(float(raw_value), minimum)
+    except ValueError:
+        print(f"WARN: invalid {name}={raw_value!r}; using {default}")
+        return max(float(default), minimum)
+
+
+def _read_env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable with common truthy/falsy forms."""
+    raw_value = (os.environ.get(name, "") or "").strip().lower()
+    if not raw_value:
+        return bool(default)
+    if raw_value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "n", "off"}:
+        return False
+    print(f"WARN: invalid {name}={raw_value!r}; using {default}")
+    return bool(default)
+
+
 def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
-    """Enrich profile rows via strict ORCID -> OpenAlex lookup only."""
+    """Enrich profile rows via strict ORCID -> OpenAlex lookup using chunked looping."""
     storage = get_storage()
     if not storage.available:
         print("SKIP: storage unavailable; OpenAlex enrichment was not executed.")
         return
 
-    candidates = storage.get_profiles_needing_openalex(limit=limit, require_orcid=True)
-    if not candidates:
+    batch_size = _read_env_int("OPENALEX_ENRICH_BATCH_SIZE", max(int(limit or 500), 1), minimum=1)
+    max_total = _read_env_int("OPENALEX_ENRICH_MAX_TOTAL", 0, minimum=0)
+    progress_every = _read_env_int("OPENALEX_ENRICH_PROGRESS_EVERY", 50, minimum=1)
+    batch_pause_seconds = _read_env_float("OPENALEX_ENRICH_BATCH_PAUSE_SEC", 0.0, minimum=0.0)
+    include_pending_manual = _read_env_bool("OPENALEX_ENRICH_INCLUDE_PENDING_MANUAL", default=False)
+
+    initial_remaining = storage.count_profiles_needing_openalex(
+        require_orcid=True,
+        include_pending_manual=include_pending_manual,
+    )
+    if initial_remaining <= 0:
         print("No ORCID profiles need OpenAlex enrichment.")
         return
 
+    effective_max_total = max_total
+    if include_pending_manual and effective_max_total <= 0:
+        # Pending-manual rows remain eligible after failed retries, so cap one pass by default.
+        effective_max_total = initial_remaining
+        print(
+            "OPENALEX_ENRICH_INCLUDE_PENDING_MANUAL enabled without OPENALEX_ENRICH_MAX_TOTAL; "
+            f"limiting this run to {effective_max_total} attempts to avoid infinite retries."
+        )
+
     client = OpenAlexClient()
-    matched = 0
-    pending_manual = 0
 
-    print(f"Enriching up to {len(candidates)} ORCID profiles from OpenAlex...")
-    for index, profile in enumerate(candidates, start=1):
-        profile_key = profile.get("profile_key", "")
-        orcid_id = profile.get("orcid_id", "")
-        if not profile_key or not orcid_id:
-            continue
-
-        author = client.fetch_author_by_orcid(orcid_id)
-        if author:
-            openalex_id = author.get("author_id", "") or ""
-            scientific_domain = author.get("discipline", "") or ""
-            topics_payload = author.get("all_topics")
-            raw_topics = cast(list[str], topics_payload) if isinstance(topics_payload, list) else []
-            domains = [topic for topic in raw_topics if topic][:8]
-            updated = storage.update_profile_openalex(
-                profile_key=profile_key,
-                openalex_id=openalex_id,
-                scientific_domain=scientific_domain,
-                scientific_domains=domains,
-                match_status=OPENALEX_MATCH_STATUS_MATCHED,
-                match_confidence=1.0,
-            )
-            if updated:
-                matched += 1
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE sent_invitations
-                        SET openalex_id = %s,
-                            scientific_domain = %s
-                        WHERE orcid_id = %s;
-                        """,
-                        (openalex_id, scientific_domain, orcid_id),
-                    )
-        else:
-            updated = storage.update_profile_openalex(
-                profile_key=profile_key,
-                openalex_id="",
-                scientific_domain="",
-                scientific_domains=[],
-                match_status=OPENALEX_MATCH_STATUS_PENDING_MANUAL,
-                match_confidence=0.0,
-            )
-            if updated:
-                pending_manual += 1
-
-        if index % 50 == 0:
-            print(f"  processed {index}/{len(candidates)} profiles")
+    total_attempted = 0
+    total_matched = 0
+    total_pending_manual = 0
+    batch_index = 0
 
     print(
+        "Starting OpenAlex enrichment:",
+        f"initial_queue={initial_remaining},",
+        f"batch_size={batch_size},",
+        f"max_total={effective_max_total if effective_max_total > 0 else 'unbounded'},",
+        f"include_pending_manual={include_pending_manual}",
+    )
+
+    while True:
+        if effective_max_total > 0 and total_attempted >= effective_max_total:
+            print(f"Reached OPENALEX_ENRICH_MAX_TOTAL={effective_max_total}; stopping early.")
+            break
+
+        limit_for_batch = batch_size
+        if effective_max_total > 0:
+            limit_for_batch = min(limit_for_batch, effective_max_total - total_attempted)
+            if limit_for_batch <= 0:
+                break
+
+        candidates = storage.get_profiles_needing_openalex(
+            limit=limit_for_batch,
+            require_orcid=True,
+            include_pending_manual=include_pending_manual,
+        )
+        if not candidates:
+            break
+
+        batch_index += 1
+        batch_attempted = 0
+        batch_matched = 0
+        batch_pending_manual = 0
+
+        print(f"Batch {batch_index}: processing {len(candidates)} profiles")
+        for profile in candidates:
+            profile_key = profile.get("profile_key", "")
+            orcid_id = profile.get("orcid_id", "")
+            if not profile_key or not orcid_id:
+                continue
+
+            total_attempted += 1
+            batch_attempted += 1
+
+            author = client.fetch_author_by_orcid(orcid_id)
+            if author:
+                openalex_id = author.get("author_id", "") or ""
+                scientific_domain = author.get("discipline", "") or ""
+                topics_payload = author.get("all_topics")
+                raw_topics = cast(list[str], topics_payload) if isinstance(topics_payload, list) else []
+                domains = [topic for topic in raw_topics if topic][:8]
+                updated = storage.update_profile_openalex(
+                    profile_key=profile_key,
+                    openalex_id=openalex_id,
+                    scientific_domain=scientific_domain,
+                    scientific_domains=domains,
+                    match_status=OPENALEX_MATCH_STATUS_MATCHED,
+                    match_confidence=1.0,
+                )
+                if updated:
+                    total_matched += 1
+                    batch_matched += 1
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE sent_invitations
+                            SET openalex_id = %s,
+                                scientific_domain = %s
+                            WHERE orcid_id = %s;
+                            """,
+                            (openalex_id, scientific_domain, orcid_id),
+                        )
+            else:
+                updated = storage.update_profile_openalex(
+                    profile_key=profile_key,
+                    openalex_id="",
+                    scientific_domain="",
+                    scientific_domains=[],
+                    match_status=OPENALEX_MATCH_STATUS_PENDING_MANUAL,
+                    match_confidence=0.0,
+                )
+                if updated:
+                    total_pending_manual += 1
+                    batch_pending_manual += 1
+
+            if total_attempted % progress_every == 0:
+                print(
+                    f"  progress: attempted={total_attempted},",
+                    f"matched={total_matched},",
+                    f"pending_manual={total_pending_manual}",
+                )
+
+        remaining = storage.count_profiles_needing_openalex(
+            require_orcid=True,
+            include_pending_manual=include_pending_manual,
+        )
+        request_stats = client.request_stats
+        print(
+            f"Batch {batch_index} complete:",
+            f"attempted={batch_attempted},",
+            f"matched={batch_matched},",
+            f"pending_manual={batch_pending_manual},",
+            f"remaining={remaining},",
+            f"api_requests={request_stats.get('requests', 0)},",
+            f"api_429={request_stats.get('rate_limited', 0)},",
+            f"api_5xx={request_stats.get('server_errors', 0)},",
+            f"api_network={request_stats.get('network_errors', 0)},",
+            f"retry_exhausted={request_stats.get('retry_exhausted', 0)}",
+        )
+
+        if remaining <= 0:
+            break
+        if batch_pause_seconds > 0:
+            time.sleep(batch_pause_seconds)
+
+    final_remaining = storage.count_profiles_needing_openalex(
+        require_orcid=True,
+        include_pending_manual=include_pending_manual,
+    )
+    request_stats = client.request_stats
+    print(
         "OpenAlex enrichment complete:",
-        f"matched={matched},",
-        f"pending_manual={pending_manual}",
+        f"attempted={total_attempted},",
+        f"matched={total_matched},",
+        f"pending_manual={total_pending_manual},",
+        f"remaining={final_remaining},",
+        f"api_requests={request_stats.get('requests', 0)},",
+        f"api_429={request_stats.get('rate_limited', 0)},",
+        f"api_5xx={request_stats.get('server_errors', 0)},",
+        f"api_network={request_stats.get('network_errors', 0)},",
+        f"retry_exhausted={request_stats.get('retry_exhausted', 0)}",
     )
 
 
@@ -399,8 +534,9 @@ if __name__ == "__main__":
     ensure_tables(conn)
     import_sent_invitations(conn)
     backfill_profiles_and_counters()
-    enrich_limit = int(os.environ.get("OPENALEX_ENRICH_LIMIT", "500"))
-    enrich_profiles_from_openalex(conn, limit=max(0, enrich_limit))
+    legacy_enrich_limit = _read_env_int("OPENALEX_ENRICH_LIMIT", 500, minimum=1)
+    enrich_batch_size = _read_env_int("OPENALEX_ENRICH_BATCH_SIZE", legacy_enrich_limit, minimum=1)
+    enrich_profiles_from_openalex(conn, limit=enrich_batch_size)
     import_retraction_watch(conn)
     conn.close()
     print("\nAll imports complete.")

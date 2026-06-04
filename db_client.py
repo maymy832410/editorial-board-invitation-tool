@@ -716,12 +716,21 @@ class PostgresStorage:
             print(f"PostgreSQL backfill author profiles error: {e}")
             return stats
 
-    def get_profiles_needing_openalex(self, limit: int = 500, require_orcid: bool = True) -> List[Dict[str, Any]]:
-        """Return profiles missing OpenAlex IDs for enrichment processing."""
+    def get_profiles_needing_openalex(
+        self,
+        limit: int = 500,
+        require_orcid: bool = True,
+        include_pending_manual: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return profiles missing OpenAlex IDs that still need enrichment work."""
         if not self.available:
             return []
         try:
             with self._get_cursor() as cur:
+                status_filter = [OPENALEX_MATCH_STATUS_UNKNOWN]
+                if include_pending_manual:
+                    status_filter.append(OPENALEX_MATCH_STATUS_PENDING_MANUAL)
+
                 if require_orcid:
                     cur.execute(
                         f"""
@@ -729,10 +738,15 @@ class PostgresStorage:
                         FROM {self.PROFILE_TABLE_NAME}
                         WHERE (openalex_id = '' OR openalex_id IS NULL)
                           AND (orcid_id <> '' AND orcid_id IS NOT NULL)
-                        ORDER BY updated_at DESC
+                          AND COALESCE(openalex_match_status, %s) = ANY(%s)
+                        ORDER BY updated_at ASC NULLS FIRST
                         LIMIT %s;
                         """,
-                        (int(limit),),
+                        (
+                            OPENALEX_MATCH_STATUS_UNKNOWN,
+                            status_filter,
+                            int(limit),
+                        ),
                     )
                 else:
                     cur.execute(
@@ -740,15 +754,69 @@ class PostgresStorage:
                         SELECT profile_key, orcid_id, author_name, email, email_domain
                         FROM {self.PROFILE_TABLE_NAME}
                         WHERE (openalex_id = '' OR openalex_id IS NULL)
-                        ORDER BY updated_at DESC
+                          AND COALESCE(openalex_match_status, %s) = ANY(%s)
+                        ORDER BY updated_at ASC NULLS FIRST
                         LIMIT %s;
                         """,
-                        (int(limit),),
+                        (
+                            OPENALEX_MATCH_STATUS_UNKNOWN,
+                            status_filter,
+                            int(limit),
+                        ),
                     )
                 return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             print(f"PostgreSQL get profiles needing OpenAlex error: {e}")
             return []
+
+    def count_profiles_needing_openalex(
+        self,
+        require_orcid: bool = True,
+        include_pending_manual: bool = False,
+    ) -> int:
+        """Return how many profiles remain in the OpenAlex enrichment queue."""
+        if not self.available:
+            return 0
+
+        status_filter = [OPENALEX_MATCH_STATUS_UNKNOWN]
+        if include_pending_manual:
+            status_filter.append(OPENALEX_MATCH_STATUS_PENDING_MANUAL)
+
+        try:
+            with self._get_cursor() as cur:
+                if require_orcid:
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*) AS cnt
+                        FROM {self.PROFILE_TABLE_NAME}
+                        WHERE (openalex_id = '' OR openalex_id IS NULL)
+                          AND (orcid_id <> '' AND orcid_id IS NOT NULL)
+                          AND COALESCE(openalex_match_status, %s) = ANY(%s);
+                        """,
+                        (
+                            OPENALEX_MATCH_STATUS_UNKNOWN,
+                            status_filter,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*) AS cnt
+                        FROM {self.PROFILE_TABLE_NAME}
+                        WHERE (openalex_id = '' OR openalex_id IS NULL)
+                          AND COALESCE(openalex_match_status, %s) = ANY(%s);
+                        """,
+                        (
+                            OPENALEX_MATCH_STATUS_UNKNOWN,
+                            status_filter,
+                        ),
+                    )
+
+                row = cur.fetchone() or {}
+                return int(row.get("cnt") or 0)
+        except Exception as e:
+            print(f"PostgreSQL count profiles needing OpenAlex error: {e}")
+            return 0
 
     def update_profile_openalex(
         self,
