@@ -839,6 +839,48 @@ class PostgresStorage:
             print(f"PostgreSQL profile summary error: {e}")
             return summary
 
+    def get_author_profile_candidates(
+        self,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Return invitation candidates from author_profiles requiring ORCID and email."""
+        if not self.available:
+            return []
+
+        safe_limit = max(1, min(int(limit or 500), 5000))
+        safe_offset = max(0, int(offset or 0))
+
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        profile_key,
+                        orcid_id,
+                        openalex_id,
+                        author_name,
+                        email,
+                        scientific_domain,
+                        scientific_domains_json,
+                        invitation_count_total,
+                        invitation_count_editorial,
+                        invitation_count_publication,
+                        last_invited_at,
+                        updated_at
+                    FROM {self.PROFILE_TABLE_NAME}
+                    WHERE (orcid_id <> '' AND orcid_id IS NOT NULL)
+                      AND (email <> '' AND email IS NOT NULL)
+                    ORDER BY updated_at DESC
+                    LIMIT %s OFFSET %s;
+                    """,
+                    (safe_limit, safe_offset),
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL get author profile candidates error: {e}")
+            return []
+
     def get_invitation_counts(self, orcid_ids: List[str]) -> Dict[str, int]:
         """Get invitation counts for a list of ORCID IDs."""
         if not self.available:

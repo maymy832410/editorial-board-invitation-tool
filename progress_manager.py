@@ -27,6 +27,7 @@ class StateManager:
         return {
             "publisher": "brevo",
             "invitation_type": "editorial",
+            "author_source_mode": "both",
             "journal_config": {
                 "name": "",
                 "issn": "",
@@ -45,6 +46,7 @@ class StateManager:
                 "h_index_max": 50,
                 "countries": [],
                 "disciplines": [],
+                "author_source_mode": "both",
                 "max_results": 500,
                 "jump_size": 250
             },
@@ -81,6 +83,12 @@ class StateManager:
             else:
                 for key, value in default['journal_config'].items():
                     state['journal_config'].setdefault(key, value)
+
+            if not isinstance(state.get('search_params'), dict):
+                state['search_params'] = default['search_params'].copy()
+            else:
+                for key, value in default['search_params'].items():
+                    state['search_params'].setdefault(key, value)
             
             # Convert lists to sets where needed for lookup
             state['processed_orcids'] = set(state.get('processed_orcids', []))

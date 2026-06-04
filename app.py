@@ -4,6 +4,7 @@ A unified tool for finding academic authors and sending editorial board invitati
 """
 
 import asyncio
+import json
 import time
 import streamlit as st
 import pandas as pd
@@ -37,6 +38,10 @@ from db_client import get_storage as get_db_storage
 
 WORKFLOW_AUTHOR = "author"
 WORKFLOW_EDITORIAL = "editorial"
+
+AUTHOR_SOURCE_OPENALEX = "openalex"
+AUTHOR_SOURCE_DATABASE = "database"
+AUTHOR_SOURCE_BOTH = "both"
 
 
 # Page config
@@ -112,6 +117,15 @@ def _workflow_invitation_type(workflow: str) -> str:
     return INVITATION_TYPE_EDITORIAL
 
 
+def _author_source_label(source_mode: str) -> str:
+    """Return a readable label for an Author Invitation source mode."""
+    if source_mode == AUTHOR_SOURCE_DATABASE:
+        return "Database Emails"
+    if source_mode == AUTHOR_SOURCE_BOTH:
+        return "OpenAlex + Database Emails"
+    return "OpenAlex"
+
+
 def _scope_key(scope: str, key: str) -> str:
     """Build a deterministic widget/session key scoped to one workflow tab."""
     return f"{scope}_{key}"
@@ -156,6 +170,191 @@ def _extract_author_domains(author: dict) -> set[str]:
             domains.add(topic_label)
 
     return domains
+
+
+def _parse_scientific_domains_json(value: object) -> list[str]:
+    """Parse scientific_domains_json into a normalized topic list."""
+    parsed: list[object] = []
+    if isinstance(value, list):
+        parsed = value
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            try:
+                loaded = json.loads(normalized)
+                if isinstance(loaded, list):
+                    parsed = loaded
+            except Exception:
+                parsed = []
+
+    cleaned: list[str] = []
+    for raw_item in parsed:
+        text_value = _clean_domain_label(str(raw_item))
+        if text_value:
+            cleaned.append(text_value)
+    return cleaned
+
+
+def _map_db_profile_row_to_author(row: dict) -> dict:
+    """Convert one author_profiles row into the shared author result schema."""
+    topics = _parse_scientific_domains_json(row.get('scientific_domains_json'))
+    scientific_domain = _clean_domain_label(row.get('scientific_domain', ''))
+    specialty = topics[0] if topics else ""
+    discipline = scientific_domain or specialty or "Other"
+
+    orcid_id = (row.get('orcid_id') or '').strip()
+    email = (row.get('email') or '').strip()
+    author_name = (row.get('author_name') or '').strip() or f"Author {orcid_id}"
+
+    return {
+        'profile_key': row.get('profile_key', ''),
+        'author_id': row.get('openalex_id', ''),
+        'name': author_name,
+        'orcid_id': orcid_id,
+        'orcid_url': f"https://orcid.org/{orcid_id}" if orcid_id else '',
+        'h_index': None,
+        'works_count': None,
+        'cited_by_count': None,
+        'institution': '',
+        'country': '',
+        'discipline': discipline,
+        'specialty': specialty,
+        'subfield': '',
+        'all_topics': topics,
+        'research_areas': ", ".join(topics[:3]) if topics else '',
+        'email': email,
+        'all_emails': email,
+        'email_source': 'db_profile',
+        'scientific_domain': scientific_domain,
+        'source_origin': AUTHOR_SOURCE_DATABASE,
+    }
+
+
+def _load_author_source_rows_from_db(limit: int) -> list[dict]:
+    """Load Author Invitation candidates from author_profiles (ORCID + email only)."""
+    if not db_storage.available:
+        return []
+
+    rows = db_storage.get_author_profile_candidates(limit=limit)
+    mapped_rows = [_map_db_profile_row_to_author(row) for row in rows]
+    return [row for row in mapped_rows if row.get('orcid_id') and row.get('email')]
+
+
+def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict]) -> list[dict]:
+    """Merge OpenAlex and DB rows by ORCID with deterministic field precedence."""
+    merged_rows: list[dict] = []
+    index_by_orcid: dict[str, dict] = {}
+
+    for openalex_row in openalex_rows:
+        row = dict(openalex_row)
+        row.setdefault('profile_key', '')
+        row.setdefault('source_origin', AUTHOR_SOURCE_OPENALEX)
+        row.setdefault('scientific_domain', _clean_domain_label(row.get('discipline', '')))
+        merged_rows.append(row)
+        orcid_id = row.get('orcid_id', '')
+        if orcid_id:
+            index_by_orcid[orcid_id] = row
+
+    for db_row in db_rows:
+        orcid_id = db_row.get('orcid_id', '')
+        if not orcid_id:
+            continue
+
+        existing = index_by_orcid.get(orcid_id)
+        if not existing:
+            merged_rows.append(dict(db_row))
+            index_by_orcid[orcid_id] = merged_rows[-1]
+            continue
+
+        existing['source_origin'] = AUTHOR_SOURCE_BOTH
+        if db_row.get('profile_key'):
+            existing['profile_key'] = db_row.get('profile_key', '')
+
+        if not existing.get('email') and db_row.get('email'):
+            existing['email'] = db_row.get('email', '')
+            existing['all_emails'] = db_row.get('all_emails', db_row.get('email', ''))
+            existing['email_source'] = db_row.get('email_source', 'db_profile')
+
+        if not existing.get('scientific_domain') and db_row.get('scientific_domain'):
+            existing['scientific_domain'] = db_row.get('scientific_domain', '')
+
+        existing_topics = existing.get('all_topics') or []
+        db_topics = db_row.get('all_topics') or []
+        merged_topics: list[str] = []
+        for topic in existing_topics + db_topics:
+            label = _clean_domain_label(topic)
+            if label and label not in merged_topics:
+                merged_topics.append(label)
+        if merged_topics:
+            existing['all_topics'] = merged_topics
+            if not existing.get('specialty'):
+                existing['specialty'] = merged_topics[0]
+
+        if (not existing.get('discipline') or existing.get('discipline') == 'Other') and db_row.get('discipline'):
+            existing['discipline'] = db_row.get('discipline', '')
+
+    return merged_rows
+
+
+def _enrich_db_source_domains_from_openalex(authors: list[dict], max_rows: int = 50) -> tuple[int, int]:
+    """Enrich missing scientific domains for visible DB-source rows via strict ORCID matching."""
+    if not db_storage.available:
+        return 0, 0
+
+    targets: list[dict] = []
+    seen_profile_keys: set[str] = set()
+    for author in authors:
+        profile_key = (author.get('profile_key') or '').strip()
+        if not profile_key or profile_key in seen_profile_keys:
+            continue
+        if author.get('source_origin') not in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
+            continue
+        if not author.get('orcid_id') or author.get('scientific_domain'):
+            continue
+        seen_profile_keys.add(profile_key)
+        targets.append(author)
+
+    if not targets:
+        return 0, 0
+
+    client = OpenAlexClient()
+    attempted = 0
+    updated = 0
+
+    for author in targets[:max_rows]:
+        attempted += 1
+        fetched = client.fetch_author_by_orcid(author.get('orcid_id', ''))
+        if not fetched:
+            continue
+
+        scientific_domain = _clean_domain_label(fetched.get('discipline', ''))
+        topics = [
+            _clean_domain_label(topic)
+            for topic in (fetched.get('all_topics') or [])
+            if _clean_domain_label(topic)
+        ][:8]
+        openalex_id = (fetched.get('author_id') or '').strip()
+
+        saved = db_storage.update_profile_openalex(
+            profile_key=author.get('profile_key', ''),
+            openalex_id=openalex_id,
+            scientific_domain=scientific_domain,
+            scientific_domains=topics,
+        )
+        if not saved:
+            continue
+
+        updated += 1
+        author['author_id'] = openalex_id or author.get('author_id', '')
+        author['scientific_domain'] = scientific_domain
+        if scientific_domain:
+            author['discipline'] = scientific_domain
+        if topics:
+            author['all_topics'] = topics
+            if not author.get('specialty'):
+                author['specialty'] = topics[0]
+
+    return updated, attempted
 
 
 def _hydrate_result_emails_from_db(authors: list[dict]) -> bool:
@@ -1238,16 +1437,43 @@ def render_sidebar():
 def render_search_section(filters, ui_scope: str):
     """Render the search and results section."""
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    is_author_workflow = invitation_type == INVITATION_TYPE_PUBLICATION and ui_scope == WORKFLOW_AUTHOR
+    author_source_mode = AUTHOR_SOURCE_OPENALEX
+
+    if is_author_workflow:
+        source_modes = [AUTHOR_SOURCE_OPENALEX, AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH]
+        persisted_source_mode = st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH)
+        author_source_mode = st.selectbox(
+            "Author Source",
+            options=source_modes,
+            index=_safe_select_index(source_modes, persisted_source_mode, default=2),
+            format_func=_author_source_label,
+            key=_scope_key(ui_scope, "author_source_mode_select"),
+            help="Choose whether Author Invitation candidates come from OpenAlex, your database emails, or both."
+        )
+        if author_source_mode != persisted_source_mode:
+            st.session_state.app_state['author_source_mode'] = author_source_mode
+            save_state()
+        filters['author_source_mode'] = author_source_mode
 
     st.header("Search Authors")
     st.caption(f"Active workflow: {_invitation_type_label(invitation_type)}")
+    if is_author_workflow:
+        st.caption(f"Source mode: {_author_source_label(author_source_mode)}")
+
+    if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
+        search_button_label = "Load Database Authors"
+    elif is_author_workflow and author_source_mode == AUTHOR_SOURCE_BOTH:
+        search_button_label = "Search OpenAlex + Merge DB"
+    else:
+        search_button_label = "Search OpenAlex"
     
     # Search button
     col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
         search_clicked = st.button(
-            "Search OpenAlex",
+            search_button_label,
             type="primary",
             use_container_width=True,
             key=_scope_key(ui_scope, "search_openalex")
@@ -1264,7 +1490,16 @@ def render_search_section(filters, ui_scope: str):
     
     # Handle search
     if search_clicked:
-        run_search(filters, ui_scope)
+        if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
+            st.session_state.app_state['search_pagination'] = {'active': False}
+            st.session_state.app_state['search_results'] = []
+            st.session_state.app_state['processed_orcids'] = set()
+            st.session_state[_scope_key(ui_scope, "filtered_authors")] = []
+            st.session_state[_scope_key(ui_scope, "results_page")] = 0
+            save_state()
+            st.success("Loaded database-source author candidates.")
+        else:
+            run_search(filters, ui_scope)
     
     # Display results (returns filtered list for email fetching)
     display_results(filters, ui_scope)
@@ -1357,6 +1592,7 @@ def run_search(filters, ui_scope: str):
         'h_index_min': filters['h_min'],
         'h_index_max': filters['h_max'],
         'exclude_countries': filters['exclude_countries'],
+        'author_source_mode': filters.get('author_source_mode', st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH)),
         'max_results': filters['max_results'],
         'jump_size': filters['jump_size'],
     }
@@ -1545,15 +1781,64 @@ def run_email_fetch_filtered(filters, ui_scope: str):
 def display_results(filters, ui_scope: str):
     """Display search results with selection and filtering."""
     
-    results = st.session_state.app_state.get('search_results', [])
+    openalex_results = st.session_state.app_state.get('search_results', [])
     search_state = _get_search_pagination_state()
     journal_config = st.session_state.app_state.get('journal_config', {})
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
+    is_author_workflow = invitation_type == INVITATION_TYPE_PUBLICATION and ui_scope == WORKFLOW_AUTHOR
+    author_source_mode = filters.get(
+        'author_source_mode',
+        st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH),
+    )
+
+    db_source_results: list[dict] = []
+    if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
+        db_source_results = _load_author_source_rows_from_db(limit=int(filters.get('max_results', DEFAULT_MAX_RESULTS)))
+
+    if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
+        results = db_source_results
+    elif is_author_workflow and author_source_mode == AUTHOR_SOURCE_BOTH:
+        results = _merge_author_source_results(openalex_results, db_source_results)
+    else:
+        results = openalex_results
     
     if not results:
-        st.info("No results yet. Use the search button above.")
+        if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
+            st.info("No author_profiles rows with ORCID + email were found in the database source.")
+        else:
+            st.info("No results yet. Use the search button above.")
         return
+
+    if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
+        db_count = len(db_source_results)
+        openalex_count = len(openalex_results)
+        st.caption(
+            f"Source counts: OpenAlex={openalex_count:,}, Database={db_count:,}, Displayed={len(results):,}."
+        )
+
+        missing_domain_rows = [
+            row for row in results
+            if row.get('source_origin') in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}
+            and row.get('profile_key')
+            and not row.get('scientific_domain')
+        ]
+        if missing_domain_rows:
+            enrich_count = min(len(missing_domain_rows), 50)
+            enrich_clicked = st.button(
+                f"Enrich Missing Domains from OpenAlex ({enrich_count} visible)",
+                key=_scope_key(ui_scope, "enrich_missing_domains"),
+                use_container_width=False,
+            )
+            st.caption("Uses strict ORCID matching and writes scientific_domain back to author_profiles.")
+            if enrich_clicked:
+                with st.spinner("Enriching visible database-source authors from OpenAlex..."):
+                    updated_count, attempted_count = _enrich_db_source_domains_from_openalex(results, max_rows=50)
+                if updated_count > 0:
+                    st.success(f"Enriched {updated_count} of {attempted_count} attempted rows.")
+                else:
+                    st.info("No visible rows were enriched. Ensure ORCID values exist and are valid in OpenAlex.")
+                st.rerun()
     
     # Show email fetch result message from previous run
     if st.session_state.get('last_fetch_result'):
@@ -1561,7 +1846,11 @@ def display_results(filters, ui_scope: str):
 
     total_visible_results = _get_result_limit(search_state) if search_state.get('active') else len(results)
 
-    if search_state.get('active'):
+    show_openalex_batch_controls = search_state.get('active') and (
+        not is_author_workflow or author_source_mode == AUTHOR_SOURCE_OPENALEX
+    )
+
+    if show_openalex_batch_controls:
         current_jump_size = int(search_state.get('jump_size', 250) or 250)
         selected_jump_size = st.selectbox(
             "Batch Jump Size",
@@ -1623,7 +1912,8 @@ def display_results(filters, ui_scope: str):
 
     # Reuse known database emails so invitations can be sent without refetching.
     if _hydrate_result_emails_from_db(filtered):
-        _sync_current_batch_cache()
+        if show_openalex_batch_controls:
+            _sync_current_batch_cache()
         save_state()
     
     # Get sent invitations from DB (persistent) for the active invitation workflow.
@@ -1857,6 +2147,7 @@ def display_results(filters, ui_scope: str):
     for r in filtered:
         orcid_id = r.get('orcid_id', '')
         invited_count = int(invitation_counts.get(orcid_id, 0))
+        source_origin = r.get('source_origin', AUTHOR_SOURCE_OPENALEX)
         status = ''
         if r.get('is_retracted'):
             status = '🚫 RETRACTED'
@@ -1869,6 +2160,7 @@ def display_results(filters, ui_scope: str):
             'Discipline': r.get('discipline', ''),
             'Email': r.get('email', '') or '',
             'All_Emails': r.get('all_emails', '') or r.get('email', '') or '',
+            'Source': _author_source_label(source_origin),
             'Institution': r.get('institution', ''),
             'Country': r.get('country', ''),
             'Invited_Count': invited_count,
@@ -2174,12 +2466,15 @@ def display_results(filters, ui_scope: str):
         
         with cols[0]:
             name_display = author.get('name', '')
+            source_origin = author.get('source_origin', AUTHOR_SOURCE_OPENALEX)
             if is_retracted:
                 st.markdown(f"🚫 ~~{name_display}~~ :red[RETRACTED]")
             elif is_notified:
                 st.markdown(f"✅ **{name_display}** :green[SENT {_invitation_type_label(invitation_type)}]")
             else:
                 st.write(name_display)
+            if source_origin != AUTHOR_SOURCE_OPENALEX:
+                st.caption(f"Source: {_author_source_label(source_origin)}")
             if invited_count > 0:
                 st.caption(f"Invited: {invited_count}")
         
