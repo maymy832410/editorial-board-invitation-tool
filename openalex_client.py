@@ -7,6 +7,14 @@ import requests
 from config import OPENALEX_BASE_URL, OPENALEX_EMAIL
 
 
+def _normalize_orcid(orcid_value: str) -> str:
+    """Normalize ORCID inputs to bare identifier format."""
+    normalized = (orcid_value or "").strip().lower()
+    if not normalized:
+        return ""
+    return normalized.replace("https://orcid.org/", "").replace("http://orcid.org/", "")
+
+
 class OpenAlexClient:
     """Client for querying OpenAlex API for author data."""
     
@@ -289,6 +297,30 @@ class OpenAlexClient:
 
         time.sleep(0.1)
         return works
+
+    def fetch_author_by_orcid(self, orcid_id: str) -> Optional[dict[str, Any]]:
+        """Fetch a single author record by ORCID with strict matching."""
+        normalized_orcid = _normalize_orcid(orcid_id)
+        if not normalized_orcid:
+            return None
+
+        canonical_orcid_url = f"https://orcid.org/{normalized_orcid}"
+        params = {
+            "filter": f"orcid:{canonical_orcid_url}",
+            "select": "id,display_name,orcid,summary_stats,last_known_institutions,works_count,cited_by_count,topics",
+            "per_page": 1,
+        }
+
+        try:
+            data = self._make_request("authors", params)
+        except Exception:
+            return None
+
+        results = data.get("results", [])
+        if not results:
+            return None
+
+        return self._parse_author(results[0])
     
     def _parse_author(self, author: dict) -> dict:
         """Parse author data into a cleaner format."""

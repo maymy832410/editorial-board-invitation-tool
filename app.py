@@ -1639,11 +1639,23 @@ def display_results(filters):
     if not filtered:
         st.info("No authors match the current filters.")
         return
+
+    invitation_counts: dict[str, int] = {}
+    if db_storage.available:
+        try:
+            invitation_counts = db_storage.get_invitation_counts([
+                row.get('orcid_id', '')
+                for row in filtered
+                if row.get('orcid_id')
+            ])
+        except Exception:
+            invitation_counts = {}
     
     # Prepare dataframe for export
     df_data = []
     for r in filtered:
         orcid_id = r.get('orcid_id', '')
+        invited_count = int(invitation_counts.get(orcid_id, 0))
         status = ''
         if r.get('is_retracted'):
             status = '🚫 RETRACTED'
@@ -1658,6 +1670,7 @@ def display_results(filters):
             'All_Emails': r.get('all_emails', '') or r.get('email', '') or '',
             'Institution': r.get('institution', ''),
             'Country': r.get('country', ''),
+            'Invited_Count': invited_count,
             'Status': status,
             'orcid_id': orcid_id,
             'all_topics': r.get('all_topics', [])
@@ -1930,6 +1943,7 @@ def display_results(filters):
     # --- Display rows ---
     for idx, author in enumerate(page_results):
         orcid_id = author.get('orcid_id', '')
+        invited_count = int(invitation_counts.get(orcid_id, 0))
         is_notified = orcid_id in sent_invitations
         is_retracted = author.get('is_retracted', False)
         has_email = bool(author.get('email'))
@@ -1953,6 +1967,8 @@ def display_results(filters):
                 st.markdown(f"✅ **{name_display}** :green[SENT {_invitation_type_label(invitation_type)}]")
             else:
                 st.write(name_display)
+            if invited_count > 0:
+                st.caption(f"Invited: {invited_count}")
         
         with cols[1]:
             st.write(author.get('h_index', ''))
