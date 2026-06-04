@@ -8,6 +8,10 @@ import requests
 from config import OPENALEX_BASE_URL, OPENALEX_EMAIL
 
 
+class OpenAlexRequestError(Exception):
+    """Raised when an OpenAlex request fails after retry attempts."""
+
+
 def _normalize_orcid(orcid_value: str) -> str:
     """Normalize ORCID inputs to bare identifier format."""
     normalized = (orcid_value or "").strip().lower()
@@ -360,8 +364,10 @@ class OpenAlexClient:
 
         try:
             data = self._make_request("authors", params)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise OpenAlexRequestError(
+                f"OpenAlex ORCID lookup failed for {normalized_orcid}"
+            ) from exc
 
         results = data.get("results", [])
         if not results:

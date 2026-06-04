@@ -20,7 +20,7 @@ from db_client import (
     OPENALEX_MATCH_STATUS_PENDING_MANUAL,
     get_storage,
 )
-from openalex_client import OpenAlexClient
+from openalex_client import OpenAlexClient, OpenAlexRequestError
 
 
 def extract_email_domain(email: str) -> str:
@@ -372,6 +372,7 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
     progress_every = _read_env_int("OPENALEX_ENRICH_PROGRESS_EVERY", 50, minimum=1)
     batch_pause_seconds = _read_env_float("OPENALEX_ENRICH_BATCH_PAUSE_SEC", 0.0, minimum=0.0)
     include_pending_manual = _read_env_bool("OPENALEX_ENRICH_INCLUDE_PENDING_MANUAL", default=False)
+    max_deferred_errors = _read_env_int("OPENALEX_ENRICH_MAX_DEFERRED_ERRORS", 0, minimum=0)
 
     initial_remaining = storage.count_profiles_needing_openalex(
         require_orcid=True,
@@ -395,14 +396,18 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
     total_attempted = 0
     total_matched = 0
     total_pending_manual = 0
+    total_deferred = 0
     batch_index = 0
+    stop_due_deferred_limit = False
+    deferred_profile_keys: set[str] = set()
 
     print(
         "Starting OpenAlex enrichment:",
         f"initial_queue={initial_remaining},",
         f"batch_size={batch_size},",
         f"max_total={effective_max_total if effective_max_total > 0 else 'unbounded'},",
-        f"include_pending_manual={include_pending_manual}",
+        f"include_pending_manual={include_pending_manual},",
+        f"max_deferred_errors={max_deferred_errors if max_deferred_errors > 0 else 'unbounded'}",
     )
 
     while True:
@@ -421,13 +426,25 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
             require_orcid=True,
             include_pending_manual=include_pending_manual,
         )
+        if deferred_profile_keys:
+            candidates = [
+                profile
+                for profile in candidates
+                if (profile.get("profile_key") or "") not in deferred_profile_keys
+            ]
         if not candidates:
+            if deferred_profile_keys:
+                print(
+                    "No retry-eligible profiles left in this run; "
+                    "deferred rows remain queued for the next run."
+                )
             break
 
         batch_index += 1
         batch_attempted = 0
         batch_matched = 0
         batch_pending_manual = 0
+        batch_deferred = 0
 
         print(f"Batch {batch_index}: processing {len(candidates)} profiles")
         for profile in candidates:
@@ -439,7 +456,37 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
             total_attempted += 1
             batch_attempted += 1
 
-            author = client.fetch_author_by_orcid(orcid_id)
+            try:
+                author = client.fetch_author_by_orcid(orcid_id)
+            except OpenAlexRequestError as exc:
+                deferred_profile_keys.add(profile_key)
+                total_deferred += 1
+                batch_deferred += 1
+                if batch_deferred <= 3:
+                    print(f"  deferred (request error) profile_key={profile_key}: {exc}")
+                if max_deferred_errors > 0 and total_deferred >= max_deferred_errors:
+                    print(
+                        f"Reached OPENALEX_ENRICH_MAX_DEFERRED_ERRORS={max_deferred_errors}; "
+                        "stopping early."
+                    )
+                    stop_due_deferred_limit = True
+                    break
+                continue
+            except Exception as exc:
+                deferred_profile_keys.add(profile_key)
+                total_deferred += 1
+                batch_deferred += 1
+                if batch_deferred <= 3:
+                    print(f"  deferred (unexpected error) profile_key={profile_key}: {exc}")
+                if max_deferred_errors > 0 and total_deferred >= max_deferred_errors:
+                    print(
+                        f"Reached OPENALEX_ENRICH_MAX_DEFERRED_ERRORS={max_deferred_errors}; "
+                        "stopping early."
+                    )
+                    stop_due_deferred_limit = True
+                    break
+                continue
+
             if author:
                 openalex_id = author.get("author_id", "") or ""
                 scientific_domain = author.get("discipline", "") or ""
@@ -484,7 +531,8 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
                 print(
                     f"  progress: attempted={total_attempted},",
                     f"matched={total_matched},",
-                    f"pending_manual={total_pending_manual}",
+                    f"pending_manual={total_pending_manual},",
+                    f"deferred={total_deferred}",
                 )
 
         remaining = storage.count_profiles_needing_openalex(
@@ -497,6 +545,7 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
             f"attempted={batch_attempted},",
             f"matched={batch_matched},",
             f"pending_manual={batch_pending_manual},",
+            f"deferred={batch_deferred},",
             f"remaining={remaining},",
             f"api_requests={request_stats.get('requests', 0)},",
             f"api_429={request_stats.get('rate_limited', 0)},",
@@ -505,6 +554,8 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
             f"retry_exhausted={request_stats.get('retry_exhausted', 0)}",
         )
 
+        if stop_due_deferred_limit:
+            break
         if remaining <= 0:
             break
         if batch_pause_seconds > 0:
@@ -520,6 +571,7 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
         f"attempted={total_attempted},",
         f"matched={total_matched},",
         f"pending_manual={total_pending_manual},",
+        f"deferred={total_deferred},",
         f"remaining={final_remaining},",
         f"api_requests={request_stats.get('requests', 0)},",
         f"api_429={request_stats.get('rate_limited', 0)},",

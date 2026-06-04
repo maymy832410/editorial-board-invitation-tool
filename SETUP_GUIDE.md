@@ -245,6 +245,7 @@ If the process stops, re-running `import_data.py` continues from remaining `unkn
 - `OPENALEX_ENRICH_PROGRESS_EVERY` (default: `50`) - progress print interval
 - `OPENALEX_ENRICH_BATCH_PAUSE_SEC` (default: `0`) - pause between DB batches
 - `OPENALEX_ENRICH_INCLUDE_PENDING_MANUAL` (default: `false`) - include `pending_manual` rows in queue
+- `OPENALEX_ENRICH_MAX_DEFERRED_ERRORS` (default: `0`) - stop early after this many transient/deferred lookup failures (`0` means unbounded)
 - `OPENALEX_ENRICH_LIMIT` (legacy fallback) - used only when batch size is not set
 
 ### OpenAlex request controls
@@ -261,6 +262,7 @@ OPENALEX_ENRICH_BATCH_SIZE=300 \
 OPENALEX_ENRICH_MAX_TOTAL=20000 \
 OPENALEX_ENRICH_PROGRESS_EVERY=100 \
 OPENALEX_ENRICH_BATCH_PAUSE_SEC=0.2 \
+OPENALEX_ENRICH_MAX_DEFERRED_ERRORS=200 \
 OPENALEX_MAX_RETRIES=4 \
 python import_data.py
 ```
@@ -282,4 +284,4 @@ python import_data.py
 
 ---
 
-*Last updated: January 2026*
+*Last updated: June 2026*

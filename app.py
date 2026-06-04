@@ -15,7 +15,7 @@ from config import (
     DEFAULT_H_INDEX_MAX,
     DEFAULT_MAX_RESULTS,
 )
-from openalex_client import OpenAlexClient
+from openalex_client import OpenAlexClient, OpenAlexRequestError
 from orcid_async import fetch_emails_async
 from openai_email_async import AsyncOpenAIEmailClient
 from progress_manager import StateManager
@@ -323,7 +323,10 @@ def _enrich_db_source_domains_from_openalex(authors: list[dict], max_rows: int =
 
     for author in targets[:max_rows]:
         attempted += 1
-        fetched = client.fetch_author_by_orcid(author.get('orcid_id', ''))
+        try:
+            fetched = client.fetch_author_by_orcid(author.get('orcid_id', ''))
+        except OpenAlexRequestError:
+            continue
         if not fetched:
             continue
 
