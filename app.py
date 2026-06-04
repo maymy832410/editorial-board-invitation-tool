@@ -235,7 +235,24 @@ def _load_author_source_rows_from_db(limit: int) -> list[dict]:
     if not db_storage.available:
         return []
 
-    rows = db_storage.get_author_profile_candidates(limit=limit)
+    target_limit = max(1, int(limit or DEFAULT_MAX_RESULTS))
+    rows: list[dict] = []
+    offset = 0
+    chunk_size = 5000
+
+    while len(rows) < target_limit:
+        remaining = target_limit - len(rows)
+        current_limit = min(chunk_size, remaining)
+        batch = db_storage.get_author_profile_candidates(limit=current_limit, offset=offset)
+        if not batch:
+            break
+
+        rows.extend(batch)
+        fetched = len(batch)
+        offset += fetched
+        if fetched < current_limit:
+            break
+
     mapped_rows = [_map_db_profile_row_to_author(row) for row in rows]
     return [row for row in mapped_rows if row.get('orcid_id') and row.get('email')]
 
@@ -1796,8 +1813,12 @@ def display_results(filters, ui_scope: str):
     )
 
     db_source_results: list[dict] = []
+    db_source_total = 0
+    db_source_limit = int(filters.get('max_results', DEFAULT_MAX_RESULTS))
     if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
-        db_source_results = _load_author_source_rows_from_db(limit=int(filters.get('max_results', DEFAULT_MAX_RESULTS)))
+        if db_storage.available:
+            db_source_total = db_storage.count_author_profile_candidates()
+        db_source_results = _load_author_source_rows_from_db(limit=db_source_limit)
 
     if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
         results = db_source_results
@@ -1817,8 +1838,14 @@ def display_results(filters, ui_scope: str):
         db_count = len(db_source_results)
         openalex_count = len(openalex_results)
         st.caption(
-            f"Source counts: OpenAlex={openalex_count:,}, Database={db_count:,}, Displayed={len(results):,}."
+            f"Source counts: OpenAlex={openalex_count:,}, "
+            f"DatabaseLoaded={db_count:,}/{db_source_total:,}, Displayed={len(results):,}."
         )
+        if db_source_total > db_count:
+            st.info(
+                f"Database source currently loads the first {db_count:,} of {db_source_total:,} rows "
+                f"because Max Results is {db_source_limit:,}. Increase Max Results to load more."
+            )
 
         missing_domain_rows = [
             row for row in results
@@ -2048,6 +2075,8 @@ def display_results(filters, ui_scope: str):
             value=True,
             key=_scope_key(ui_scope, "filter_retracted")
         )
+
+    retracted_in_scope = sum(1 for r in filtered if r.get('is_retracted'))
     
     # Apply email filter
     if show_only_with_email:
@@ -2060,6 +2089,8 @@ def display_results(filters, ui_scope: str):
     # Apply retraction filter
     if hide_retracted:
         filtered = [r for r in filtered if not r.get('is_retracted')]
+        if retracted_in_scope:
+            st.caption(f"Hidden retracted authors: {retracted_in_scope:,}")
     
     # Store filtered list in session state for email fetching
     st.session_state[_scope_key(ui_scope, "filtered_authors")] = filtered

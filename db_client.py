@@ -949,6 +949,27 @@ class PostgresStorage:
             print(f"PostgreSQL get author profile candidates error: {e}")
             return []
 
+    def count_author_profile_candidates(self) -> int:
+        """Return total invitation candidates from author_profiles requiring ORCID and email."""
+        if not self.available:
+            return 0
+
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) AS cnt
+                    FROM {self.PROFILE_TABLE_NAME}
+                    WHERE (orcid_id <> '' AND orcid_id IS NOT NULL)
+                      AND (email <> '' AND email IS NOT NULL);
+                    """,
+                )
+                row = cur.fetchone() or {}
+                return int(row.get("cnt") or 0)
+        except Exception as e:
+            print(f"PostgreSQL count author profile candidates error: {e}")
+            return 0
+
     def get_invitation_counts(self, orcid_ids: List[str]) -> Dict[str, int]:
         """Get invitation counts for a list of ORCID IDs."""
         if not self.available:
