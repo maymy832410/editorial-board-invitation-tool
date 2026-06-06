@@ -21,6 +21,13 @@ from typing import Optional, Tuple
 LOGO_DIR = Path(__file__).parent / "pdf template"
 TRANSPARENT_LOGO_DIR = Path(__file__).parent / "logo"
 SCOPUS_LOGO_FILE = TRANSPARENT_LOGO_DIR / "Elsevier-scopus.jpg"
+DEFAULT_PUBLIC_ASSET_BASE_URL = "https://editorial-board-app-production.up.railway.app"
+DEFAULT_PUBLISHER_LOGO_PATHS = {
+    "peninsula": "/app/static/logos/peninsula-publishing-press.jpg",
+    "brevo": "/app/static/logos/peninsula-publishing-press.jpg",
+    "mesopotamian": "/app/static/logos/map-logo-mesopotamian.png",
+}
+DEFAULT_SCOPUS_LOGO_PATH = "/app/static/logos/elsevier-scopus.jpg"
 PUBLISHER_LOGOS = {
     "peninsula": LOGO_DIR / "Peninsula publishing press.jpg",
     "brevo": LOGO_DIR / "Peninsula publishing press.jpg",
@@ -37,6 +44,27 @@ class EmailSender:
         self.credentials = self._load_credentials()
         self._logo_data_cache: dict[str, str] = {}
         self._asset_data_cache: dict[str, str] = {}
+
+    def _public_asset_base_url(self) -> str:
+        """Return the base URL for hosted public email assets."""
+        return (
+            os.environ.get("PUBLIC_ASSET_BASE_URL", DEFAULT_PUBLIC_ASSET_BASE_URL)
+            .strip()
+            .rstrip("/")
+        )
+
+    def _build_public_asset_url(self, relative_path: str) -> str:
+        """Build an absolute URL for a static asset path."""
+        base_url = self._public_asset_base_url()
+        if not base_url or not relative_path:
+            return ""
+        normalized_path = relative_path if relative_path.startswith("/") else f"/{relative_path}"
+        return f"{base_url}{normalized_path}"
+
+    def _is_http_url(self, value: str) -> bool:
+        """Check whether a value is an HTTP(S) URL."""
+        lowered = (value or "").strip().lower()
+        return lowered.startswith("https://") or lowered.startswith("http://")
 
     def _load_credentials(self) -> dict:
         """Load email credentials from JSON file or Streamlit secrets."""
@@ -405,6 +433,19 @@ class EmailSender:
         if cache_key in self._logo_data_cache:
             return self._logo_data_cache[cache_key]
 
+        public_logo_urls = {
+            "peninsula": os.environ.get("PENINSULA_LOGO_URL", "").strip(),
+            "brevo": os.environ.get("BREVO_LOGO_URL", "").strip(),
+            "mesopotamian": os.environ.get("MESOPOTAMIAN_LOGO_URL", "").strip(),
+        }
+        public_logo_url = public_logo_urls.get(cache_key, "")
+        if not public_logo_url:
+            default_path = DEFAULT_PUBLISHER_LOGO_PATHS.get(cache_key, "")
+            public_logo_url = self._build_public_asset_url(default_path)
+        if self._is_http_url(public_logo_url):
+            self._logo_data_cache[cache_key] = public_logo_url
+            return public_logo_url
+
         logo_path = PUBLISHER_LOGOS.get(cache_key)
         if not logo_path:
             self._logo_data_cache[cache_key] = ""
@@ -435,6 +476,13 @@ class EmailSender:
         cache_key = "scopus_logo"
         if cache_key in self._asset_data_cache:
             return self._asset_data_cache[cache_key]
+
+        public_scopus_logo_url = os.environ.get("SCOPUS_LOGO_URL", "").strip()
+        if not public_scopus_logo_url:
+            public_scopus_logo_url = self._build_public_asset_url(DEFAULT_SCOPUS_LOGO_PATH)
+        if self._is_http_url(public_scopus_logo_url):
+            self._asset_data_cache[cache_key] = public_scopus_logo_url
+            return public_scopus_logo_url
 
         if not SCOPUS_LOGO_FILE.exists():
             self._asset_data_cache[cache_key] = ""
