@@ -20,7 +20,7 @@ from db_client import (
     OPENALEX_MATCH_STATUS_PENDING_MANUAL,
     get_storage,
 )
-from openalex_client import OpenAlexClient, OpenAlexRequestError
+from openalex_client import OpenAlexClient, OpenAlexRateLimitError, OpenAlexRequestError
 
 
 def extract_email_domain(email: str) -> str:
@@ -399,6 +399,9 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
     total_deferred = 0
     batch_index = 0
     stop_due_deferred_limit = False
+    stop_due_rate_limit = False
+    rate_limit_retry_after_seconds: Optional[int] = None
+    rate_limit_reason = ""
     deferred_profile_keys: set[str] = set()
 
     print(
@@ -421,17 +424,38 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
             if limit_for_batch <= 0:
                 break
 
-        candidates = storage.get_profiles_needing_openalex(
-            limit=limit_for_batch,
-            require_orcid=True,
-            include_pending_manual=include_pending_manual,
-        )
+        # If transient request failures were deferred earlier in this run, over-fetch so
+        # later queue rows can still be processed instead of repeatedly returning only
+        # deferred rows in the top slice.
+        fetch_limit = max(limit_for_batch, 1)
         if deferred_profile_keys:
-            candidates = [
-                profile
-                for profile in candidates
-                if (profile.get("profile_key") or "") not in deferred_profile_keys
-            ]
+            fetch_limit = min(fetch_limit + len(deferred_profile_keys), 10000)
+
+        candidates: list[dict[str, Any]] = []
+        while True:
+            fetched_profiles = storage.get_profiles_needing_openalex(
+                limit=fetch_limit,
+                require_orcid=True,
+                include_pending_manual=include_pending_manual,
+            )
+            if deferred_profile_keys:
+                candidates = [
+                    profile
+                    for profile in fetched_profiles
+                    if (profile.get("profile_key") or "") not in deferred_profile_keys
+                ]
+            else:
+                candidates = list(fetched_profiles)
+
+            if len(candidates) >= limit_for_batch:
+                candidates = candidates[:limit_for_batch]
+                break
+
+            if len(fetched_profiles) < fetch_limit or fetch_limit >= 10000:
+                break
+
+            fetch_limit = min(fetch_limit * 2, 10000)
+
         if not candidates:
             if deferred_profile_keys:
                 print(
@@ -458,6 +482,18 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
 
             try:
                 author = client.fetch_author_by_orcid(orcid_id)
+            except OpenAlexRateLimitError as exc:
+                stop_due_rate_limit = True
+                rate_limit_retry_after_seconds = exc.retry_after_seconds
+                rate_limit_reason = str(exc)
+                if rate_limit_retry_after_seconds is not None and rate_limit_retry_after_seconds > 0:
+                    print(
+                        "  stopping early due to OpenAlex rate limit:",
+                        f"retry_after_seconds={rate_limit_retry_after_seconds}",
+                    )
+                else:
+                    print("  stopping early due to OpenAlex rate limit")
+                break
             except OpenAlexRequestError as exc:
                 deferred_profile_keys.add(profile_key)
                 total_deferred += 1
@@ -554,6 +590,8 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
             f"retry_exhausted={request_stats.get('retry_exhausted', 0)}",
         )
 
+        if stop_due_rate_limit:
+            break
         if stop_due_deferred_limit:
             break
         if remaining <= 0:
@@ -579,6 +617,19 @@ def enrich_profiles_from_openalex(conn: Any, limit: int = 500) -> None:
         f"api_network={request_stats.get('network_errors', 0)},",
         f"retry_exhausted={request_stats.get('retry_exhausted', 0)}",
     )
+    if stop_due_rate_limit:
+        if rate_limit_reason:
+            print(f"OpenAlex rate limit detail: {rate_limit_reason}")
+        if rate_limit_retry_after_seconds is not None and rate_limit_retry_after_seconds > 0:
+            print(
+                "OpenAlex enrichment paused due to rate limit.",
+                f"Retry after approximately {rate_limit_retry_after_seconds} seconds.",
+            )
+        else:
+            print(
+                "OpenAlex enrichment paused due to rate limit.",
+                "Retry after quota reset or when more OpenAlex budget is available.",
+            )
 
 
 if __name__ == "__main__":

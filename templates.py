@@ -21,20 +21,45 @@ _PUBLICATION_TEMPLATES = [
 ]
 _BASE_TEMPLATES = _EDITORIAL_BASE_TEMPLATES
 
+_COMMON_PLACEHOLDERS = [
+    "{author_name}",
+    "{journal_name}",
+    "{journal_issn}",
+    "{journal_link}",
+    "{editor_in_chief_name}",
+    "{publisher_name}",
+    "{sender_email}",
+    "{publisher_location}",
+]
+_EDITORIAL_PLACEHOLDERS = list(_COMMON_PLACEHOLDERS)
+_PUBLICATION_PLACEHOLDERS = list(_COMMON_PLACEHOLDERS) + [
+    "{journal_submission_link}",
+    "{journal_cite_score}",
+    "{journal_quartile}",
+    "{journal_indexing_status}",
+    "{author_specialty}",
+    "{author_recent_publications}",
+    "{journal_scope}",
+    "{invitation_goal}",
+    "{journal_metrics}",
+    "{invitation_goal_note}",
+    "{journal_scope_note}",
+]
+
 TEMPLATES = {
     # ── Editorial Board Member (non-Scopus) ──
     TEMPLATE_BOARD_MEMBER: {
         "name": "Editorial Board Member",
-        "subject": "Invitation to Join {journal_name} Editorial Board",
-        "body": """Dear Prof. {author_name},
+        "subject": "Invitation to Join the Editorial Board of {journal_name}",
+        "body": """Dear Professor {author_name},
 
-On behalf of the editorial leadership of {journal_name}, we are pleased to invite you to join the journal's Editorial Board.
+On behalf of the editorial leadership of {journal_name}, published by {publisher_name}, we are pleased to invite you to join the journal's Editorial Board.
 
-{journal_name} is currently advancing its editorial standards in line with COPE principles and international publishing best practices. We are forming a renewed Editorial Board of distinguished scholars whose expertise will support the journal's academic quality, peer-review process, and international visibility.
+We are expanding the board with experienced scholars who can support rigorous peer review, strong publication ethics, and long-term journal development aligned with COPE and international publishing standards.
 
-The journal is actively working toward indexing in major international databases, including Scopus, and your participation would significantly strengthen this effort.
+Your academic profile and subject-matter expertise would be highly valuable to this effort, and we would be honored to welcome your participation.
 
-Given your respected academic profile, we would be honored by your acceptance of this invitation.
+If you are open to this appointment, please reply to this message and we will share the formal onboarding details.
 
 We look forward to the possibility of working with you.
 
@@ -49,16 +74,16 @@ Editorial Office
     # ── Editorial Board Member (Scopus) ──
     "board_member_scopus": {
         "name": "Editorial Board Member",
-        "subject": "Invitation to Join {journal_name} Editorial Board (Scopus-Indexed)",
-        "body": """Dear Prof. {author_name},
+        "subject": "Invitation to Join the Editorial Board of {journal_name} (Scopus-Indexed)",
+        "body": """Dear Professor {author_name},
 
-On behalf of the editorial leadership of {journal_name}, we are pleased to invite you to join the journal's Editorial Board.
+On behalf of the editorial leadership of {journal_name}, published by {publisher_name}, we are pleased to invite you to join the journal's Editorial Board.
 
-{journal_name} is a Scopus-indexed journal committed to advancing its editorial standards in line with COPE principles and international publishing best practices. We are forming a renewed Editorial Board of distinguished scholars whose expertise will support the journal's academic quality, peer-review process, and international visibility.
+{journal_name} is a Scopus-indexed journal committed to high editorial quality, ethical publishing practice, and international scholarly visibility.
 
-Given your respected academic profile, we would be honored by your acceptance of this invitation.
+Your academic profile and subject-matter expertise would be highly valuable to the continued growth of the journal, and we would be honored to welcome your participation.
 
-We look forward to the possibility of working with you.
+If you are open to this appointment, please reply to this message and we will share the formal onboarding details.
 
 Warm regards,
 
@@ -71,40 +96,20 @@ Editorial Office
     # ── Managing Editor (non-Scopus) ──
     TEMPLATE_MANAGING_EDITOR: {
         "name": "Managing Editor",
-        "subject": "Invitation to Serve as Managing Editor - {journal_name}",
+        "subject": "Invitation to Serve as Managing Editor of {journal_name}",
         "body": """Dear Professor {author_name},
 
-I hope this letter finds you in excellent health and spirits.
+On behalf of the editorial leadership of {journal_name} (ISSN: {journal_issn}), published by {publisher_name}, we are pleased to invite you to serve as Managing Editor.
 
-On behalf of {journal_name} (ISSN: {journal_issn}), published by {publisher_name}, I am pleased to extend an invitation for you to serve as Managing Editor of our journal.
+This role includes coordinating manuscript workflow, supporting timely peer review, and helping implement editorial policy in line with COPE and international publishing standards.
 
-Given your distinguished academic career, extensive publication record, and recognized expertise in the field, we believe you would be an exceptional addition to our editorial leadership team.
+The journal is actively strengthening its editorial operations and international profile. Your leadership, editorial judgment, and academic reputation would be highly valuable to this mission.
 
-As Managing Editor, your responsibilities would include:
+If you are open to this appointment, please reply to this message and we will share the formal scope, timeline, and onboarding details.
 
-- Overseeing the day-to-day editorial operations
-- Managing manuscript workflow and peer review process
-- Coordinating with Editorial Board members and reviewers
-- Ensuring timely publication of accepted manuscripts
-- Contributing to strategic planning and journal development
-- Maintaining publication quality and ethical standards
+We would be honored to work with you in this capacity.
 
-This position offers:
-- A prominent leadership role in a growing academic journal
-- Certificate of appointment as Managing Editor
-- Opportunity to shape the direction of scholarly discourse in your field
-- Networking with leading researchers worldwide
-- Recognition on all journal publications and communications
-
-{journal_name} is dedicated to publishing innovative, high-impact research and is actively pursuing indexing in Scopus and other major international databases. Your leadership would be instrumental in achieving this milestone and contributing to our continued growth and excellence.
-
-Please visit {journal_link} to familiarize yourself with our journal's scope, recent issues, and editorial policies.
-
-To express your interest or discuss this opportunity further, please reply to this email with your CV and a brief statement of interest.
-
-We eagerly await your favorable response.
-
-With highest regards,
+Warm regards,
 
 {editor_in_chief_name}
 Editor-in-Chief
@@ -117,40 +122,22 @@ Website: {journal_link}"""
     # ── Managing Editor (Scopus) ──
     "managing_editor_scopus": {
         "name": "Managing Editor",
-        "subject": "Invitation to Serve as Managing Editor - {journal_name} (Scopus-Indexed)",
+        "subject": "Invitation to Serve as Managing Editor of {journal_name} (Scopus-Indexed)",
         "body": """Dear Professor {author_name},
 
-I hope this letter finds you in excellent health and spirits.
+On behalf of the editorial leadership of {journal_name} (ISSN: {journal_issn}), published by {publisher_name}, we are pleased to invite you to serve as Managing Editor.
 
-On behalf of {journal_name} (ISSN: {journal_issn}), published by {publisher_name}, I am pleased to extend an invitation for you to serve as Managing Editor of our journal.
+{journal_name} is a Scopus-indexed journal committed to rigorous peer review, ethical publishing practice, and international visibility.
 
-{journal_name} is a Scopus-indexed journal recognized for its commitment to rigorous peer review and high-quality scholarship. Given your distinguished academic career, extensive publication record, and recognized expertise in the field, we believe you would be an exceptional addition to our editorial leadership team.
+This role includes coordinating manuscript workflow, supporting timely peer review, and helping implement editorial policy in line with COPE and international publishing standards.
 
-As Managing Editor, your responsibilities would include:
+Your leadership, editorial judgment, and academic reputation would be highly valuable to the continued development of the journal.
 
-- Overseeing the day-to-day editorial operations
-- Managing manuscript workflow and peer review process
-- Coordinating with Editorial Board members and reviewers
-- Ensuring timely publication of accepted manuscripts
-- Contributing to strategic planning and journal development
-- Maintaining publication quality and ethical standards
+If you are open to this appointment, please reply to this message and we will share the formal scope, timeline, and onboarding details.
 
-This position offers:
-- A prominent leadership role in a Scopus-indexed academic journal
-- Certificate of appointment as Managing Editor
-- Opportunity to shape the direction of scholarly discourse in your field
-- Networking with leading researchers worldwide
-- Recognition on all journal publications and communications
+We would be honored to work with you in this capacity.
 
-{journal_name} is dedicated to publishing innovative, high-impact research. We are confident that your leadership would significantly contribute to our continued growth and excellence.
-
-Please visit {journal_link} to familiarize yourself with our journal's scope, recent issues, and editorial policies.
-
-To express your interest or discuss this opportunity further, please reply to this email with your CV and a brief statement of interest.
-
-We eagerly await your favorable response.
-
-With highest regards,
+Warm regards,
 
 {editor_in_chief_name}
 Editor-in-Chief
@@ -163,45 +150,20 @@ Website: {journal_link}"""
     # ── Editor-in-Chief (non-Scopus) ──
     TEMPLATE_EDITOR_IN_CHIEF: {
         "name": "Editor-in-Chief",
-        "subject": "Distinguished Invitation: Editor-in-Chief Position - {journal_name}",
+        "subject": "Invitation to Serve as Editor-in-Chief of {journal_name}",
         "body": """Dear Professor {author_name},
 
-I hope this message finds you well.
+On behalf of {publisher_name}, we are honored to invite you to serve as Editor-in-Chief of {journal_name} (ISSN: {journal_issn}).
 
-It is with great pleasure that I write to you on behalf of {publisher_name} to extend a distinguished invitation to serve as Editor-in-Chief of {journal_name} (ISSN: {journal_issn}).
+This appointment carries strategic responsibility for editorial direction, quality oversight, and long-term journal development in line with COPE and international publishing standards.
 
-Your outstanding scholarly achievements, extensive publication record, and recognized leadership in the academic community make you our ideal candidate for this prestigious position.
+Your scholarly leadership and academic reputation make you an exceptional candidate for this role.
 
-As Editor-in-Chief, you would:
+If you are open to this appointment, please reply to this message and we will share the formal terms, editorial mandate, and onboarding process.
 
-- Provide visionary leadership and strategic direction for the journal
-- Chair the Editorial Board and guide editorial policies
-- Make final decisions on manuscript acceptance
-- Represent the journal at conferences and academic forums
-- Foster relationships with the global research community
-- Ensure the highest standards of publication ethics and quality
-- Guide the journal's growth and international recognition
-- Lead the journal's efforts toward Scopus indexing and broader international database inclusion
+We would be honored to work under your guidance.
 
-We offer:
-- Complete editorial autonomy within established ethical guidelines
-- Full administrative and technical support from our publishing team
-- Competitive honorarium commensurate with the position
-- Platform to advance your field through curated special issues
-- Prominent recognition across all journal communications
-- Opportunity to build a distinguished editorial team
-
-{journal_name}, published by {publisher_name}, is committed to excellence in academic publishing. Under your leadership, we envision the journal achieving Scopus indexing and new heights of scholarly impact and recognition.
-
-Please visit {journal_link} to review our current publications, scope, and editorial framework.
-
-I would be delighted to arrange a call at your convenience to discuss this opportunity in detail, answer any questions, and explore how we can support your vision for the journal.
-
-To express your interest, please reply to this email with your updated CV and any initial thoughts or questions.
-
-We are honored to extend this invitation and sincerely hope you will consider joining us in this exciting endeavor.
-
-With deepest respect and warm regards,
+With highest respect and warm regards,
 
 {editor_in_chief_name}
 {publisher_name}
@@ -212,44 +174,22 @@ Website: {journal_link}"""
     # ── Editor-in-Chief (Scopus) ──
     "editor_in_chief_scopus": {
         "name": "Editor-in-Chief",
-        "subject": "Distinguished Invitation: Editor-in-Chief Position - {journal_name} (Scopus-Indexed)",
+        "subject": "Invitation to Serve as Editor-in-Chief of {journal_name} (Scopus-Indexed)",
         "body": """Dear Professor {author_name},
 
-I hope this message finds you well.
+On behalf of {publisher_name}, we are honored to invite you to serve as Editor-in-Chief of {journal_name} (ISSN: {journal_issn}).
 
-It is with great pleasure that I write to you on behalf of {publisher_name} to extend a distinguished invitation to serve as Editor-in-Chief of {journal_name} (ISSN: {journal_issn}).
+{journal_name} is a Scopus-indexed journal committed to rigorous peer review, publication ethics, and international scholarly visibility.
 
-{journal_name} is a Scopus-indexed journal with an established reputation for publishing rigorous, high-impact research. Your outstanding scholarly achievements, extensive publication record, and recognized leadership in the academic community make you our ideal candidate for this prestigious position.
+This appointment carries strategic responsibility for editorial direction, quality oversight, and sustained global growth.
 
-As Editor-in-Chief, you would:
+Your scholarly leadership and academic reputation make you an exceptional candidate for this role.
 
-- Provide visionary leadership and strategic direction for the journal
-- Chair the Editorial Board and guide editorial policies
-- Make final decisions on manuscript acceptance
-- Represent the journal at conferences and academic forums
-- Foster relationships with the global research community
-- Ensure the highest standards of publication ethics and quality
-- Guide the journal's growth and international recognition
+If you are open to this appointment, please reply to this message and we will share the formal terms, editorial mandate, and onboarding process.
 
-We offer:
-- Complete editorial autonomy within established ethical guidelines
-- Full administrative and technical support from our publishing team
-- Competitive honorarium commensurate with the position
-- Platform to advance your field through curated special issues
-- Prominent recognition across all journal communications
-- Opportunity to build a distinguished editorial team
+We would be honored to work under your guidance.
 
-{journal_name}, published by {publisher_name}, is committed to excellence in academic publishing. Under your leadership, we envision the journal achieving new heights of scholarly impact and recognition.
-
-Please visit {journal_link} to review our current publications, scope, and editorial framework.
-
-I would be delighted to arrange a call at your convenience to discuss this opportunity in detail, answer any questions, and explore how we can support your vision for the journal.
-
-To express your interest, please reply to this email with your updated CV and any initial thoughts or questions.
-
-We are honored to extend this invitation and sincerely hope you will consider joining us in this exciting endeavor.
-
-With deepest respect and warm regards,
+With highest respect and warm regards,
 
 {editor_in_chief_name}
 {publisher_name}
@@ -260,24 +200,22 @@ Website: {journal_link}"""
     # -- Publication invitation: recent-work admiration --
     TEMPLATE_PUBLICATION_RECENT_WORK: {
         "name": "Publish Invitation - Recent Work",
-        "subject": "{author_name}, invitation to submit your work to {journal_name}",
+        "subject": "Invitation to Submit Your Research to {journal_name}",
         "body": """Dear Professor {author_name},
 
-I hope this message finds you well.
+On behalf of {journal_name} (ISSN: {journal_issn}), we are pleased to invite you to submit a manuscript for consideration.
 
-I am writing on behalf of {journal_name} (ISSN: {journal_issn}) to invite you to consider submitting a manuscript to the journal.
+Your research profile in {author_specialty} is highly relevant to the journal's readership.{author_recent_publications}
 
-We noticed your recent scholarly work and believe your research profile is highly relevant to our readership.{author_recent_publications}
+{journal_name} welcomes original research, review papers, and other high-quality scholarly contributions. {journal_metrics}{invitation_goal_note}{journal_scope_note}
 
-{journal_name} welcomes rigorous contributions in {author_specialty}. {journal_metrics}{invitation_goal_note}{journal_scope_note}
-
-If you have a manuscript in preparation, we would be pleased to receive it through our submission portal:
+Submission portal:
 {journal_submission_link}
 
-You may also review the journal scope and published articles here:
+Journal website:
 {journal_link}
 
-We would be honored to consider a contribution from you and would be happy to answer any questions about fit, scope, or the submission process.
+If you would like to confirm topic fit before submission, please feel free to reply to this email.
 
 Warm regards,
 
@@ -291,48 +229,47 @@ Website: {journal_link}"""
     # -- Publication invitation: topic fit --
     TEMPLATE_PUBLICATION_TOPIC_FIT: {
         "name": "Publish Invitation - Topic Fit",
-        "subject": "{author_name}, your research aligns with {journal_name}",
+        "subject": "Your Research Topic Fits {journal_name}",
         "body": """Dear Professor {author_name},
 
 Greetings from the Editorial Office of {journal_name}.
 
-Your research background in {author_specialty} appears to align well with the journal's current publishing interests. We would therefore like to invite you to submit a manuscript for consideration in {journal_name} (ISSN: {journal_issn}).
+Your research background in {author_specialty} appears to align closely with the journal's current publishing priorities. We would therefore like to invite you to submit a manuscript for consideration in {journal_name} (ISSN: {journal_issn}).
 
 {author_recent_publications}
 
-The journal is seeking high-quality original articles, reviews, and scholarly contributions that can support meaningful discussion in the field. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+The journal is currently seeking high-quality original articles, review papers, and other scholarly contributions that can support meaningful discussion in the field. {journal_metrics}{invitation_goal_note}{journal_scope_note}
 
-For submission, please use the journal portal:
+Submission portal:
 {journal_submission_link}
 
 Journal website:
 {journal_link}
 
-If you are considering a suitable manuscript, we would be glad to hear from you or receive your submission through the portal.
+If you are considering a suitable manuscript, we would be delighted to receive your submission through the portal.
 
-Sincerely,
+Warm regards,
 
 Editorial Office
 {journal_name}
 {publisher_name}
-Email: {sender_email}"""
+Email: {sender_email}
+Website: {journal_link}"""
     },
 
     # -- Publication invitation: journal value and metrics --
     TEMPLATE_PUBLICATION_METRICS: {
         "name": "Publish Invitation - Journal Metrics",
-        "subject": "{author_name}, publication invitation from {journal_name}",
+        "subject": "Publication Invitation from {journal_name}",
         "body": """Dear Professor {author_name},
 
-I hope you are doing well.
-
-On behalf of {journal_name}, I am pleased to invite you to submit a manuscript for publication consideration.
+On behalf of {journal_name} (ISSN: {journal_issn}), we are pleased to invite you to submit a manuscript for publication consideration.
 
 {journal_name} is committed to rigorous peer review, ethical publication practices, and international scholarly visibility. {journal_metrics}{invitation_goal_note}{journal_scope_note}
 
-Your work in {author_specialty} would be a valuable fit for the journal's audience.{author_recent_publications}
+Your work in {author_specialty} would be a strong fit for the journal's audience.{author_recent_publications}
 
-Submission link:
+Submission portal:
 {journal_submission_link}
 
 Journal website:
@@ -340,7 +277,7 @@ Journal website:
 
 We would be pleased to consider an original article, review article, or other suitable scholarly contribution from your research group.
 
-With best regards,
+Warm regards,
 
 Editorial Office
 {journal_name}
@@ -360,6 +297,21 @@ def get_template_names(invitation_type: str = INVITATION_TYPE_EDITORIAL) -> Dict
 def get_publication_template_ids() -> list[str]:
     """Return publication template IDs in their rotation order."""
     return list(_PUBLICATION_TEMPLATES)
+
+
+def _template_invitation_type(template_id: str) -> str:
+    """Infer invitation type from template id (handles Scopus template variants)."""
+    base_id = template_id.removesuffix("_scopus")
+    if base_id in _PUBLICATION_TEMPLATES:
+        return INVITATION_TYPE_PUBLICATION
+    return INVITATION_TYPE_EDITORIAL
+
+
+def get_placeholders_for_invitation_type(invitation_type: str) -> list[str]:
+    """Return placeholders relevant to a specific invitation workflow type."""
+    if invitation_type == INVITATION_TYPE_PUBLICATION:
+        return list(_PUBLICATION_PLACEHOLDERS)
+    return list(_EDITORIAL_PLACEHOLDERS)
 
 
 def get_template(template_id: str) -> Dict:
@@ -448,7 +400,7 @@ def format_template(
     invitation_goal_note = f" Current invitation focus: {invitation_goal}." if invitation_goal else ""
     journal_scope_note = f"\n\nScope note: {journal_scope}" if journal_scope else ""
 
-    replacements = {
+    all_replacements = {
         "{author_name}": author_name,
         "{journal_name}": journal_name,
         "{journal_issn}": journal_issn,
@@ -470,10 +422,14 @@ def format_template(
         "{journal_scope_note}": journal_scope_note,
     }
 
+    invitation_type = _template_invitation_type(template_id)
+    allowed_placeholders = set(get_placeholders_for_invitation_type(invitation_type))
+
     subject = template["subject"]
     body = template["body"]
 
-    for placeholder, value in replacements.items():
+    for placeholder in get_all_placeholders():
+        value = all_replacements.get(placeholder, "") if placeholder in allowed_placeholders else ""
         subject = subject.replace(placeholder, value or "")
         body = body.replace(placeholder, value or "")
 
@@ -485,24 +441,5 @@ def format_template(
 
 def get_all_placeholders() -> list:
     """Get list of all placeholders used in templates."""
-    return [
-        "{author_name}",
-        "{journal_name}",
-        "{journal_issn}",
-        "{journal_link}",
-        "{editor_in_chief_name}",
-        "{publisher_name}",
-        "{sender_email}",
-        "{publisher_location}",
-        "{journal_submission_link}",
-        "{journal_cite_score}",
-        "{journal_quartile}",
-        "{journal_indexing_status}",
-        "{author_specialty}",
-        "{author_recent_publications}",
-        "{journal_scope}",
-        "{invitation_goal}",
-        "{journal_metrics}",
-        "{invitation_goal_note}",
-        "{journal_scope_note}",
-    ]
+    # Preserve order while deduplicating shared placeholders.
+    return list(dict.fromkeys(_EDITORIAL_PLACEHOLDERS + _PUBLICATION_PLACEHOLDERS))

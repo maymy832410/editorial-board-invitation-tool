@@ -12,6 +12,14 @@ class OpenAlexRequestError(Exception):
     """Raised when an OpenAlex request fails after retry attempts."""
 
 
+class OpenAlexRateLimitError(OpenAlexRequestError):
+    """Raised when OpenAlex blocks requests due to rate limit or exhausted budget."""
+
+    def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 def _normalize_orcid(orcid_value: str) -> str:
     """Normalize ORCID inputs to bare identifier format."""
     normalized = (orcid_value or "").strip().lower()
@@ -83,11 +91,50 @@ class OpenAlexClient:
                 if response.status_code == 200:
                     return response.json()
                 elif response.status_code == 429:
-                    # Rate limited - wait and retry
                     self.request_stats["rate_limited"] += 1
-                    wait_time = (2 ** attempt) * self.backoff_base_seconds
-                    time.sleep(wait_time)
-                    continue
+
+                    retry_after_seconds: Optional[int] = None
+                    retry_after_raw = (response.headers.get("Retry-After") or "").strip()
+                    if retry_after_raw:
+                        try:
+                            retry_after_seconds = max(int(float(retry_after_raw)), 0)
+                        except ValueError:
+                            retry_after_seconds = None
+
+                    payload: dict[str, Any] = {}
+                    try:
+                        payload_candidate = response.json()
+                        if isinstance(payload_candidate, dict):
+                            payload = payload_candidate
+                            payload_retry_after = payload.get("retryAfter")
+                            if retry_after_seconds is None and payload_retry_after is not None:
+                                try:
+                                    retry_after_seconds = max(int(payload_retry_after), 0)
+                                except (TypeError, ValueError):
+                                    retry_after_seconds = None
+                    except ValueError:
+                        payload = {}
+
+                    if attempt < retries - 1:
+                        wait_time = (
+                            float(retry_after_seconds)
+                            if retry_after_seconds is not None
+                            else (2 ** attempt) * self.backoff_base_seconds
+                        )
+                        time.sleep(max(wait_time, self.backoff_base_seconds))
+                        continue
+
+                    self.request_stats["retry_exhausted"] += 1
+                    detail = (payload.get("message") or payload.get("error") or "").strip()
+                    if detail:
+                        raise OpenAlexRateLimitError(
+                            f"OpenAlex rate limit exceeded: {detail}",
+                            retry_after_seconds=retry_after_seconds,
+                        )
+                    raise OpenAlexRateLimitError(
+                        "OpenAlex rate limit exceeded",
+                        retry_after_seconds=retry_after_seconds,
+                    )
                 elif response.status_code >= 500:
                     # Server error - retry
                     self.request_stats["server_errors"] += 1
@@ -364,6 +411,8 @@ class OpenAlexClient:
 
         try:
             data = self._make_request("authors", params)
+        except OpenAlexRateLimitError:
+            raise
         except Exception as exc:
             raise OpenAlexRequestError(
                 f"OpenAlex ORCID lookup failed for {normalized_orcid}"

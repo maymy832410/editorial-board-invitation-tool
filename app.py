@@ -1059,6 +1059,13 @@ def email_dialog(author: dict, filters: dict):
                     to_name=author['name'],
                     pdf_attachment=pdf_bytes,
                     attachment_filename="Publication_Invitation_Letter.pdf" if invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter.pdf",
+                    journal_name=journal_config.get('name', ''),
+                    journal_link=journal_config.get('link', ''),
+                    submission_link=journal_config.get('submission_link', ''),
+                    invitation_type=invitation_type,
+                    scopus_indexed=scopus_indexed,
+                    journal_cite_score=journal_config.get('cite_score', ''),
+                    journal_quartile=journal_config.get('quartile', ''),
                 )
                 
                 if success:
@@ -1083,6 +1090,55 @@ def email_dialog(author: dict, filters: dict):
     
     if not EMAIL_AVAILABLE:
         st.warning("Email sending not configured. Add email_credentials.json.")
+
+
+@st.dialog("Confirm Bulk Send", width="large")
+def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
+    """Preview one sample bulk email and require explicit confirmation."""
+    batch = payload.get('batch') or []
+    invitation_type = payload.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    publisher_id = payload.get('publisher_id', 'brevo')
+    journal_config = payload.get('journal_config', {}) or {}
+    bulk_template_strategy = payload.get('bulk_template_strategy', 'Use selected template')
+    selected_bulk_template = payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER)
+    bulk_scopus_indexed = bool(payload.get('bulk_scopus_indexed', False))
+    bulk_attach_pdf = bool(payload.get('bulk_attach_pdf', True))
+    bulk_include_cached_publications = bool(payload.get('bulk_include_cached_publications', False))
+    dialog_key = payload.get('dialog_key', 'bulk_preview')
+
+    if not batch:
+        st.warning("No eligible authors in this bulk batch.")
+        if st.button("Close", use_container_width=True, key=f"bulk_preview_close_{dialog_key}"):
+            st.rerun()
+        return
+
+    bulk_template_names = get_template_names(invitation_type)
+    template_name = bulk_template_names.get(selected_bulk_template, selected_bulk_template)
+    sample_author = batch[0]
+    st.warning(
+        f"You are about to send **{len(batch)}** {_invitation_type_label(invitation_type).lower()} emails. "
+        f"Please confirm before proceeding."
+    )
+    st.caption(
+        f"Sample recipient: {sample_author.get('name', 'Author')} "
+        f"<{sample_author.get('email', '')}> | Template: {template_name} | "
+        f"PDF attachment: {'Yes' if bulk_attach_pdf else 'No'}"
+    )
+
+    col_cancel, col_confirm = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", use_container_width=True, key=f"bulk_preview_cancel_{dialog_key}"):
+            st.rerun()
+    with col_confirm:
+        if st.button(
+            f"Confirm and Send {len(batch)} Emails",
+            type="primary",
+            use_container_width=True,
+            disabled=not EMAIL_AVAILABLE,
+            key=f"bulk_preview_confirm_{dialog_key}",
+        ):
+            st.session_state[confirmation_key] = payload
+            st.rerun()
 
 
 def render_sidebar():
@@ -1154,6 +1210,13 @@ def render_sidebar():
                             subject="Test email from Editorial Board Invitation Tool",
                             body="This is a test email. If you received this, the sender is configured correctly.",
                             to_name="Test recipient",
+                            journal_name="",
+                            journal_link="",
+                            submission_link="",
+                            invitation_type=INVITATION_TYPE_EDITORIAL,
+                            scopus_indexed=False,
+                            journal_cite_score="",
+                            journal_quartile="",
                         )
                     if success:
                         st.success(f"Test email sent to {test_email_to}.")
@@ -1324,6 +1387,14 @@ def render_sidebar():
             key="exclude_countries",
             help="Authors from these countries will be excluded from results"
         )
+
+        selected_disciplines = st.multiselect(
+            "Filter by Discipline",
+            options=ALL_DISCIPLINES,
+            default=[d for d in search_params.get('disciplines', []) if d in ALL_DISCIPLINES],
+            key="sidebar_discipline_filter",
+            help="Show only results in the selected disciplines"
+        )
         
         max_results = st.number_input(
             "Max Results",
@@ -1444,6 +1515,7 @@ def render_sidebar():
             'h_min': h_min,
             'h_max': h_max,
             'exclude_countries': countries_to_exclude,
+            'disciplines': selected_disciplines,
             'max_results': max_results,
             'jump_size': jump_size,
             'concurrent': concurrent,
@@ -1612,6 +1684,7 @@ def run_search(filters, ui_scope: str):
         'h_index_min': filters['h_min'],
         'h_index_max': filters['h_max'],
         'exclude_countries': filters['exclude_countries'],
+        'disciplines': filters.get('disciplines', []),
         'author_source_mode': filters.get('author_source_mode', st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH)),
         'max_results': filters['max_results'],
         'jump_size': filters['jump_size'],
@@ -1798,14 +1871,166 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     st.rerun()
 
 
+def _execute_bulk_send(payload: dict, invitation_type, tracking_journal_name, filters):
+    """Run a confirmed bulk send, rendering the progress bar at the top of the page."""
+    from datetime import date as _date
+    DAILY_CAP = 280
+    if 'bulk_send_date' not in st.session_state or st.session_state.bulk_send_date != str(_date.today()):
+        st.session_state.bulk_send_date = str(_date.today())
+        st.session_state.bulk_sends_today = 0
+
+    batch = list(payload.get('batch') or [])
+    remaining_today_now = max(0, DAILY_CAP - st.session_state.bulk_sends_today)
+    if remaining_today_now <= 0:
+        st.warning("Bulk send cancelled: daily limit reached.")
+        st.rerun()
+    batch = batch[:remaining_today_now]
+    if not batch:
+        st.warning("Bulk send cancelled: no eligible authors remained.")
+        st.rerun()
+
+    payload_invitation_type = payload.get('invitation_type', invitation_type)
+    payload_tracking_journal_name = payload.get('tracking_journal_name', tracking_journal_name)
+    payload_publisher_id = payload.get('publisher_id', filters.get('publisher', 'brevo'))
+    payload_selected_template = payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER)
+    payload_template_strategy = payload.get('bulk_template_strategy', 'Use selected template')
+    payload_scopus_indexed = bool(payload.get('bulk_scopus_indexed', False))
+    payload_attach_pdf = bool(payload.get('bulk_attach_pdf', True))
+    payload_include_cached_publications = bool(payload.get('bulk_include_cached_publications', False))
+    payload_journal_config = payload.get('journal_config', {}) or {}
+
+    pub_info = PUBLISHER_INFO.get(payload_publisher_id, {})
+    publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(payload_publisher_id) if EMAIL_AVAILABLE else "")
+    publisher_location = pub_info.get('location') or payload_journal_config.get('location', '')
+    sender_email = email_sender.get_publisher_email(payload_publisher_id) if EMAIL_AVAILABLE else ""
+
+    sent_ok = 0
+    failed = 0
+    errors = []
+
+    st.subheader(f"Sending {len(batch)} {_invitation_type_label(payload_invitation_type).lower()} emails…")
+    progress_bar = st.progress(0, text="Starting bulk send...")
+    status_area = st.empty()
+
+    for i, author in enumerate(batch):
+        author_name = author.get('name', 'Unknown')
+        to_email = author.get('email', '')
+
+        status_area.info(f"Sending {i+1}/{len(batch)}: {author_name} ({to_email})")
+
+        if payload_invitation_type == INVITATION_TYPE_PUBLICATION and payload_template_strategy == "Rotate publication templates":
+            template_id = choose_rotating_template(get_publication_template_ids(), i)
+        else:
+            template_id = payload_selected_template
+
+        recent_publications_text = ""
+        if payload_invitation_type == INVITATION_TYPE_PUBLICATION and payload_include_cached_publications:
+            recent_publications_text = format_recent_publications(author.get('recent_publications') or [])
+
+        formatted = format_template(
+            template_id=template_id,
+            author_name=author_name,
+            journal_name=payload_journal_config.get('name', ''),
+            journal_issn=payload_journal_config.get('issn', ''),
+            journal_link=payload_journal_config.get('link', ''),
+            editor_in_chief_name=payload_journal_config.get('editor_in_chief', ''),
+            publisher_name=publisher_name,
+            sender_email=sender_email,
+            publisher_location=publisher_location,
+            scopus_indexed=payload_scopus_indexed,
+            journal_submission_link=payload_journal_config.get('submission_link', ''),
+            journal_cite_score=payload_journal_config.get('cite_score', ''),
+            journal_quartile=payload_journal_config.get('quartile', ''),
+            journal_indexing_status=payload_journal_config.get('indexing_status', ''),
+            author_specialty=author.get('specialty') or author.get('research_areas') or '',
+            author_recent_publications=recent_publications_text,
+            journal_scope=payload_journal_config.get('scope', ''),
+            invitation_goal=payload_journal_config.get('invitation_goal', ''),
+        )
+
+        pdf_bytes = None
+        if payload_attach_pdf:
+            try:
+                pdf_bytes = generate_invitation_pdf(
+                    publisher_id=payload_publisher_id,
+                    recipient_name=author_name,
+                    email_body=formatted['body'],
+                    subject=formatted['subject'],
+                    journal_name=payload_journal_config.get('name', ''),
+                    journal_link=payload_journal_config.get('link', ''),
+                )
+            except Exception:
+                pdf_bytes = None
+
+        success, msg = email_sender.send_email(
+            publisher_id=payload_publisher_id,
+            to_email=to_email,
+            subject=formatted['subject'],
+            body=formatted['body'],
+            to_name=author_name,
+            pdf_attachment=pdf_bytes,
+            attachment_filename="Publication_Invitation_Letter.pdf" if payload_invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter.pdf",
+            journal_name=payload_journal_config.get('name', ''),
+            journal_link=payload_journal_config.get('link', ''),
+            submission_link=payload_journal_config.get('submission_link', ''),
+            invitation_type=payload_invitation_type,
+            scopus_indexed=payload_scopus_indexed,
+            journal_cite_score=payload_journal_config.get('cite_score', ''),
+            journal_quartile=payload_journal_config.get('quartile', ''),
+        )
+
+        if success:
+            sent_ok += 1
+            st.session_state.bulk_sends_today += 1
+            mark_author_notified(
+                author.get('orcid_id', ''),
+                author_name=author_name,
+                email=to_email,
+                publisher=payload_publisher_id,
+                invitation_type=payload_invitation_type,
+                journal_name=payload_tracking_journal_name,
+                template_id=template_id,
+                cite_score=payload_journal_config.get('cite_score', ''),
+                quartile=payload_journal_config.get('quartile', ''),
+            )
+        else:
+            failed += 1
+            errors.append(f"{author_name}: {msg}")
+
+        progress_bar.progress((i + 1) / len(batch), text=f"Sent {sent_ok}, failed {failed} of {len(batch)}")
+
+        if i < len(batch) - 1:
+            time.sleep(2)
+
+    progress_bar.progress(1.0, text="Done!")
+    if sent_ok > 0:
+        st.success(f"Bulk send complete: {sent_ok}/{len(batch)} sent successfully.")
+    if failed > 0:
+        st.warning(f"{failed} failed:")
+        for err in errors:
+            st.caption(f"  - {err}")
+    time.sleep(2)
+    st.rerun()
+
+
 def display_results(filters, ui_scope: str):
     """Display search results with selection and filtering."""
     
     openalex_results = st.session_state.app_state.get('search_results', [])
     search_state = _get_search_pagination_state()
+    pending_dialog_author_key = _scope_key(ui_scope, "pending_email_dialog_author")
+    pending_dialog_filters_key = _scope_key(ui_scope, "pending_email_dialog_filters")
+    pending_bulk_dialog_key = _scope_key(ui_scope, "pending_bulk_send_dialog")
+    confirmed_bulk_send_key = _scope_key(ui_scope, "confirmed_bulk_send_payload")
     journal_config = st.session_state.app_state.get('journal_config', {})
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
+
+    # Run a confirmed bulk send before any other rendering so the progress bar is visible at the top.
+    confirmed_bulk_payload = st.session_state.pop(confirmed_bulk_send_key, None)
+    if isinstance(confirmed_bulk_payload, dict):
+        _execute_bulk_send(confirmed_bulk_payload, invitation_type, tracking_journal_name, filters)
+
     is_author_workflow = invitation_type == INVITATION_TYPE_PUBLICATION and ui_scope == WORKFLOW_AUTHOR
     author_source_mode = filters.get(
         'author_source_mode',
@@ -1955,12 +2180,17 @@ def display_results(filters, ui_scope: str):
     # Tag each author with retraction and sent status
     for r in filtered:
         r['is_retracted'] = r.get('name', '').lower() in retracted_names
+
+    # Apply sidebar discipline filter to the displayed results.
+    sidebar_disciplines = [d for d in filters.get('disciplines', []) if d]
+    if sidebar_disciplines:
+        filtered = [r for r in filtered if r.get('discipline') in sidebar_disciplines]
     
     # Collect unique disciplines, specialties, and author domains from results.
     all_disciplines = set()
     all_specialties = set()
     all_author_domains = set()
-    for r in results:
+    for r in filtered:
         if r.get('discipline'):
             all_disciplines.add(r['discipline'])
         if r.get('all_topics'):
@@ -2066,7 +2296,7 @@ def display_results(filters, ui_scope: str):
     with col_filter2:
         show_only_not_sent = st.checkbox(
             f"Hide already sent ({_invitation_type_label(invitation_type)})",
-            value=False,
+            value=True,
             key=_scope_key(ui_scope, "filter_not_sent")
         )
     with col_filter3:
@@ -2375,118 +2605,34 @@ def display_results(filters, ui_scope: str):
         )
     
     st.caption(f"Brevo daily sends: {st.session_state.bulk_sends_today}/{DAILY_CAP} used today")
-    
-    # --- Execute bulk send ---
+
     if bulk_send_clicked and select_all and batch_size > 0:
-        journal_config = st.session_state.app_state.get('journal_config', {})
-        publisher_id = filters.get('publisher', 'brevo')
-        attach_pdf = bulk_attach_pdf
-        
-        pub_info = PUBLISHER_INFO.get(publisher_id, {})
-        publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
-        publisher_location = pub_info.get('location') or journal_config.get('location', '')
-        sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
-        
-        batch = eligible[:batch_size]
-        sent_ok = 0
-        failed = 0
-        errors = []
-        
-        progress_bar = st.progress(0, text="Starting bulk send...")
-        status_area = st.empty()
-        
-        for i, author in enumerate(batch):
-            author_name = author.get('name', 'Unknown')
-            to_email = author.get('email', '')
-            
-            status_area.info(f"Sending {i+1}/{len(batch)}: {author_name} ({to_email})")
-
-            if invitation_type == INVITATION_TYPE_PUBLICATION and bulk_template_strategy == "Rotate publication templates":
-                template_id = choose_rotating_template(get_publication_template_ids(), i)
-            else:
-                template_id = selected_bulk_template
-
-            recent_publications_text = ""
-            if invitation_type == INVITATION_TYPE_PUBLICATION and bulk_include_cached_publications:
-                recent_publications_text = format_recent_publications(author.get('recent_publications') or [])
-            
-            formatted = format_template(
-                template_id=template_id,
-                author_name=author_name,
-                journal_name=journal_config.get('name', ''),
-                journal_issn=journal_config.get('issn', ''),
-                journal_link=journal_config.get('link', ''),
-                editor_in_chief_name=journal_config.get('editor_in_chief', ''),
-                publisher_name=publisher_name,
-                sender_email=sender_email,
-                publisher_location=publisher_location,
-                scopus_indexed=bulk_scopus_indexed,
-                journal_submission_link=journal_config.get('submission_link', ''),
-                journal_cite_score=journal_config.get('cite_score', ''),
-                journal_quartile=journal_config.get('quartile', ''),
-                journal_indexing_status=journal_config.get('indexing_status', ''),
-                author_specialty=author.get('specialty') or author.get('research_areas') or '',
-                author_recent_publications=recent_publications_text,
-                journal_scope=journal_config.get('scope', ''),
-                invitation_goal=journal_config.get('invitation_goal', '')
-            )
-            
-            pdf_bytes = None
-            if attach_pdf:
-                try:
-                    pdf_bytes = generate_invitation_pdf(
-                        publisher_id=publisher_id,
-                        recipient_name=author_name,
-                        email_body=formatted['body'],
-                        subject=formatted['subject'],
-                        journal_name=journal_config.get('name', ''),
-                        journal_link=journal_config.get('link', '')
-                    )
-                except Exception:
-                    pdf_bytes = None
-            
-            success, msg = email_sender.send_email(
-                publisher_id=publisher_id,
-                to_email=to_email,
-                subject=formatted['subject'],
-                body=formatted['body'],
-                to_name=author_name,
-                pdf_attachment=pdf_bytes,
-                attachment_filename="Publication_Invitation_Letter.pdf" if invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter.pdf",
-            )
-            
-            if success:
-                sent_ok += 1
-                st.session_state.bulk_sends_today += 1
-                mark_author_notified(
-                    author.get('orcid_id', ''),
-                    author_name=author_name,
-                    email=to_email,
-                    publisher=publisher_id,
-                    invitation_type=invitation_type,
-                    journal_name=tracking_journal_name,
-                    template_id=template_id,
-                    cite_score=journal_config.get('cite_score', ''),
-                    quartile=journal_config.get('quartile', '')
-                )
-            else:
-                failed += 1
-                errors.append(f"{author_name}: {msg}")
-            
-            progress_bar.progress((i + 1) / len(batch), text=f"Sent {sent_ok}, failed {failed} of {len(batch)}")
-            
-            if i < len(batch) - 1:
-                time.sleep(2)
-        
-        progress_bar.progress(1.0, text="Done!")
-        if sent_ok > 0:
-            st.success(f"Bulk send complete: {sent_ok}/{len(batch)} sent successfully.")
-        if failed > 0:
-            st.warning(f"{failed} failed:")
-            for err in errors:
-                st.caption(f"  - {err}")
-        time.sleep(2)
+        st.session_state[pending_bulk_dialog_key] = {
+            'batch': [dict(author) for author in eligible[:batch_size]],
+            'invitation_type': invitation_type,
+            'tracking_journal_name': tracking_journal_name,
+            'publisher_id': filters.get('publisher', 'brevo'),
+            'selected_bulk_template': selected_bulk_template,
+            'bulk_template_strategy': bulk_template_strategy,
+            'bulk_scopus_indexed': bulk_scopus_indexed,
+            'bulk_attach_pdf': bulk_attach_pdf,
+            'bulk_include_cached_publications': bulk_include_cached_publications,
+            'journal_config': dict(journal_config),
+            'dialog_key': f"{ui_scope}_{current_results_page}_{int(time.time())}",
+        }
         st.rerun()
+
+    pending_bulk_payload = st.session_state.pop(pending_bulk_dialog_key, None)
+    if isinstance(pending_bulk_payload, dict):
+        bulk_send_preview_dialog(pending_bulk_payload, confirmation_key=confirmed_bulk_send_key)
+
+    pending_author = st.session_state.pop(pending_dialog_author_key, None)
+    pending_filters = st.session_state.pop(pending_dialog_filters_key, None)
+    if isinstance(pending_author, dict):
+        dialog_filters = dict(filters)
+        if isinstance(pending_filters, dict):
+            dialog_filters.update(pending_filters)
+        email_dialog(pending_author, dialog_filters)
     
     # --- Display rows ---
     for idx, author in enumerate(page_results):
@@ -2566,7 +2712,12 @@ def display_results(filters, ui_scope: str):
                     type=btn_type,
                     use_container_width=True
                 ):
-                    email_dialog(author, filters)
+                    st.session_state[pending_dialog_author_key] = dict(author)
+                    st.session_state[pending_dialog_filters_key] = {
+                        'publisher': filters.get('publisher', 'brevo'),
+                        'invitation_type': invitation_type,
+                    }
+                    st.rerun()
             else:
                 st.button(
                     "—",
@@ -2780,6 +2931,13 @@ def render_invitation_section(filters):
                         body=body,
                         to_name=selected['name'],
                         pdf_attachment=pdf_bytes,
+                        journal_name=journal_config.get('name', ''),
+                        journal_link=journal_config.get('link', ''),
+                        submission_link=journal_config.get('submission_link', ''),
+                        invitation_type=INVITATION_TYPE_EDITORIAL,
+                        scopus_indexed=scopus_indexed,
+                        journal_cite_score=journal_config.get('cite_score', ''),
+                        journal_quartile=journal_config.get('quartile', ''),
                     )
                 
                 if success:
