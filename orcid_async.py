@@ -43,7 +43,7 @@ class AsyncOrcidClient:
         if self.session:
             await self.session.close()
     
-    async def get_email(self, orcid_id: str) -> Optional[str]:
+    async def get_email(self, orcid_id: str) -> dict:
         """
         Fetch email for a single ORCID ID.
         
@@ -51,9 +51,13 @@ class AsyncOrcidClient:
             orcid_id: ORCID identifier
             
         Returns:
-            Email if found, None otherwise
+            Dict with keys 'email' (str or None), 'rate_limited' (bool) and
+            'status' (one of 'found', 'no_email', 'rate_limited', 'error').
         """
         async with self.semaphore:
+            rate_limited = False
+            errored = False
+
             # Try /email endpoint first
             url = f"{self.base_url}/{orcid_id}/email"
             
@@ -63,12 +67,12 @@ class AsyncOrcidClient:
                         data = await response.json()
                         email = self._parse_email(data)
                         if email:
-                            return email
+                            return {"email": email, "rate_limited": False, "status": "found"}
                     elif response.status == 429:
                         await asyncio.sleep(2)
-                        return None
+                        return {"email": None, "rate_limited": True, "status": "rate_limited"}
             except Exception:
-                pass
+                errored = True
             
             # Fallback: try /person endpoint (emails + researcher-urls)
             try:
@@ -76,11 +80,17 @@ class AsyncOrcidClient:
                 async with self.session.get(person_url) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return self._parse_person_email(data)
+                        email = self._parse_person_email(data)
+                        if email:
+                            return {"email": email, "rate_limited": False, "status": "found"}
+                    elif response.status == 429:
+                        await asyncio.sleep(2)
+                        return {"email": None, "rate_limited": True, "status": "rate_limited"}
             except Exception:
-                pass
+                errored = True
             
-            return None
+            status = "error" if (errored and not rate_limited) else "no_email"
+            return {"email": None, "rate_limited": rate_limited, "status": status}
     
     def _parse_email(self, data: dict) -> Optional[str]:
         """Parse email from ORCID API /email response."""
@@ -138,7 +148,9 @@ class AsyncOrcidClient:
                     result = {
                         "orcid_id": None,
                         "name": author.get("name", ""),
-                        "email": None
+                        "email": None,
+                        "rate_limited": False,
+                        "email_status": "no_orcid",
                     }
                     results.append(result)
                     if on_result:
@@ -168,14 +180,18 @@ class AsyncOrcidClient:
         orcid_id = author.get("orcid_id")
         name = author.get("name", "")
         
-        email = await self.get_email(orcid_id)
+        lookup = await self.get_email(orcid_id)
         
-        return {
+        result = dict(author)
+        result.update({
             "orcid_id": orcid_id,
             "name": name,
-            "email": email,
-            "orcid_url": f"https://orcid.org/{orcid_id}" if orcid_id else None
-        }
+            "email": lookup.get("email"),
+            "rate_limited": bool(lookup.get("rate_limited")),
+            "email_status": lookup.get("status", "no_email"),
+            "orcid_url": f"https://orcid.org/{orcid_id}" if orcid_id else None,
+        })
+        return result
 
 
 async def fetch_emails_async(

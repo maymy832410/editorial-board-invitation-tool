@@ -35,6 +35,12 @@ from templates import (
 )
 from pdf_generator import generate_invitation_pdf, PUBLISHER_INFO
 from db_client import get_storage as get_db_storage
+from db_client import (
+    RUN_STATUS_ACTIVE,
+    RUN_STATUS_IDLE,
+    RUN_STATUS_PAUSED,
+    EMAIL_STATUS_FOUND,
+)
 
 WORKFLOW_AUTHOR = "author"
 WORKFLOW_EDITORIAL = "editorial"
@@ -2963,6 +2969,172 @@ def render_invitation_section(filters):
             st.warning("Email sending not available.")
 
 
+def render_collection_panel():
+    """Control panel for the background email-collection worker."""
+    st.caption(
+        "Background service that continuously harvests author metadata and emails "
+        "into the database for future processing. The worker runs as a separate process."
+    )
+
+    if not db_storage.available:
+        st.error("Database unavailable — the collection service requires PostgreSQL (DATABASE_URL).")
+        return
+
+    summary = db_storage.get_collection_summary()
+    run = summary.get("run") or {}
+    status = run.get("status") or RUN_STATUS_IDLE
+
+    status_styles = {
+        "active": ("🟢", "ACTIVE"),
+        "recovery": ("🟡", "RECOVERY"),
+        "cooldown": ("🟠", "COOLDOWN"),
+        "stopped_today": ("🔴", "STOPPED (next UTC day)"),
+        "paused": ("⏸️", "PAUSED"),
+        "idle": ("⚪", "IDLE / not started"),
+    }
+    icon, label = status_styles.get(status, ("⚪", status.upper()))
+
+    header_col, refresh_col = st.columns([4, 1])
+    with header_col:
+        st.subheader(f"{icon} {label}")
+    with refresh_col:
+        if st.button("🔄 Refresh", key="collection_refresh"):
+            st.rerun()
+
+    # Live status metrics
+    row1 = st.columns(4)
+    row1[0].metric("Collected today", summary.get("emails_found_today", 0))
+    row1[1].metric("Attempts today", summary.get("attempts_today", 0))
+    row1[2].metric("Hit rate", f"{summary.get('hit_rate', 0) * 100:.1f}%")
+    row1[3].metric("ORCID 429 today", summary.get("orcid_429_today", 0))
+
+    row2 = st.columns(4)
+    row2[0].metric("Queue pending", summary.get("queue_pending", 0))
+    row2[1].metric("Total collected", summary.get("total_collected", 0))
+    row2[2].metric("Eff. concurrency", run.get("effective_concurrency", "—"))
+    row2[3].metric("Eff. delay (s)", run.get("effective_delay", "—"))
+
+    detail_bits = []
+    if run.get("last_429_at"):
+        detail_bits.append(f"Last 429: {run['last_429_at']}")
+    if status == "cooldown" and run.get("cooldown_until"):
+        detail_bits.append(f"Cooldown until: {run['cooldown_until']}")
+    if status == "stopped_today" and run.get("stop_until"):
+        detail_bits.append(f"Resumes: {run['stop_until']}")
+    if run.get("seed_exhausted"):
+        detail_bits.append("Seed cursor exhausted for current filters")
+    if detail_bits:
+        st.caption(" · ".join(str(b) for b in detail_bits))
+
+    # Controls
+    st.markdown("#### Controls")
+    ctrl = st.columns(4)
+    if ctrl[0].button("▶️ Start", key="collection_start", use_container_width=True):
+        db_storage.set_run_status(RUN_STATUS_ACTIVE)
+        st.rerun()
+    if ctrl[1].button("⏸️ Pause", key="collection_pause", use_container_width=True):
+        db_storage.set_run_status(RUN_STATUS_PAUSED)
+        st.rerun()
+    if ctrl[2].button("⏯️ Resume", key="collection_resume", use_container_width=True):
+        db_storage.set_run_status(RUN_STATUS_ACTIVE)
+        st.rerun()
+    if ctrl[3].button("⏹️ Stop", key="collection_stop", use_container_width=True):
+        db_storage.set_run_status(RUN_STATUS_IDLE)
+        st.rerun()
+
+    # Filters / configuration
+    st.markdown("#### Targeting filters")
+    with st.form("collection_config_form"):
+        keyword_tags = st.text_input(
+            "Keyword tags (comma-separated, resolved to OpenAlex topics)",
+            value=run.get("keyword_tags", "") or "",
+            help="e.g. machine learning, computer vision, genomics",
+        )
+        disciplines = st.multiselect(
+            "Disciplines (post-filter on OpenAlex field)",
+            options=ALL_DISCIPLINES,
+            default=_parse_scientific_domains_json(run.get("disciplines_json")),
+        )
+        specialties_raw = st.text_input(
+            "Specialty terms (comma-separated substring match)",
+            value=", ".join(_parse_scientific_domains_json(run.get("specialties_json"))),
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            h_index_min = st.number_input(
+                "h-index min", min_value=0, max_value=500,
+                value=int(run.get("h_index_min") or DEFAULT_H_INDEX_MIN),
+            )
+        with col_b:
+            h_index_max = st.number_input(
+                "h-index max", min_value=0, max_value=1000,
+                value=int(run.get("h_index_max") or DEFAULT_H_INDEX_MAX),
+            )
+        exclude_countries = st.multiselect(
+            "Exclude countries",
+            options=list(COUNTRIES.keys()),
+            default=[
+                name for name, code in COUNTRIES.items()
+                if code in _parse_scientific_domains_json(run.get("exclude_countries_json"))
+            ],
+        )
+        col_c, col_d = st.columns(2)
+        with col_c:
+            baseline_concurrency = st.slider(
+                "Baseline concurrency", min_value=1, max_value=10,
+                value=int(run.get("baseline_concurrency") or 2),
+            )
+        with col_d:
+            baseline_delay = st.slider(
+                "Baseline delay (s)", min_value=1.0, max_value=10.0, step=0.5,
+                value=float(run.get("baseline_delay") or 3.0),
+            )
+        reset_cursor = st.checkbox(
+            "Reset OpenAlex seed cursor (re-scan from the start with new filters)",
+            value=False,
+        )
+        submitted = st.form_submit_button("💾 Save filters", use_container_width=True)
+
+    if submitted:
+        specialties = [s.strip() for s in specialties_raw.split(",") if s.strip()]
+        exclude_codes = [COUNTRIES[name] for name in exclude_countries if name in COUNTRIES]
+        db_storage.set_run_config(
+            disciplines=disciplines,
+            specialties=specialties,
+            exclude_countries=exclude_codes,
+            keyword_tags=keyword_tags.strip(),
+            topic_ids=[] if reset_cursor else None,
+            h_index_min=int(h_index_min),
+            h_index_max=int(h_index_max),
+            baseline_concurrency=int(baseline_concurrency),
+            baseline_delay=float(baseline_delay),
+            reset_cursor=reset_cursor,
+        )
+        st.success("Filters saved. The worker will pick them up on its next cycle.")
+        st.rerun()
+
+    # Recent collected authors
+    st.markdown("#### Recently collected")
+    recent = db_storage.get_recent_harvested(limit=25, status=EMAIL_STATUS_FOUND)
+    if recent:
+        recent_df = pd.DataFrame([
+            {
+                "Name": r.get("author_name"),
+                "Email": r.get("email"),
+                "ORCID": r.get("orcid_id"),
+                "Discipline": r.get("discipline"),
+                "Specialty": r.get("specialty"),
+                "h-index": r.get("h_index"),
+                "Country": r.get("country"),
+                "Collected": r.get("updated_at"),
+            }
+            for r in recent
+        ])
+        st.dataframe(recent_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No emails collected yet. Start the worker and configure filters above.")
+
+
 def main():
     """Main app entry point."""
     
@@ -2972,9 +3144,10 @@ def main():
     # Render sidebar and get filters
     shared_filters = render_sidebar()
 
-    author_tab, editorial_tab = st.tabs([
+    author_tab, editorial_tab, collection_tab = st.tabs([
         _workflow_label(WORKFLOW_AUTHOR),
         _workflow_label(WORKFLOW_EDITORIAL),
+        "📥 Collection",
     ])
 
     with author_tab:
@@ -2988,6 +3161,9 @@ def main():
         editorial_filters = dict(shared_filters)
         editorial_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_EDITORIAL)
         render_search_section(editorial_filters, WORKFLOW_EDITORIAL)
+
+    with collection_tab:
+        render_collection_panel()
 
 
 if __name__ == "__main__":

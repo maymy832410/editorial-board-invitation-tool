@@ -18,6 +18,21 @@ OPENALEX_MATCH_STATUS_MATCHED = "matched"
 OPENALEX_MATCH_STATUS_PENDING_MANUAL = "pending_manual"
 DEFAULT_PROFILE_COOLDOWN_DAYS = 180
 
+# Background collection-service run states
+RUN_STATUS_IDLE = "idle"
+RUN_STATUS_ACTIVE = "active"
+RUN_STATUS_COOLDOWN = "cooldown"
+RUN_STATUS_RECOVERY = "recovery"
+RUN_STATUS_STOPPED_TODAY = "stopped_today"
+RUN_STATUS_PAUSED = "paused"
+
+# Harvested-author email fetch states
+EMAIL_STATUS_PENDING = "pending"
+EMAIL_STATUS_FOUND = "found"
+EMAIL_STATUS_NO_EMAIL = "no_email"
+EMAIL_STATUS_NO_ORCID = "no_orcid"
+EMAIL_STATUS_ERROR = "error"
+
 
 def _normalize_text(value: Optional[str]) -> str:
     """Normalize optional text for consistent storage."""
@@ -116,6 +131,9 @@ class PostgresStorage:
     TABLE_NAME = "sent_invitations"
     INVITATION_TABLE_NAME = "author_invitations"
     PROFILE_TABLE_NAME = "author_profiles"
+    COLLECTION_RUNS_TABLE = "collection_runs"
+    HARVESTED_AUTHORS_TABLE = "harvested_authors"
+    COLLECTION_DAILY_STATS_TABLE = "collection_daily_stats"
 
     def __init__(self):
         self.available = False
@@ -259,6 +277,95 @@ class PostgresStorage:
                 CREATE INDEX IF NOT EXISTS idx_retracted_name_lower
                 ON retracted_authors (author_name_lower);
             """)
+            self._ensure_collection_tables(cur)
+
+    def _ensure_collection_tables(self, cur):
+        """Create tables for the background email-collection service."""
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.COLLECTION_RUNS_TABLE} (
+                id                      INTEGER PRIMARY KEY,
+                status                  TEXT DEFAULT '{RUN_STATUS_IDLE}',
+                domains_json            TEXT DEFAULT '[]',
+                disciplines_json        TEXT DEFAULT '[]',
+                specialties_json        TEXT DEFAULT '[]',
+                exclude_countries_json  TEXT DEFAULT '[]',
+                keyword_tags            TEXT DEFAULT '',
+                topic_ids_json          TEXT DEFAULT '[]',
+                h_index_min             INTEGER,
+                h_index_max             INTEGER,
+                baseline_concurrency    INTEGER DEFAULT 2,
+                baseline_delay          DOUBLE PRECISION DEFAULT 3.0,
+                effective_concurrency   INTEGER DEFAULT 2,
+                effective_delay         DOUBLE PRECISION DEFAULT 3.0,
+                seed_cursor             TEXT DEFAULT '*',
+                seed_exhausted          BOOLEAN DEFAULT FALSE,
+                last_429_at             TIMESTAMPTZ,
+                cooldown_until          TIMESTAMPTZ,
+                stop_until              TIMESTAMPTZ,
+                run_429_count           INTEGER DEFAULT 0,
+                clean_batches           INTEGER DEFAULT 0,
+                created_at              TIMESTAMPTZ DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.HARVESTED_AUTHORS_TABLE} (
+                openalex_id     TEXT PRIMARY KEY,
+                orcid_id        TEXT DEFAULT '',
+                author_name     TEXT DEFAULT '',
+                author_name_lower TEXT DEFAULT '',
+                h_index         INTEGER,
+                works_count     INTEGER,
+                cited_by_count  INTEGER,
+                institution     TEXT DEFAULT '',
+                country         TEXT DEFAULT '',
+                discipline      TEXT DEFAULT '',
+                specialty       TEXT DEFAULT '',
+                subfield        TEXT DEFAULT '',
+                research_areas  TEXT DEFAULT '',
+                all_topics_json TEXT DEFAULT '[]',
+                email           TEXT DEFAULT '',
+                all_emails      TEXT DEFAULT '',
+                email_source    TEXT DEFAULT '',
+                email_status    TEXT DEFAULT '{EMAIL_STATUS_PENDING}',
+                attempts        INTEGER DEFAULT 0,
+                last_checked_at TIMESTAMPTZ,
+                next_retry_at   TIMESTAMPTZ,
+                run_id          INTEGER,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_harvested_email_status
+            ON {self.HARVESTED_AUTHORS_TABLE} (email_status);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_harvested_orcid
+            ON {self.HARVESTED_AUTHORS_TABLE} (orcid_id);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_harvested_discipline
+            ON {self.HARVESTED_AUTHORS_TABLE} (discipline);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_harvested_country
+            ON {self.HARVESTED_AUTHORS_TABLE} (country);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_harvested_next_retry
+            ON {self.HARVESTED_AUTHORS_TABLE} (next_retry_at);
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.COLLECTION_DAILY_STATS_TABLE} (
+                day             DATE PRIMARY KEY,
+                emails_found    INTEGER DEFAULT 0,
+                attempts        INTEGER DEFAULT 0,
+                orcid_429       INTEGER DEFAULT 0,
+                openalex_429    INTEGER DEFAULT 0,
+                seeded          INTEGER DEFAULT 0
+            );
+        """)
 
     def _get_cursor(self):
         """Get a cursor, reconnecting if the connection was lost."""
@@ -1263,6 +1370,415 @@ class PostgresStorage:
         except Exception as e:
             print(f"PostgreSQL get_retracted_count error: {e}")
             return 0
+
+    # ------------------------------------------------------------------
+    # Background email-collection service
+    # ------------------------------------------------------------------
+    def get_or_create_run(self) -> Optional[Dict[str, Any]]:
+        """Return the singleton collection run row, creating it if absent."""
+        if not self.available:
+            return None
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"SELECT * FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1;"
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.COLLECTION_RUNS_TABLE} (id, status)
+                    VALUES (1, %s)
+                    ON CONFLICT (id) DO NOTHING;
+                    """,
+                    (RUN_STATUS_IDLE,),
+                )
+                cur.execute(
+                    f"SELECT * FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1;"
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"PostgreSQL get_or_create_run error: {e}")
+            return None
+
+    def get_active_run(self) -> Optional[Dict[str, Any]]:
+        """Return the current collection run row (alias of get_or_create_run)."""
+        return self.get_or_create_run()
+
+    def update_run_state(self, **fields: Any) -> bool:
+        """Update arbitrary columns on the singleton collection run row."""
+        if not self.available or not fields:
+            return False
+        allowed = {
+            "status", "seed_cursor", "seed_exhausted", "effective_concurrency",
+            "effective_delay", "baseline_concurrency", "baseline_delay",
+            "last_429_at", "cooldown_until", "stop_until", "run_429_count",
+            "clean_batches",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        set_clause = ", ".join(f"{key} = %s" for key in updates)
+        values = list(updates.values())
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_RUNS_TABLE}
+                    SET {set_clause}, updated_at = NOW()
+                    WHERE id = 1;
+                    """,
+                    values,
+                )
+            return True
+        except Exception as e:
+            print(f"PostgreSQL update_run_state error: {e}")
+            return False
+
+    def set_run_status(self, status: str) -> bool:
+        """Set the collection run status."""
+        return self.update_run_state(status=status)
+
+    def set_run_config(
+        self,
+        domains: Optional[List[str]] = None,
+        disciplines: Optional[List[str]] = None,
+        specialties: Optional[List[str]] = None,
+        exclude_countries: Optional[List[str]] = None,
+        keyword_tags: Optional[str] = None,
+        topic_ids: Optional[List[str]] = None,
+        h_index_min: Optional[int] = None,
+        h_index_max: Optional[int] = None,
+        baseline_concurrency: Optional[int] = None,
+        baseline_delay: Optional[float] = None,
+        reset_cursor: bool = False,
+    ) -> bool:
+        """Persist run filters and pacing; optionally reset the OpenAlex cursor."""
+        if not self.available:
+            return False
+        self.get_or_create_run()
+        updates: Dict[str, Any] = {}
+        if domains is not None:
+            updates["domains_json"] = json.dumps(domains)
+        if disciplines is not None:
+            updates["disciplines_json"] = json.dumps(disciplines)
+        if specialties is not None:
+            updates["specialties_json"] = json.dumps(specialties)
+        if exclude_countries is not None:
+            updates["exclude_countries_json"] = json.dumps(exclude_countries)
+        if keyword_tags is not None:
+            updates["keyword_tags"] = keyword_tags
+        if topic_ids is not None:
+            updates["topic_ids_json"] = json.dumps(topic_ids)
+        if h_index_min is not None:
+            updates["h_index_min"] = int(h_index_min)
+        if h_index_max is not None:
+            updates["h_index_max"] = int(h_index_max)
+        if baseline_concurrency is not None:
+            updates["baseline_concurrency"] = int(baseline_concurrency)
+        if baseline_delay is not None:
+            updates["baseline_delay"] = float(baseline_delay)
+        if reset_cursor:
+            updates["seed_cursor"] = "*"
+            updates["seed_exhausted"] = False
+        if not updates:
+            return False
+        set_clause = ", ".join(f"{key} = %s" for key in updates)
+        values = list(updates.values())
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_RUNS_TABLE}
+                    SET {set_clause}, updated_at = NOW()
+                    WHERE id = 1;
+                    """,
+                    values,
+                )
+            return True
+        except Exception as e:
+            print(f"PostgreSQL set_run_config error: {e}")
+            return False
+
+    def upsert_harvested_author(self, author: Dict[str, Any], run_id: int = 1) -> bool:
+        """Upsert one harvested author with full metadata, preserving email state."""
+        return self.bulk_upsert_harvested_authors([author], run_id=run_id) > 0
+
+    def bulk_upsert_harvested_authors(
+        self, authors: List[Dict[str, Any]], run_id: int = 1
+    ) -> int:
+        """Bulk-upsert harvested authors keyed by openalex_id; returns rows written."""
+        if not self.available or not authors:
+            return 0
+        written = 0
+        try:
+            with self._get_cursor() as cur:
+                for author in authors:
+                    openalex_id = _normalize_openalex_id(author.get("author_id"))
+                    if not openalex_id:
+                        continue
+                    orcid_id = _normalize_orcid(author.get("orcid_id"))
+                    name = _normalize_text(author.get("name"))
+                    name_lower = _normalize_author_name(author.get("name"))
+                    initial_status = (
+                        EMAIL_STATUS_PENDING if orcid_id else EMAIL_STATUS_NO_ORCID
+                    )
+                    all_topics = author.get("all_topics") or []
+                    try:
+                        all_topics_json = json.dumps(all_topics)
+                    except Exception:
+                        all_topics_json = "[]"
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.HARVESTED_AUTHORS_TABLE}
+                            (openalex_id, orcid_id, author_name, author_name_lower,
+                             h_index, works_count, cited_by_count, institution, country,
+                             discipline, specialty, subfield, research_areas, all_topics_json,
+                             email_status, run_id, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (openalex_id) DO UPDATE SET
+                            orcid_id = CASE WHEN EXCLUDED.orcid_id <> '' THEN EXCLUDED.orcid_id
+                                            ELSE {self.HARVESTED_AUTHORS_TABLE}.orcid_id END,
+                            author_name = CASE WHEN EXCLUDED.author_name <> '' THEN EXCLUDED.author_name
+                                               ELSE {self.HARVESTED_AUTHORS_TABLE}.author_name END,
+                            author_name_lower = CASE WHEN EXCLUDED.author_name_lower <> '' THEN EXCLUDED.author_name_lower
+                                                     ELSE {self.HARVESTED_AUTHORS_TABLE}.author_name_lower END,
+                            h_index = COALESCE(EXCLUDED.h_index, {self.HARVESTED_AUTHORS_TABLE}.h_index),
+                            works_count = COALESCE(EXCLUDED.works_count, {self.HARVESTED_AUTHORS_TABLE}.works_count),
+                            cited_by_count = COALESCE(EXCLUDED.cited_by_count, {self.HARVESTED_AUTHORS_TABLE}.cited_by_count),
+                            institution = CASE WHEN EXCLUDED.institution <> '' THEN EXCLUDED.institution
+                                               ELSE {self.HARVESTED_AUTHORS_TABLE}.institution END,
+                            country = CASE WHEN EXCLUDED.country <> '' THEN EXCLUDED.country
+                                           ELSE {self.HARVESTED_AUTHORS_TABLE}.country END,
+                            discipline = CASE WHEN EXCLUDED.discipline <> '' THEN EXCLUDED.discipline
+                                              ELSE {self.HARVESTED_AUTHORS_TABLE}.discipline END,
+                            specialty = CASE WHEN EXCLUDED.specialty <> '' THEN EXCLUDED.specialty
+                                             ELSE {self.HARVESTED_AUTHORS_TABLE}.specialty END,
+                            subfield = CASE WHEN EXCLUDED.subfield <> '' THEN EXCLUDED.subfield
+                                            ELSE {self.HARVESTED_AUTHORS_TABLE}.subfield END,
+                            research_areas = CASE WHEN EXCLUDED.research_areas <> '' THEN EXCLUDED.research_areas
+                                                  ELSE {self.HARVESTED_AUTHORS_TABLE}.research_areas END,
+                            all_topics_json = CASE WHEN EXCLUDED.all_topics_json <> '[]' THEN EXCLUDED.all_topics_json
+                                                   ELSE {self.HARVESTED_AUTHORS_TABLE}.all_topics_json END,
+                            updated_at = NOW();
+                        """,
+                        (
+                            openalex_id,
+                            orcid_id,
+                            name,
+                            name_lower,
+                            author.get("h_index"),
+                            author.get("works_count"),
+                            author.get("cited_by_count"),
+                            _normalize_text(author.get("institution")),
+                            _normalize_text(author.get("country")),
+                            _normalize_text(author.get("discipline")),
+                            _normalize_text(author.get("specialty")),
+                            _normalize_text(author.get("subfield")),
+                            _normalize_text(author.get("research_areas")),
+                            all_topics_json,
+                            initial_status,
+                            int(run_id),
+                        ),
+                    )
+                    written += 1
+            return written
+        except Exception as e:
+            print(f"PostgreSQL bulk_upsert_harvested_authors error: {e}")
+            return written
+
+    def get_pending_harvest(
+        self, limit: int = 50, require_orcid: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Return pending harvested authors due for an email lookup."""
+        if not self.available:
+            return []
+        safe_limit = max(1, min(int(limit or 50), 1000))
+        orcid_clause = "AND orcid_id <> ''" if require_orcid else ""
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT * FROM {self.HARVESTED_AUTHORS_TABLE}
+                    WHERE email_status = %s {orcid_clause}
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                    ORDER BY next_retry_at ASC NULLS FIRST, created_at ASC
+                    LIMIT %s;
+                    """,
+                    (EMAIL_STATUS_PENDING, safe_limit),
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL get_pending_harvest error: {e}")
+            return []
+
+    def update_harvest_email(
+        self,
+        openalex_id: str,
+        email: str = "",
+        status: str = EMAIL_STATUS_NO_EMAIL,
+        email_source: str = "",
+        all_emails: str = "",
+        next_retry_at: Optional[datetime] = None,
+    ) -> bool:
+        """Record the outcome of an email lookup for a harvested author."""
+        if not self.available:
+            return False
+        normalized_id = _normalize_openalex_id(openalex_id)
+        if not normalized_id:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.HARVESTED_AUTHORS_TABLE}
+                    SET email = CASE WHEN %s <> '' THEN %s ELSE email END,
+                        all_emails = CASE WHEN %s <> '' THEN %s ELSE all_emails END,
+                        email_source = CASE WHEN %s <> '' THEN %s ELSE email_source END,
+                        email_status = %s,
+                        attempts = attempts + 1,
+                        last_checked_at = NOW(),
+                        next_retry_at = %s,
+                        updated_at = NOW()
+                    WHERE openalex_id = %s;
+                    """,
+                    (
+                        email, email,
+                        all_emails, all_emails,
+                        email_source, email_source,
+                        status,
+                        next_retry_at,
+                        normalized_id,
+                    ),
+                )
+            return True
+        except Exception as e:
+            print(f"PostgreSQL update_harvest_email error: {e}")
+            return False
+
+    def count_harvest_by_status(self) -> Dict[str, int]:
+        """Return counts of harvested authors grouped by email_status."""
+        counts: Dict[str, int] = {}
+        if not self.available:
+            return counts
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT email_status, COUNT(*) AS cnt
+                    FROM {self.HARVESTED_AUTHORS_TABLE}
+                    GROUP BY email_status;
+                    """
+                )
+                for row in cur.fetchall():
+                    counts[row["email_status"]] = int(row["cnt"])
+            return counts
+        except Exception as e:
+            print(f"PostgreSQL count_harvest_by_status error: {e}")
+            return counts
+
+    def bump_daily_stat(self, field: str, increment: int = 1, day: Optional[Any] = None) -> bool:
+        """Increment a counter in collection_daily_stats for the given UTC day."""
+        if not self.available:
+            return False
+        allowed = {"emails_found", "attempts", "orcid_429", "openalex_429", "seeded"}
+        if field not in allowed:
+            return False
+        target_day = day or datetime.now(timezone.utc).date()
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.COLLECTION_DAILY_STATS_TABLE} (day, {field})
+                    VALUES (%s, %s)
+                    ON CONFLICT (day) DO UPDATE SET
+                        {field} = {self.COLLECTION_DAILY_STATS_TABLE}.{field} + EXCLUDED.{field};
+                    """,
+                    (target_day, int(increment)),
+                )
+            return True
+        except Exception as e:
+            print(f"PostgreSQL bump_daily_stat error: {e}")
+            return False
+
+    def get_recent_harvested(
+        self, limit: int = 25, status: str = EMAIL_STATUS_FOUND
+    ) -> List[Dict[str, Any]]:
+        """Return the most recently updated harvested authors for a given status."""
+        if not self.available:
+            return []
+        safe_limit = max(1, min(int(limit or 25), 500))
+        try:
+            with self._get_cursor() as cur:
+                if status:
+                    cur.execute(
+                        f"""
+                        SELECT * FROM {self.HARVESTED_AUTHORS_TABLE}
+                        WHERE email_status = %s
+                        ORDER BY updated_at DESC
+                        LIMIT %s;
+                        """,
+                        (status, safe_limit),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT * FROM {self.HARVESTED_AUTHORS_TABLE}
+                        ORDER BY updated_at DESC
+                        LIMIT %s;
+                        """,
+                        (safe_limit,),
+                    )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL get_recent_harvested error: {e}")
+            return []
+
+    def get_collection_summary(self) -> Dict[str, Any]:
+        """Aggregate live status for the collection dashboard."""
+        summary: Dict[str, Any] = {
+            "run": None,
+            "status_counts": {},
+            "queue_pending": 0,
+            "total_collected": 0,
+            "emails_found_today": 0,
+            "attempts_today": 0,
+            "orcid_429_today": 0,
+            "hit_rate": 0.0,
+        }
+        if not self.available:
+            return summary
+        try:
+            summary["run"] = self.get_or_create_run()
+            counts = self.count_harvest_by_status()
+            summary["status_counts"] = counts
+            summary["queue_pending"] = counts.get(EMAIL_STATUS_PENDING, 0)
+            summary["total_collected"] = counts.get(EMAIL_STATUS_FOUND, 0)
+            today = datetime.now(timezone.utc).date()
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT emails_found, attempts, orcid_429
+                    FROM {self.COLLECTION_DAILY_STATS_TABLE}
+                    WHERE day = %s;
+                    """,
+                    (today,),
+                )
+                row = cur.fetchone()
+            if row:
+                summary["emails_found_today"] = int(row.get("emails_found", 0) or 0)
+                summary["attempts_today"] = int(row.get("attempts", 0) or 0)
+                summary["orcid_429_today"] = int(row.get("orcid_429", 0) or 0)
+                if summary["attempts_today"] > 0:
+                    summary["hit_rate"] = round(
+                        summary["emails_found_today"] / summary["attempts_today"], 4
+                    )
+            return summary
+        except Exception as e:
+            print(f"PostgreSQL get_collection_summary error: {e}")
+            return summary
 
 
 # Singleton instance

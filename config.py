@@ -79,3 +79,37 @@ DEFAULT_MAX_RESULTS = 1000
 # File paths
 DATA_DIR = "data"
 PROGRESS_FILE = "progress.json"
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int environment variable with a fallback default."""
+    raw = (os.environ.get(name, "") or "").strip()
+    try:
+        return int(raw) if raw else int(default)
+    except ValueError:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float environment variable with a fallback default."""
+    raw = (os.environ.get(name, "") or "").strip()
+    try:
+        return float(raw) if raw else float(default)
+    except ValueError:
+        return float(default)
+
+
+# Background email-collection worker settings (env-tunable)
+COLLECT_BASELINE_CONCURRENCY = _env_int("COLLECT_BASELINE_CONCURRENCY", 2)
+COLLECT_BASELINE_DELAY_SEC = _env_float("COLLECT_BASELINE_DELAY_SEC", 3.0)
+COLLECT_COOLDOWN_MIN = _env_int("COLLECT_COOLDOWN_MIN", 20)
+COLLECT_COOLDOWN_DELAY_MIN = _env_float("COLLECT_COOLDOWN_DELAY_MIN", 8.0)
+COLLECT_COOLDOWN_DELAY_MAX = _env_float("COLLECT_COOLDOWN_DELAY_MAX", 12.0)
+COLLECT_RECOVERY_STEP = _env_int("COLLECT_RECOVERY_STEP", 2)
+COLLECT_SEED_MIN_QUEUE = _env_int("COLLECT_SEED_MIN_QUEUE", 2000)
+COLLECT_SEED_BATCH_SIZE = _env_int("COLLECT_SEED_BATCH_SIZE", 200)
+COLLECT_FETCH_BATCH = _env_int("COLLECT_FETCH_BATCH", 20)
+COLLECT_NO_EMAIL_RETRY_DAYS = _env_int("COLLECT_NO_EMAIL_RETRY_DAYS", 30)
+COLLECT_ERROR_RETRY_HOURS = _env_int("COLLECT_ERROR_RETRY_HOURS", 6)
+COLLECT_CYCLE_PAUSE_SEC = _env_float("COLLECT_CYCLE_PAUSE_SEC", 3.0)
+COLLECT_IDLE_POLL_SEC = _env_int("COLLECT_IDLE_POLL_SEC", 30)
