@@ -13,6 +13,7 @@ import psycopg2.extras
 
 INVITATION_TYPE_EDITORIAL = "editorial"
 INVITATION_TYPE_PUBLICATION = "publication"
+TEMPLATE_PUBLICATION_RECENT_WORK = "publication_recent_work"
 OPENALEX_MATCH_STATUS_UNKNOWN = "unknown"
 OPENALEX_MATCH_STATUS_MATCHED = "matched"
 OPENALEX_MATCH_STATUS_PENDING_MANUAL = "pending_manual"
@@ -1437,6 +1438,9 @@ class PostgresStorage:
         publisher_id = _normalize_text(publisher_id)
         if not publisher_id:
             return None
+        if invitation_type == INVITATION_TYPE_PUBLICATION:
+            template_id = TEMPLATE_PUBLICATION_RECENT_WORK
+            template_strategy = "Use selected template"
 
         cleaned: List[Dict[str, Any]] = []
         seen_keys: Set[str] = set()

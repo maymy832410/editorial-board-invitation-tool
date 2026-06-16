@@ -33,6 +33,7 @@ from templates import (
     TEMPLATE_BOARD_MEMBER,
     TEMPLATE_MANAGING_EDITOR,
     TEMPLATE_EDITOR_IN_CHIEF,
+    TEMPLATE_PUBLICATION_RECENT_WORK,
 )
 from pdf_generator import generate_invitation_pdf, PUBLISHER_INFO
 from db_client import get_storage as get_db_storage
@@ -1933,6 +1934,11 @@ def _enqueue_bulk_send(payload: dict) -> None:
         st.rerun()
 
     invitation_type = payload.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    selected_template_id = payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER)
+    template_strategy = payload.get('bulk_template_strategy', 'Use selected template')
+    if invitation_type == INVITATION_TYPE_PUBLICATION:
+        selected_template_id = TEMPLATE_PUBLICATION_RECENT_WORK
+        template_strategy = "Use selected template"
     tracking_journal_name = payload.get('tracking_journal_name', '')
     journal_filter = tracking_journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
     retracted_names = db_storage.get_retracted_names()
@@ -1951,8 +1957,8 @@ def _enqueue_bulk_send(payload: dict) -> None:
         invitation_type=invitation_type,
         publisher_id=publisher_id,
         journal_name=tracking_journal_name,
-        template_id=payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER),
-        template_strategy=payload.get('bulk_template_strategy', 'Use selected template'),
+        template_id=selected_template_id,
+        template_strategy=template_strategy,
         scopus_indexed=bool(payload.get('bulk_scopus_indexed', False)),
         attach_pdf=bool(payload.get('bulk_attach_pdf', True)),
         include_publications=bool(payload.get('bulk_include_cached_publications', False)),
@@ -2538,18 +2544,29 @@ def display_results(filters, ui_scope: str):
     bulk_template_names = get_template_names(invitation_type)
     bulk_col1, bulk_col2, bulk_col3 = st.columns([1.4, 1.4, 1.2])
     with bulk_col1:
-        selected_bulk_template = st.selectbox(
-            "Bulk Template",
-            options=list(bulk_template_names.keys()),
-            format_func=lambda x: bulk_template_names[x],
-            key=_scope_key(ui_scope, f"bulk_template_select_{invitation_type}")
-        )
+        if invitation_type == INVITATION_TYPE_PUBLICATION:
+            selected_bulk_template = TEMPLATE_PUBLICATION_RECENT_WORK
+            st.text_input(
+                "Bulk Template",
+                value=bulk_template_names.get(selected_bulk_template, "Publication Invitation"),
+                disabled=True,
+                key=_scope_key(ui_scope, f"bulk_template_locked_{invitation_type}")
+            )
+        else:
+            selected_bulk_template = st.selectbox(
+                "Bulk Template",
+                options=list(bulk_template_names.keys()),
+                format_func=lambda x: bulk_template_names[x],
+                key=_scope_key(ui_scope, f"bulk_template_select_{invitation_type}")
+            )
     with bulk_col2:
         if invitation_type == INVITATION_TYPE_PUBLICATION:
-            bulk_template_strategy = st.selectbox(
+            bulk_template_strategy = "Use selected template"
+            st.text_input(
                 "Template Strategy",
-                options=["Rotate publication templates", "Use selected template"],
-                key=_scope_key(ui_scope, "bulk_publication_template_strategy")
+                value="Fixed HTML template",
+                disabled=True,
+                key=_scope_key(ui_scope, "bulk_publication_template_strategy_locked")
             )
             bulk_scopus_indexed = False
         else:

@@ -17,10 +17,8 @@ from email_sender import EmailSender
 from pdf_generator import PUBLISHER_INFO, generate_invitation_pdf
 from templates import (
     TEMPLATE_BOARD_MEMBER,
-    choose_rotating_template,
     format_recent_publications,
     format_template,
-    get_publication_template_ids,
 )
 
 
@@ -226,16 +224,7 @@ class BulkEmailWorker:
         return message
 
     def _resolve_template_id(self, job: Dict[str, Any], recipient: Dict[str, Any]) -> str:
-        template_id = job.get("template_id") or TEMPLATE_BOARD_MEMBER
-        if (
-            job.get("invitation_type") == INVITATION_TYPE_PUBLICATION
-            and job.get("template_strategy") == "Rotate publication templates"
-        ):
-            return choose_rotating_template(
-                get_publication_template_ids(),
-                int(recipient.get("id") or 0),
-            )
-        return template_id
+        return job.get("template_id") or TEMPLATE_BOARD_MEMBER
 
 
 class DuplicateInvitationError(RuntimeError):
