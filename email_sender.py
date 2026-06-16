@@ -726,6 +726,7 @@ class EmailSender:
                 or lower.startswith("sincerely")
                 or lower.startswith("editorial office")
                 or lower.startswith("submission link")
+                or lower.startswith("submission portal")
                 or lower.startswith("journal website")
                 or lower.startswith("email:")
                 or "recent publications such as" in lower
@@ -754,6 +755,8 @@ class EmailSender:
 
             paragraph = html.escape(block["value"])
             paragraph = re.sub(r"(https?://[^\s<]+)", r'<a href="\1" target="_blank" style="color:#0f3a6d; text-decoration:underline;">\1</a>', paragraph)
+            paragraph = paragraph.replace("Submission portal: ", "Submission portal:<br>")
+            paragraph = paragraph.replace("Journal website: ", "Journal website:<br>")
             paragraph = paragraph.replace(" Email:", "<br>Email:")
             paragraph = paragraph.replace(" Website:", "<br>Website:")
             html_blocks.append(

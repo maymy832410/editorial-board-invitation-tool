@@ -337,6 +337,16 @@ def build_journal_metrics(
     return "Journal details: " + "; ".join(details) + "."
 
 
+def _clean_sentence_note(value: str) -> str:
+    """Normalize free-text note content and ensure sentence punctuation."""
+    cleaned = " ".join((value or "").strip().split())
+    if not cleaned:
+        return ""
+    if cleaned[-1] not in ".!?":
+        cleaned += "."
+    return cleaned
+
+
 def format_recent_publications(publications: Iterable[dict]) -> str:
     """Format recent OpenAlex publications for inclusion in an email template."""
     lines = []
@@ -397,8 +407,12 @@ def format_template(
         journal_quartile=journal_quartile,
         journal_indexing_status=journal_indexing_status,
     )
-    invitation_goal_note = f" Current invitation focus: {invitation_goal}." if invitation_goal else ""
-    journal_scope_note = f"\n\nScope note: {journal_scope}" if journal_scope else ""
+    invitation_goal_clean = _clean_sentence_note(invitation_goal)
+    journal_scope_clean = _clean_sentence_note(journal_scope)
+    invitation_goal_note = (
+        f" Current invitation focus: {invitation_goal_clean}" if invitation_goal_clean else ""
+    )
+    journal_scope_note = f"\n\nScope note: {journal_scope_clean}" if journal_scope_clean else ""
 
     all_replacements = {
         "{author_name}": author_name,
@@ -432,6 +446,8 @@ def format_template(
         value = all_replacements.get(placeholder, "") if placeholder in allowed_placeholders else ""
         subject = subject.replace(placeholder, value or "")
         body = body.replace(placeholder, value or "")
+
+    body = body.replace("Scope note: \n", "")
 
     return {
         "subject": subject,
