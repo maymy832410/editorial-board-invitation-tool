@@ -2357,6 +2357,18 @@ def display_results(filters, ui_scope: str):
         previous_specialties_key = _scope_key(ui_scope, "specialty_filter_multi_previous")
         specialty_filter_key = _scope_key(ui_scope, "specialty_filter_multi")
         specialty_options = sorted(all_specialties)
+        specialty_search_key = _scope_key(ui_scope, "specialty_filter_search")
+        specialty_search_text = st.text_input(
+            "Search specialties",
+            key=specialty_search_key,
+            placeholder="e.g., IoT",
+            help="Filter the specialty list, then select all matching options if needed."
+        ).strip()
+        specialty_search_lower = specialty_search_text.lower()
+        visible_specialty_options = [
+            option for option in specialty_options
+            if not specialty_search_lower or specialty_search_lower in option.lower()
+        ]
         current_specialty_values = st.session_state.get(specialty_filter_key, [])
         if current_specialty_values:
             valid_specialty_values = [
@@ -2365,16 +2377,23 @@ def display_results(filters, ui_scope: str):
             ]
             if valid_specialty_values != current_specialty_values:
                 st.session_state[specialty_filter_key] = valid_specialty_values
+                current_specialty_values = valid_specialty_values
+        selected_not_visible = [
+            value for value in current_specialty_values
+            if value not in visible_specialty_options
+        ]
+        specialty_widget_options = visible_specialty_options + selected_not_visible
 
         specialty_action_cols = st.columns(2)
         with specialty_action_cols[0]:
             if st.button(
-                "Select all specialties",
+                "Select filtered specialties",
                 key=_scope_key(ui_scope, "specialty_filter_select_all"),
                 use_container_width=True,
-                disabled=not specialty_options,
+                disabled=not visible_specialty_options,
             ):
-                st.session_state[specialty_filter_key] = specialty_options
+                merged_specialties = list(dict.fromkeys(current_specialty_values + visible_specialty_options))
+                st.session_state[specialty_filter_key] = merged_specialties
                 st.session_state[_scope_key(ui_scope, "results_page")] = 0
                 st.rerun()
         with specialty_action_cols[1]:
@@ -2390,11 +2409,16 @@ def display_results(filters, ui_scope: str):
 
         selected_specialties = st.multiselect(
             "Filter by Specialty",
-            options=specialty_options,
+            options=specialty_widget_options,
             default=[],
             key=specialty_filter_key,
             help="Type to search, then select one or more research topics."
         )
+        if specialty_search_text:
+            st.caption(
+                f"Showing {len(visible_specialty_options):,} of {len(specialty_options):,} specialties "
+                f"matching '{specialty_search_text}'."
+            )
         selected_specialty_signature = tuple(sorted(selected_specialties))
         if st.session_state.get(previous_specialties_key) != selected_specialty_signature:
             st.session_state[_scope_key(ui_scope, "results_page")] = 0
