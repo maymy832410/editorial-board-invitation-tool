@@ -405,6 +405,7 @@ class PostgresStorage:
                 skipped_count       INTEGER DEFAULT 0,
                 last_recipient      TEXT DEFAULT '',
                 last_error          TEXT DEFAULT '',
+                last_provider_response TEXT DEFAULT '',
                 cancel_requested    BOOLEAN DEFAULT FALSE,
                 created_at          TIMESTAMPTZ DEFAULT NOW(),
                 started_at          TIMESTAMPTZ,
@@ -428,6 +429,7 @@ class PostgresStorage:
                 template_id              TEXT DEFAULT '',
                 attempts                 INTEGER DEFAULT 0,
                 last_error               TEXT DEFAULT '',
+                provider_response        TEXT DEFAULT '',
                 claimed_at               TIMESTAMPTZ,
                 sent_at                  TIMESTAMPTZ,
                 created_at               TIMESTAMPTZ DEFAULT NOW(),
@@ -441,6 +443,14 @@ class PostgresStorage:
         cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_bulk_recipients_job_status
             ON {self.BULK_EMAIL_RECIPIENTS_TABLE} (job_id, status, id);
+        """)
+        cur.execute(f"""
+            ALTER TABLE {self.BULK_EMAIL_JOBS_TABLE}
+            ADD COLUMN IF NOT EXISTS last_provider_response TEXT DEFAULT '';
+        """)
+        cur.execute(f"""
+            ALTER TABLE {self.BULK_EMAIL_RECIPIENTS_TABLE}
+            ADD COLUMN IF NOT EXISTS provider_response TEXT DEFAULT '';
         """)
 
     def _get_cursor(self):
@@ -1650,6 +1660,7 @@ class PostgresStorage:
         recipient_id: int,
         status: str,
         error_message: str = "",
+        provider_response: str = "",
     ) -> bool:
         """Record the outcome for one bulk email recipient and refresh its job."""
         if not self.available:
@@ -1668,6 +1679,7 @@ class PostgresStorage:
                     UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE}
                     SET status = %s,
                         last_error = %s,
+                        provider_response = %s,
                         sent_at = CASE WHEN %s = %s THEN NOW() ELSE sent_at END,
                         updated_at = NOW()
                     WHERE id = %s
@@ -1676,6 +1688,7 @@ class PostgresStorage:
                     (
                         status,
                         error_message[:1000],
+                        provider_response[:1000],
                         status,
                         BULK_RECIPIENT_STATUS_SENT,
                         recipient_id,
@@ -1690,6 +1703,7 @@ class PostgresStorage:
                     UPDATE {self.BULK_EMAIL_JOBS_TABLE}
                     SET last_recipient = %s,
                         last_error = CASE WHEN %s <> '' THEN %s ELSE last_error END,
+                        last_provider_response = CASE WHEN %s <> '' THEN %s ELSE last_provider_response END,
                         updated_at = NOW()
                     WHERE id = %s;
                     """,
@@ -1697,6 +1711,8 @@ class PostgresStorage:
                         row.get("author_name") or row.get("email") or "",
                         error_message,
                         error_message[:1000],
+                        provider_response,
+                        provider_response[:1000],
                         job_id,
                     ),
                 )

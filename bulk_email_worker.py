@@ -72,14 +72,15 @@ class BulkEmailWorker:
                 f"job={recipient.get('job_id')} to={recipient.get('email')}",
                 flush=True,
             )
-            self._send_recipient(job, recipient)
+            provider_response = self._send_recipient(job, recipient)
             self.storage.mark_bulk_email_recipient(
                 recipient_id,
                 BULK_RECIPIENT_STATUS_SENT,
+                provider_response=provider_response,
             )
             print(
                 f"[bulk-email] sent recipient {recipient_id} "
-                f"job={recipient.get('job_id')}",
+                f"job={recipient.get('job_id')} provider_response={provider_response}",
                 flush=True,
             )
             time.sleep(max(0.0, float(BULK_EMAIL_SEND_DELAY_SEC or 0)))
@@ -114,7 +115,7 @@ class BulkEmailWorker:
             time.sleep(max(0.0, float(BULK_EMAIL_SEND_DELAY_SEC or 0)))
             return True
 
-    def _send_recipient(self, job: Dict[str, Any], recipient: Dict[str, Any]) -> None:
+    def _send_recipient(self, job: Dict[str, Any], recipient: Dict[str, Any]) -> str:
         invitation_type = job.get("invitation_type") or "editorial"
         journal_name = job.get("journal_name") or ""
         orcid_id = recipient.get("orcid_id") or ""
@@ -218,6 +219,7 @@ class BulkEmailWorker:
             )
             if not saved:
                 print("Bulk email sent, but sent status could not be saved", flush=True)
+        return message
 
     def _resolve_template_id(self, job: Dict[str, Any], recipient: Dict[str, Any]) -> str:
         template_id = job.get("template_id") or TEMPLATE_BOARD_MEMBER

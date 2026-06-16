@@ -1986,6 +1986,8 @@ def _render_bulk_job_status(ui_scope: str) -> None:
         with detail_cols[1]:
             if job.get('last_error'):
                 st.caption(f"Last error: {job.get('last_error')}")
+            elif job.get('last_provider_response'):
+                st.caption(f"Provider: {job.get('last_provider_response')}")
         with detail_cols[2]:
             if status in {BULK_JOB_STATUS_QUEUED, BULK_JOB_STATUS_RUNNING}:
                 if st.button("Cancel", key=_scope_key(ui_scope, f"cancel_bulk_job_{job.get('id')}")):

@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import requests
 import smtplib
 import ssl
 from email.mime.text import MIMEText
@@ -191,6 +192,35 @@ class EmailSender:
             return False, "Invalid sender email in account"
 
         try:
+            if not html_body:
+                html_body = self._build_premium_html_email(
+                    body=body,
+                    publisher_id=publisher_id,
+                    publisher_name=pub_config.get("name", ""),
+                    sender_email=sender_email,
+                    journal_name=journal_name,
+                    journal_link=journal_link,
+                    submission_link=submission_link,
+                    invitation_type=invitation_type,
+                    scopus_indexed=scopus_indexed,
+                    journal_cite_score=journal_cite_score,
+                    journal_quartile=journal_quartile,
+                )
+            brevo_api_key = os.environ.get("BREVO_API_KEY", "").strip()
+            if brevo_api_key and "brevo" in (pub_config.get("smtp_server") or "").lower():
+                return self._send_email_brevo_api(
+                    api_key=brevo_api_key,
+                    publisher_name=pub_config.get("name", ""),
+                    sender_email=sender_email,
+                    to_email=to_email,
+                    to_name=to_name,
+                    subject=subject,
+                    body=body,
+                    html_body=html_body,
+                    pdf_attachment=pdf_attachment,
+                    attachment_filename=attachment_filename,
+                )
+
             if pdf_attachment:
                 message = MIMEMultipart("mixed")
             else:
@@ -208,20 +238,6 @@ class EmailSender:
             body_part = MIMEMultipart("alternative")
             text_part = MIMEText(body, "plain", "utf-8")
             body_part.attach(text_part)
-            if not html_body:
-                html_body = self._build_premium_html_email(
-                    body=body,
-                    publisher_id=publisher_id,
-                    publisher_name=pub_config.get("name", ""),
-                    sender_email=sender_email,
-                    journal_name=journal_name,
-                    journal_link=journal_link,
-                    submission_link=submission_link,
-                    invitation_type=invitation_type,
-                    scopus_indexed=scopus_indexed,
-                    journal_cite_score=journal_cite_score,
-                    journal_quartile=journal_quartile,
-                )
             html_part = MIMEText(html_body, "html", "utf-8")
             body_part.attach(html_part)
 
@@ -266,6 +282,70 @@ class EmailSender:
             return False, f"SMTP error: {str(e)}"
         except Exception as e:
             return False, f"Error sending email: {str(e)}"
+
+    def _send_email_brevo_api(
+        self,
+        api_key: str,
+        publisher_name: str,
+        sender_email: str,
+        to_email: str,
+        to_name: Optional[str],
+        subject: str,
+        body: str,
+        html_body: str,
+        pdf_attachment: Optional[bytes],
+        attachment_filename: str,
+    ) -> Tuple[bool, str]:
+        """Send a transactional email through Brevo API and return its message id."""
+        payload = {
+            "sender": {
+                "name": publisher_name or sender_email,
+                "email": sender_email,
+            },
+            "to": [
+                {
+                    "email": to_email,
+                    **({"name": to_name} if to_name else {}),
+                }
+            ],
+            "subject": subject,
+            "htmlContent": html_body,
+            "textContent": body,
+        }
+        if pdf_attachment:
+            payload["attachment"] = [
+                {
+                    "name": attachment_filename,
+                    "content": base64.b64encode(pdf_attachment).decode("ascii"),
+                }
+            ]
+
+        try:
+            response = requests.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={
+                    "accept": "application/json",
+                    "api-key": api_key,
+                    "content-type": "application/json",
+                },
+                json=payload,
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            return False, f"Brevo API request failed: {exc}"
+
+        response_text = response.text.strip()
+        if response.status_code not in {200, 201, 202}:
+            return False, f"Brevo API error {response.status_code}: {response_text[:500]}"
+
+        message_id = ""
+        try:
+            message_id = response.json().get("messageId", "")
+        except Exception:
+            message_id = ""
+        if message_id:
+            return True, f"Brevo API accepted messageId={message_id}"
+        return True, f"Brevo API accepted: {response_text[:500]}"
 
     def _text_to_html(self, text: str) -> str:
         """Backwards-compatible wrapper for premium HTML rendering."""
