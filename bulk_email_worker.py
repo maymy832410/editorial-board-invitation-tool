@@ -55,14 +55,28 @@ class BulkEmailWorker:
             return False
 
         try:
+            print(
+                f"[bulk-email] sending recipient {recipient_id} "
+                f"job={recipient.get('job_id')} to={recipient.get('email')}",
+                flush=True,
+            )
             self._send_recipient(job, recipient)
             self.storage.mark_bulk_email_recipient(
                 recipient_id,
                 BULK_RECIPIENT_STATUS_SENT,
             )
+            print(
+                f"[bulk-email] sent recipient {recipient_id} "
+                f"job={recipient.get('job_id')}",
+                flush=True,
+            )
             time.sleep(max(0.0, float(BULK_EMAIL_SEND_DELAY_SEC or 0)))
             return True
         except DuplicateInvitationError as exc:
+            print(
+                f"[bulk-email] skipped recipient {recipient_id}: {exc}",
+                flush=True,
+            )
             self.storage.mark_bulk_email_recipient(
                 recipient_id,
                 BULK_RECIPIENT_STATUS_SKIPPED,
@@ -72,6 +86,11 @@ class BulkEmailWorker:
         except Exception as exc:
             attempts = int(recipient.get("attempts") or 1)
             message = str(exc)
+            print(
+                f"[bulk-email] failed recipient {recipient_id} "
+                f"attempt={attempts}: {message}",
+                flush=True,
+            )
             if attempts < max(1, int(BULK_EMAIL_MAX_ATTEMPTS or 1)):
                 self.storage.retry_bulk_email_recipient(recipient_id, message)
             else:

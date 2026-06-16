@@ -5,6 +5,7 @@ A unified tool for finding academic authors and sending editorial board invitati
 
 import asyncio
 import json
+import threading
 import time
 import streamlit as st
 import pandas as pd
@@ -20,6 +21,7 @@ from orcid_async import fetch_emails_async
 from openai_email_async import AsyncOpenAIEmailClient
 from progress_manager import StateManager
 from bulk_email_jobs import prepare_bulk_recipients
+from bulk_email_worker import BulkEmailWorker
 from disciplines import ALL_DISCIPLINES
 from email_sender import EmailSender
 from templates import (
@@ -72,6 +74,32 @@ def get_email_sender():
 
 email_sender = get_email_sender()
 EMAIL_AVAILABLE = email_sender is not None
+
+
+@st.cache_resource
+def start_bulk_email_daemon():
+    """Start one in-process daemon that drains durable bulk email jobs."""
+    stop_event = threading.Event()
+
+    def _run():
+        worker = None
+        while not stop_event.is_set():
+            try:
+                if worker is None:
+                    worker = BulkEmailWorker()
+                did_work = worker.process_next()
+                if not did_work:
+                    stop_event.wait(5)
+            except Exception as exc:
+                print(f"[bulk-email] daemon error: {exc}", flush=True)
+                worker = None
+                stop_event.wait(10)
+
+    thread = threading.Thread(target=_run, name="bulk-email-daemon", daemon=True)
+    thread.start()
+    print("[bulk-email] in-process daemon started", flush=True)
+    return stop_event
+
 
 # Load saved state
 if 'app_state' not in st.session_state:
@@ -658,6 +686,8 @@ def get_db():
     return get_db_storage()
 
 db_storage = get_db()
+if EMAIL_AVAILABLE and db_storage.available:
+    start_bulk_email_daemon()
 
 
 def _import_sent_csv(uploaded_file):
