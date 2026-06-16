@@ -33,6 +33,19 @@ EMAIL_STATUS_NO_EMAIL = "no_email"
 EMAIL_STATUS_NO_ORCID = "no_orcid"
 EMAIL_STATUS_ERROR = "error"
 
+# Background bulk email job states
+BULK_JOB_STATUS_QUEUED = "queued"
+BULK_JOB_STATUS_RUNNING = "running"
+BULK_JOB_STATUS_COMPLETED = "completed"
+BULK_JOB_STATUS_CANCELLED = "cancelled"
+BULK_JOB_STATUS_FAILED = "failed"
+
+BULK_RECIPIENT_STATUS_PENDING = "pending"
+BULK_RECIPIENT_STATUS_SENDING = "sending"
+BULK_RECIPIENT_STATUS_SENT = "sent"
+BULK_RECIPIENT_STATUS_FAILED = "failed"
+BULK_RECIPIENT_STATUS_SKIPPED = "skipped"
+
 
 def _normalize_text(value: Optional[str]) -> str:
     """Normalize optional text for consistent storage."""
@@ -134,6 +147,8 @@ class PostgresStorage:
     COLLECTION_RUNS_TABLE = "collection_runs"
     HARVESTED_AUTHORS_TABLE = "harvested_authors"
     COLLECTION_DAILY_STATS_TABLE = "collection_daily_stats"
+    BULK_EMAIL_JOBS_TABLE = "bulk_email_jobs"
+    BULK_EMAIL_RECIPIENTS_TABLE = "bulk_email_recipients"
 
     def __init__(self):
         self.available = False
@@ -278,6 +293,7 @@ class PostgresStorage:
                 ON retracted_authors (author_name_lower);
             """)
             self._ensure_collection_tables(cur)
+            self._ensure_bulk_email_tables(cur)
 
     def _ensure_collection_tables(self, cur):
         """Create tables for the background email-collection service."""
@@ -365,6 +381,66 @@ class PostgresStorage:
                 openalex_429    INTEGER DEFAULT 0,
                 seeded          INTEGER DEFAULT 0
             );
+        """)
+
+    def _ensure_bulk_email_tables(self, cur):
+        """Create tables for durable background bulk email sends."""
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.BULK_EMAIL_JOBS_TABLE} (
+                id                  SERIAL PRIMARY KEY,
+                status              TEXT DEFAULT '{BULK_JOB_STATUS_QUEUED}',
+                invitation_type     TEXT NOT NULL DEFAULT '{INVITATION_TYPE_EDITORIAL}',
+                publisher_id        TEXT DEFAULT '',
+                journal_name        TEXT DEFAULT '',
+                template_id         TEXT DEFAULT '',
+                template_strategy   TEXT DEFAULT '',
+                scopus_indexed      BOOLEAN DEFAULT FALSE,
+                attach_pdf          BOOLEAN DEFAULT TRUE,
+                include_publications BOOLEAN DEFAULT FALSE,
+                journal_config_json TEXT DEFAULT '{{}}',
+                total_count         INTEGER DEFAULT 0,
+                pending_count       INTEGER DEFAULT 0,
+                sent_count          INTEGER DEFAULT 0,
+                failed_count        INTEGER DEFAULT 0,
+                skipped_count       INTEGER DEFAULT 0,
+                last_recipient      TEXT DEFAULT '',
+                last_error          TEXT DEFAULT '',
+                cancel_requested    BOOLEAN DEFAULT FALSE,
+                created_at          TIMESTAMPTZ DEFAULT NOW(),
+                started_at          TIMESTAMPTZ,
+                completed_at        TIMESTAMPTZ,
+                updated_at          TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.BULK_EMAIL_RECIPIENTS_TABLE} (
+                id                       SERIAL PRIMARY KEY,
+                job_id                   INTEGER NOT NULL REFERENCES {self.BULK_EMAIL_JOBS_TABLE}(id) ON DELETE CASCADE,
+                status                   TEXT DEFAULT '{BULK_RECIPIENT_STATUS_PENDING}',
+                orcid_id                 TEXT DEFAULT '',
+                author_name              TEXT DEFAULT '',
+                email                    TEXT DEFAULT '',
+                openalex_id              TEXT DEFAULT '',
+                specialty                TEXT DEFAULT '',
+                research_areas           TEXT DEFAULT '',
+                all_topics_json          TEXT DEFAULT '[]',
+                recent_publications_json TEXT DEFAULT '[]',
+                template_id              TEXT DEFAULT '',
+                attempts                 INTEGER DEFAULT 0,
+                last_error               TEXT DEFAULT '',
+                claimed_at               TIMESTAMPTZ,
+                sent_at                  TIMESTAMPTZ,
+                created_at               TIMESTAMPTZ DEFAULT NOW(),
+                updated_at               TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bulk_jobs_status
+            ON {self.BULK_EMAIL_JOBS_TABLE} (status, created_at);
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_bulk_recipients_job_status
+            ON {self.BULK_EMAIL_RECIPIENTS_TABLE} (job_id, status, id);
         """)
 
     def _get_cursor(self):
@@ -1327,6 +1403,394 @@ class PostgresStorage:
             return True
         except Exception as e:
             print(f"PostgreSQL remove_sent error: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Background bulk email jobs
+    # ------------------------------------------------------------------
+    def create_bulk_email_job(
+        self,
+        recipients: List[Dict[str, Any]],
+        invitation_type: str,
+        publisher_id: str,
+        journal_name: str = "",
+        template_id: str = "",
+        template_strategy: str = "",
+        scopus_indexed: bool = False,
+        attach_pdf: bool = True,
+        include_publications: bool = False,
+        journal_config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Create a durable bulk email job and recipient queue."""
+        if not self.available or not recipients:
+            return None
+
+        cleaned: List[Dict[str, Any]] = []
+        seen_keys: Set[str] = set()
+        for recipient in recipients:
+            email = _normalize_email(recipient.get("email"))
+            if not email:
+                continue
+            orcid_id = _normalize_orcid(recipient.get("orcid_id"))
+            identity_key = orcid_id or f"email:{email}"
+            if identity_key in seen_keys:
+                continue
+            seen_keys.add(identity_key)
+            cleaned.append({**recipient, "email": email, "orcid_id": orcid_id})
+
+        if not cleaned:
+            return None
+
+        journal_config_json = json.dumps(journal_config or {}, default=str)
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.BULK_EMAIL_JOBS_TABLE}
+                        (status, invitation_type, publisher_id, journal_name, template_id,
+                         template_strategy, scopus_indexed, attach_pdf, include_publications,
+                         journal_config_json, total_count, pending_count, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    RETURNING id;
+                    """,
+                    (
+                        BULK_JOB_STATUS_QUEUED,
+                        invitation_type,
+                        publisher_id,
+                        journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else "",
+                        template_id,
+                        template_strategy,
+                        bool(scopus_indexed),
+                        bool(attach_pdf),
+                        bool(include_publications),
+                        journal_config_json,
+                        len(cleaned),
+                        len(cleaned),
+                    ),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                job_id = int(row["id"])
+
+                values = []
+                for recipient in cleaned:
+                    all_topics = recipient.get("all_topics") or []
+                    recent_publications = recipient.get("recent_publications") or []
+                    values.append(
+                        (
+                            job_id,
+                            BULK_RECIPIENT_STATUS_PENDING,
+                            recipient.get("orcid_id", ""),
+                            _normalize_text(recipient.get("name") or recipient.get("author_name")),
+                            recipient.get("email", ""),
+                            _normalize_openalex_id(recipient.get("author_id") or recipient.get("openalex_id")),
+                            _normalize_text(recipient.get("specialty")),
+                            _normalize_text(recipient.get("research_areas")),
+                            json.dumps(all_topics, default=str),
+                            json.dumps(recent_publications, default=str),
+                        )
+                    )
+
+                psycopg2.extras.execute_values(
+                    cur,
+                    f"""
+                    INSERT INTO {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                        (job_id, status, orcid_id, author_name, email, openalex_id,
+                         specialty, research_areas, all_topics_json, recent_publications_json)
+                    VALUES %s;
+                    """,
+                    values,
+                    page_size=500,
+                )
+                return job_id
+        except Exception as e:
+            print(f"PostgreSQL create bulk email job error: {e}")
+            return None
+
+    def _refresh_bulk_job_counts(self, job_id: int) -> bool:
+        """Recompute cached counters and finish completed jobs."""
+        if not self.available:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT status, COUNT(*) AS cnt
+                    FROM {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    WHERE job_id = %s
+                    GROUP BY status;
+                    """,
+                    (job_id,),
+                )
+                counts = {row["status"]: int(row["cnt"]) for row in cur.fetchall()}
+                pending = counts.get(BULK_RECIPIENT_STATUS_PENDING, 0) + counts.get(BULK_RECIPIENT_STATUS_SENDING, 0)
+                sent = counts.get(BULK_RECIPIENT_STATUS_SENT, 0)
+                failed = counts.get(BULK_RECIPIENT_STATUS_FAILED, 0)
+                skipped = counts.get(BULK_RECIPIENT_STATUS_SKIPPED, 0)
+                terminal = pending == 0
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_JOBS_TABLE}
+                    SET pending_count = %s,
+                        sent_count = %s,
+                        failed_count = %s,
+                        skipped_count = %s,
+                        status = CASE
+                            WHEN cancel_requested AND status <> %s THEN %s
+                            WHEN %s AND status NOT IN (%s, %s) THEN %s
+                            ELSE status
+                        END,
+                        completed_at = CASE
+                            WHEN (%s OR cancel_requested) AND completed_at IS NULL THEN NOW()
+                            ELSE completed_at
+                        END,
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        pending,
+                        sent,
+                        failed,
+                        skipped,
+                        BULK_JOB_STATUS_CANCELLED,
+                        BULK_JOB_STATUS_CANCELLED,
+                        terminal,
+                        BULK_JOB_STATUS_COMPLETED,
+                        BULK_JOB_STATUS_CANCELLED,
+                        BULK_JOB_STATUS_COMPLETED,
+                        terminal,
+                        job_id,
+                    ),
+                )
+            return True
+        except Exception as e:
+            print(f"PostgreSQL refresh bulk job counts error: {e}")
+            return False
+
+    def claim_next_bulk_email_recipient(self) -> Optional[Dict[str, Any]]:
+        """Claim the next pending bulk email recipient for a running worker."""
+        if not self.available:
+            return None
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    SET status = %s,
+                        last_error = 'Worker restarted before completing this attempt',
+                        updated_at = NOW()
+                    WHERE status = %s
+                      AND claimed_at IS NOT NULL
+                      AND claimed_at < NOW() - INTERVAL '30 minutes';
+                    """,
+                    (BULK_RECIPIENT_STATUS_PENDING, BULK_RECIPIENT_STATUS_SENDING),
+                )
+                cur.execute(
+                    f"""
+                    WITH next_recipient AS (
+                        SELECT r.id
+                        FROM {self.BULK_EMAIL_RECIPIENTS_TABLE} r
+                        JOIN {self.BULK_EMAIL_JOBS_TABLE} j ON j.id = r.job_id
+                        WHERE r.status = %s
+                          AND j.status IN (%s, %s)
+                          AND NOT j.cancel_requested
+                        ORDER BY j.created_at ASC, r.id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE} r
+                    SET status = %s,
+                        attempts = attempts + 1,
+                        claimed_at = NOW(),
+                        updated_at = NOW()
+                    FROM next_recipient
+                    WHERE r.id = next_recipient.id
+                    RETURNING r.*;
+                    """,
+                    (
+                        BULK_RECIPIENT_STATUS_PENDING,
+                        BULK_JOB_STATUS_QUEUED,
+                        BULK_JOB_STATUS_RUNNING,
+                        BULK_RECIPIENT_STATUS_SENDING,
+                    ),
+                )
+                recipient = cur.fetchone()
+                if not recipient:
+                    return None
+                job_id = int(recipient["job_id"])
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_JOBS_TABLE}
+                    SET status = %s,
+                        started_at = COALESCE(started_at, NOW()),
+                        last_recipient = %s,
+                        updated_at = NOW()
+                    WHERE id = %s AND status <> %s;
+                    """,
+                    (
+                        BULK_JOB_STATUS_RUNNING,
+                        recipient.get("author_name") or recipient.get("email") or "",
+                        job_id,
+                        BULK_JOB_STATUS_CANCELLED,
+                    ),
+                )
+                cur.execute(
+                    f"SELECT * FROM {self.BULK_EMAIL_JOBS_TABLE} WHERE id = %s;",
+                    (job_id,),
+                )
+                job = cur.fetchone()
+                return {"recipient": dict(recipient), "job": dict(job) if job else {}}
+        except Exception as e:
+            print(f"PostgreSQL claim bulk email recipient error: {e}")
+            return None
+
+    def mark_bulk_email_recipient(
+        self,
+        recipient_id: int,
+        status: str,
+        error_message: str = "",
+    ) -> bool:
+        """Record the outcome for one bulk email recipient and refresh its job."""
+        if not self.available:
+            return False
+        if status not in {
+            BULK_RECIPIENT_STATUS_PENDING,
+            BULK_RECIPIENT_STATUS_SENT,
+            BULK_RECIPIENT_STATUS_FAILED,
+            BULK_RECIPIENT_STATUS_SKIPPED,
+        }:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    SET status = %s,
+                        last_error = %s,
+                        sent_at = CASE WHEN %s = %s THEN NOW() ELSE sent_at END,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING job_id, author_name, email;
+                    """,
+                    (
+                        status,
+                        error_message[:1000],
+                        status,
+                        BULK_RECIPIENT_STATUS_SENT,
+                        recipient_id,
+                    ),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                job_id = int(row["job_id"])
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_JOBS_TABLE}
+                    SET last_recipient = %s,
+                        last_error = CASE WHEN %s <> '' THEN %s ELSE last_error END,
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        row.get("author_name") or row.get("email") or "",
+                        error_message,
+                        error_message[:1000],
+                        job_id,
+                    ),
+                )
+            return self._refresh_bulk_job_counts(job_id)
+        except Exception as e:
+            print(f"PostgreSQL mark bulk email recipient error: {e}")
+            return False
+
+    def retry_bulk_email_recipient(self, recipient_id: int, error_message: str = "") -> bool:
+        """Return a recipient to pending for one more attempt."""
+        if not self.available:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    SET status = %s,
+                        last_error = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING job_id;
+                    """,
+                    (BULK_RECIPIENT_STATUS_PENDING, error_message[:1000], recipient_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False
+                job_id = int(row["job_id"])
+            return self._refresh_bulk_job_counts(job_id)
+        except Exception as e:
+            print(f"PostgreSQL retry bulk email recipient error: {e}")
+            return False
+
+    def get_recent_bulk_email_jobs(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return recent bulk email jobs for dashboard display."""
+        if not self.available:
+            return []
+        safe_limit = max(1, min(int(limit or 5), 25))
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.BULK_EMAIL_JOBS_TABLE}
+                    ORDER BY created_at DESC
+                    LIMIT %s;
+                    """,
+                    (safe_limit,),
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL get recent bulk email jobs error: {e}")
+            return []
+
+    def cancel_bulk_email_job(self, job_id: int) -> bool:
+        """Cancel a queued/running bulk email job and skip pending recipients."""
+        if not self.available:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_JOBS_TABLE}
+                    SET cancel_requested = TRUE,
+                        status = %s,
+                        completed_at = COALESCE(completed_at, NOW()),
+                        updated_at = NOW()
+                    WHERE id = %s AND status IN (%s, %s);
+                    """,
+                    (
+                        BULK_JOB_STATUS_CANCELLED,
+                        int(job_id),
+                        BULK_JOB_STATUS_QUEUED,
+                        BULK_JOB_STATUS_RUNNING,
+                    ),
+                )
+                cur.execute(
+                    f"""
+                    UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    SET status = %s,
+                        last_error = 'Job cancelled',
+                        updated_at = NOW()
+                    WHERE job_id = %s AND status = %s;
+                    """,
+                    (
+                        BULK_RECIPIENT_STATUS_SKIPPED,
+                        int(job_id),
+                        BULK_RECIPIENT_STATUS_PENDING,
+                    ),
+                )
+            return self._refresh_bulk_job_counts(int(job_id))
+        except Exception as e:
+            print(f"PostgreSQL cancel bulk email job error: {e}")
             return False
 
     # --- Retraction methods ---

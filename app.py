@@ -19,14 +19,13 @@ from openalex_client import OpenAlexClient, OpenAlexRequestError
 from orcid_async import fetch_emails_async
 from openai_email_async import AsyncOpenAIEmailClient
 from progress_manager import StateManager
+from bulk_email_jobs import prepare_bulk_recipients
 from disciplines import ALL_DISCIPLINES
 from email_sender import EmailSender
 from templates import (
     get_template_names,
-    get_publication_template_ids,
     format_template,
     format_recent_publications,
-    choose_rotating_template,
     INVITATION_TYPE_EDITORIAL,
     INVITATION_TYPE_PUBLICATION,
     TEMPLATE_BOARD_MEMBER,
@@ -40,6 +39,8 @@ from db_client import (
     RUN_STATUS_IDLE,
     RUN_STATUS_PAUSED,
     EMAIL_STATUS_FOUND,
+    BULK_JOB_STATUS_QUEUED,
+    BULK_JOB_STATUS_RUNNING,
 )
 
 WORKFLOW_AUTHOR = "author"
@@ -1098,7 +1099,7 @@ def email_dialog(author: dict, filters: dict):
         st.warning("Email sending not configured. Add email_credentials.json.")
 
 
-@st.dialog("Confirm Bulk Send", width="large")
+@st.dialog("Confirm Background Bulk Send", width="large")
 def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
     """Preview one sample bulk email and require explicit confirmation."""
     batch = payload.get('batch') or []
@@ -1122,8 +1123,8 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
     template_name = bulk_template_names.get(selected_bulk_template, selected_bulk_template)
     sample_author = batch[0]
     st.warning(
-        f"You are about to send **{len(batch)}** {_invitation_type_label(invitation_type).lower()} emails. "
-        f"Please confirm before proceeding."
+        f"You are about to queue **{len(batch)}** {_invitation_type_label(invitation_type).lower()} emails. "
+        f"The worker will send them in the background, so the browser can be closed."
     )
     st.caption(
         f"Sample recipient: {sample_author.get('name', 'Author')} "
@@ -1137,7 +1138,7 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
             st.rerun()
     with col_confirm:
         if st.button(
-            f"Confirm and Send {len(batch)} Emails",
+            f"Queue {len(batch)} Background Emails",
             type="primary",
             use_container_width=True,
             disabled=not EMAIL_AVAILABLE,
@@ -1877,146 +1878,92 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     st.rerun()
 
 
-def _execute_bulk_send(payload: dict, invitation_type, tracking_journal_name, filters):
-    """Run a confirmed bulk send, rendering the progress bar at the top of the page."""
-    from datetime import date as _date
-    DAILY_CAP = 280
-    if 'bulk_send_date' not in st.session_state or st.session_state.bulk_send_date != str(_date.today()):
-        st.session_state.bulk_send_date = str(_date.today())
-        st.session_state.bulk_sends_today = 0
-
-    batch = list(payload.get('batch') or [])
-    remaining_today_now = max(0, DAILY_CAP - st.session_state.bulk_sends_today)
-    if remaining_today_now <= 0:
-        st.warning("Bulk send cancelled: daily limit reached.")
+def _enqueue_bulk_send(payload: dict) -> None:
+    """Create a durable background bulk send job."""
+    if not db_storage.available:
+        st.session_state.last_bulk_enqueue_result = "Database is required for background bulk sending."
         st.rerun()
-    batch = batch[:remaining_today_now]
+
+    invitation_type = payload.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    tracking_journal_name = payload.get('tracking_journal_name', '')
+    journal_filter = tracking_journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
+    retracted_names = db_storage.get_retracted_names()
+    batch = prepare_bulk_recipients(
+        payload.get('batch') or [],
+        is_already_sent=lambda orcid_id: db_storage.is_sent(orcid_id, invitation_type, journal_filter),
+        retracted_names=retracted_names,
+    )
+
     if not batch:
-        st.warning("Bulk send cancelled: no eligible authors remained.")
+        st.session_state.last_bulk_enqueue_result = "No eligible authors remained for this bulk send."
         st.rerun()
 
-    payload_invitation_type = payload.get('invitation_type', invitation_type)
-    payload_tracking_journal_name = payload.get('tracking_journal_name', tracking_journal_name)
-    payload_publisher_id = payload.get('publisher_id', filters.get('publisher', 'brevo'))
-    payload_selected_template = payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER)
-    payload_template_strategy = payload.get('bulk_template_strategy', 'Use selected template')
-    payload_scopus_indexed = bool(payload.get('bulk_scopus_indexed', False))
-    payload_attach_pdf = bool(payload.get('bulk_attach_pdf', True))
-    payload_include_cached_publications = bool(payload.get('bulk_include_cached_publications', False))
-    payload_journal_config = payload.get('journal_config', {}) or {}
-
-    pub_info = PUBLISHER_INFO.get(payload_publisher_id, {})
-    publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(payload_publisher_id) if EMAIL_AVAILABLE else "")
-    publisher_location = pub_info.get('location') or payload_journal_config.get('location', '')
-    sender_email = email_sender.get_publisher_email(payload_publisher_id) if EMAIL_AVAILABLE else ""
-
-    sent_ok = 0
-    failed = 0
-    errors = []
-
-    st.subheader(f"Sending {len(batch)} {_invitation_type_label(payload_invitation_type).lower()} emails…")
-    progress_bar = st.progress(0, text="Starting bulk send...")
-    status_area = st.empty()
-
-    for i, author in enumerate(batch):
-        author_name = author.get('name', 'Unknown')
-        to_email = author.get('email', '')
-
-        status_area.info(f"Sending {i+1}/{len(batch)}: {author_name} ({to_email})")
-
-        if payload_invitation_type == INVITATION_TYPE_PUBLICATION and payload_template_strategy == "Rotate publication templates":
-            template_id = choose_rotating_template(get_publication_template_ids(), i)
-        else:
-            template_id = payload_selected_template
-
-        recent_publications_text = ""
-        if payload_invitation_type == INVITATION_TYPE_PUBLICATION and payload_include_cached_publications:
-            recent_publications_text = format_recent_publications(author.get('recent_publications') or [])
-
-        formatted = format_template(
-            template_id=template_id,
-            author_name=author_name,
-            journal_name=payload_journal_config.get('name', ''),
-            journal_issn=payload_journal_config.get('issn', ''),
-            journal_link=payload_journal_config.get('link', ''),
-            editor_in_chief_name=payload_journal_config.get('editor_in_chief', ''),
-            publisher_name=publisher_name,
-            sender_email=sender_email,
-            publisher_location=publisher_location,
-            scopus_indexed=payload_scopus_indexed,
-            journal_submission_link=payload_journal_config.get('submission_link', ''),
-            journal_cite_score=payload_journal_config.get('cite_score', ''),
-            journal_quartile=payload_journal_config.get('quartile', ''),
-            journal_indexing_status=payload_journal_config.get('indexing_status', ''),
-            author_specialty=author.get('specialty') or author.get('research_areas') or '',
-            author_recent_publications=recent_publications_text,
-            journal_scope=payload_journal_config.get('scope', ''),
-            invitation_goal=payload_journal_config.get('invitation_goal', ''),
-        )
-
-        pdf_bytes = None
-        if payload_attach_pdf:
-            try:
-                pdf_bytes = generate_invitation_pdf(
-                    publisher_id=payload_publisher_id,
-                    recipient_name=author_name,
-                    email_body=formatted['body'],
-                    subject=formatted['subject'],
-                    journal_name=payload_journal_config.get('name', ''),
-                    journal_link=payload_journal_config.get('link', ''),
-                )
-            except Exception:
-                pdf_bytes = None
-
-        success, msg = email_sender.send_email(
-            publisher_id=payload_publisher_id,
-            to_email=to_email,
-            subject=formatted['subject'],
-            body=formatted['body'],
-            to_name=author_name,
-            pdf_attachment=pdf_bytes,
-            attachment_filename="Publication_Invitation_Letter.pdf" if payload_invitation_type == INVITATION_TYPE_PUBLICATION else "Invitation_Letter.pdf",
-            journal_name=payload_journal_config.get('name', ''),
-            journal_link=payload_journal_config.get('link', ''),
-            submission_link=payload_journal_config.get('submission_link', ''),
-            invitation_type=payload_invitation_type,
-            scopus_indexed=payload_scopus_indexed,
-            journal_cite_score=payload_journal_config.get('cite_score', ''),
-            journal_quartile=payload_journal_config.get('quartile', ''),
-        )
-
-        if success:
-            sent_ok += 1
-            st.session_state.bulk_sends_today += 1
-            mark_author_notified(
-                author.get('orcid_id', ''),
-                author_name=author_name,
-                email=to_email,
-                publisher=payload_publisher_id,
-                invitation_type=payload_invitation_type,
-                journal_name=payload_tracking_journal_name,
-                template_id=template_id,
-                cite_score=payload_journal_config.get('cite_score', ''),
-                quartile=payload_journal_config.get('quartile', ''),
-            )
-        else:
-            failed += 1
-            errors.append(f"{author_name}: {msg}")
-
-        progress_bar.progress((i + 1) / len(batch), text=f"Sent {sent_ok}, failed {failed} of {len(batch)}")
-
-        if i < len(batch) - 1:
-            time.sleep(2)
-
-    progress_bar.progress(1.0, text="Done!")
-    if sent_ok > 0:
-        st.success(f"Bulk send complete: {sent_ok}/{len(batch)} sent successfully.")
-    if failed > 0:
-        st.warning(f"{failed} failed:")
-        for err in errors:
-            st.caption(f"  - {err}")
-    time.sleep(2)
+    job_id = db_storage.create_bulk_email_job(
+        recipients=batch,
+        invitation_type=invitation_type,
+        publisher_id=payload.get('publisher_id', 'brevo'),
+        journal_name=tracking_journal_name,
+        template_id=payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER),
+        template_strategy=payload.get('bulk_template_strategy', 'Use selected template'),
+        scopus_indexed=bool(payload.get('bulk_scopus_indexed', False)),
+        attach_pdf=bool(payload.get('bulk_attach_pdf', True)),
+        include_publications=bool(payload.get('bulk_include_cached_publications', False)),
+        journal_config=payload.get('journal_config', {}) or {},
+    )
+    if job_id:
+        st.session_state.last_bulk_enqueue_result = f"Queued background bulk email job #{job_id} with {len(batch)} recipients."
+    else:
+        st.session_state.last_bulk_enqueue_result = "Could not queue the background bulk email job."
     st.rerun()
+
+
+def _render_bulk_job_status(ui_scope: str) -> None:
+    """Show progress for recent background bulk email jobs."""
+    if not db_storage.available:
+        st.info("Background bulk sending requires PostgreSQL. Configure DATABASE_URL to enable it.")
+        return
+
+    if st.session_state.get('last_bulk_enqueue_result'):
+        message = st.session_state.pop('last_bulk_enqueue_result')
+        if message.startswith("Queued"):
+            st.success(message)
+        else:
+            st.warning(message)
+
+    jobs = db_storage.get_recent_bulk_email_jobs(limit=5)
+    if not jobs:
+        st.caption("No background bulk send jobs yet.")
+        return
+
+    st.markdown("**Background Send Progress**")
+    for job in jobs:
+        total = int(job.get('total_count') or 0)
+        sent = int(job.get('sent_count') or 0)
+        failed = int(job.get('failed_count') or 0)
+        skipped = int(job.get('skipped_count') or 0)
+        done = sent + failed + skipped
+        progress = (done / total) if total else 0
+        status = job.get('status') or ''
+        label = (
+            f"Job #{job.get('id')} | {status.title()} | "
+            f"{done}/{total} processed ({sent} sent, {failed} failed, {skipped} skipped)"
+        )
+        st.progress(min(progress, 1.0), text=label)
+        detail_cols = st.columns([2, 2, 1])
+        with detail_cols[0]:
+            if job.get('last_recipient'):
+                st.caption(f"Last recipient: {job.get('last_recipient')}")
+        with detail_cols[1]:
+            if job.get('last_error'):
+                st.caption(f"Last error: {job.get('last_error')}")
+        with detail_cols[2]:
+            if status in {BULK_JOB_STATUS_QUEUED, BULK_JOB_STATUS_RUNNING}:
+                if st.button("Cancel", key=_scope_key(ui_scope, f"cancel_bulk_job_{job.get('id')}")):
+                    db_storage.cancel_bulk_email_job(int(job.get('id')))
+                    st.rerun()
+
+    if st.button("Refresh Bulk Progress", key=_scope_key(ui_scope, "refresh_bulk_jobs")):
+        st.rerun()
 
 
 def display_results(filters, ui_scope: str):
@@ -2032,10 +1979,9 @@ def display_results(filters, ui_scope: str):
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
 
-    # Run a confirmed bulk send before any other rendering so the progress bar is visible at the top.
     confirmed_bulk_payload = st.session_state.pop(confirmed_bulk_send_key, None)
     if isinstance(confirmed_bulk_payload, dict):
-        _execute_bulk_send(confirmed_bulk_payload, invitation_type, tracking_journal_name, filters)
+        _enqueue_bulk_send(confirmed_bulk_payload)
 
     is_author_workflow = invitation_type == INVITATION_TYPE_PUBLICATION and ui_scope == WORKFLOW_AUTHOR
     author_source_mode = filters.get(
@@ -2179,6 +2125,7 @@ def display_results(filters, ui_scope: str):
     
     # Get sent invitations from DB (persistent) for the active invitation workflow.
     sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
+    _render_bulk_job_status(ui_scope)
     
     # Get retracted author names from DB (lowercased set for fast matching)
     retracted_names = db_storage.get_retracted_names() if db_storage.available else set()
@@ -2529,14 +2476,12 @@ def display_results(filters, ui_scope: str):
     page_results = filtered[start_idx:end_idx]
     
     # --- Bulk send controls ---
-    from datetime import date as _date
-    DAILY_CAP = 280
-    if 'bulk_send_date' not in st.session_state or st.session_state.bulk_send_date != str(_date.today()):
-        st.session_state.bulk_send_date = str(_date.today())
-        st.session_state.bulk_sends_today = 0
-    
-    page_with_email = [a for a in page_results if a.get('email')]
-    page_not_sent = [a for a in page_with_email if a.get('orcid_id', '') not in sent_invitations and not a.get('is_retracted')]
+    filtered_with_email = [a for a in filtered if a.get('email')]
+    eligible_bulk_authors = prepare_bulk_recipients(
+        filtered,
+        is_already_sent=lambda orcid_id: orcid_id in sent_invitations,
+        retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
+    )
 
     st.markdown(f"**Bulk Send Settings ({_invitation_type_label(invitation_type)})**")
     bulk_template_names = get_template_names(invitation_type)
@@ -2579,42 +2524,38 @@ def display_results(filters, ui_scope: str):
         else:
             bulk_include_cached_publications = False
     
-    col_sel, col_skip, col_bulk = st.columns([1.2, 1.2, 1.6])
-    with col_sel:
-        select_all = st.checkbox(
-            f"Select all on page ({len(page_with_email)} with email)",
-            key=_scope_key(ui_scope, f"select_all_page_{current_results_page}")
+    col_count, col_note, col_bulk = st.columns([1.2, 1.2, 1.6])
+    with col_count:
+        default_bulk_count = min(1000, len(eligible_bulk_authors)) if eligible_bulk_authors else 0
+        batch_size = st.number_input(
+            "Recipients to queue",
+            min_value=0,
+            max_value=len(eligible_bulk_authors),
+            value=default_bulk_count,
+            step=25,
+            key=_scope_key(ui_scope, "bulk_recipient_count"),
+            help="Uses all current filters, not just the visible page."
         )
-    with col_skip:
-        skip_notified = st.checkbox(
-            "Skip already notified",
-            value=True,
-            key=_scope_key(ui_scope, "bulk_skip_notified")
+    with col_note:
+        st.caption(
+            f"Eligible: {len(eligible_bulk_authors):,} of {len(filtered_with_email):,} filtered authors with email. "
+            "Already invited and retracted authors are skipped."
         )
-    
-    eligible = page_not_sent if skip_notified else page_with_email
-    remaining_today = max(0, DAILY_CAP - st.session_state.bulk_sends_today)
-    batch_size = min(len(eligible), remaining_today) if select_all else 0
-    
+
     with col_bulk:
-        if remaining_today == 0:
-            st.warning("Daily limit reached (280/day)")
-        elif select_all and batch_size < len(eligible):
-            st.caption(f"Capped to {batch_size} (daily limit: {remaining_today} left)")
-        
         bulk_send_clicked = st.button(
-            f"Send Bulk ({batch_size} emails)" if select_all else "Select all to bulk send",
-            type="primary" if select_all and batch_size > 0 and EMAIL_AVAILABLE else "secondary",
-            disabled=not (select_all and batch_size > 0 and EMAIL_AVAILABLE),
+            f"Queue Background Bulk ({int(batch_size)} emails)",
+            type="primary" if batch_size > 0 and EMAIL_AVAILABLE and db_storage.available else "secondary",
+            disabled=not (batch_size > 0 and EMAIL_AVAILABLE and db_storage.available),
             use_container_width=True,
             key=_scope_key(ui_scope, f"bulk_send_{current_results_page}")
         )
-    
-    st.caption(f"Brevo daily sends: {st.session_state.bulk_sends_today}/{DAILY_CAP} used today")
+    if not db_storage.available:
+        st.warning("Background bulk sending is disabled because PostgreSQL is not connected.")
 
-    if bulk_send_clicked and select_all and batch_size > 0:
+    if bulk_send_clicked and batch_size > 0:
         st.session_state[pending_bulk_dialog_key] = {
-            'batch': [dict(author) for author in eligible[:batch_size]],
+            'batch': [dict(author) for author in eligible_bulk_authors[:int(batch_size)]],
             'invitation_type': invitation_type,
             'tracking_journal_name': tracking_journal_name,
             'publisher_id': filters.get('publisher', 'brevo'),

@@ -53,6 +53,7 @@ from openalex_client import (
     OpenAlexRequestError,
 )
 from orcid_async import fetch_emails_async
+from bulk_email_worker import BulkEmailWorker
 
 
 def _utcnow() -> datetime:
@@ -90,6 +91,7 @@ class CollectorWorker:
         self.storage = get_storage()
         self.openalex = OpenAlexClient()
         self._topic_cache: Optional[List[str]] = None
+        self.bulk_email_worker: Optional[BulkEmailWorker] = None
 
     # -- seeding ---------------------------------------------------------
     def _resolve_topic_ids(self, run: Dict[str, Any]) -> List[str]:
@@ -340,6 +342,10 @@ class CollectorWorker:
             time.sleep(COLLECT_IDLE_POLL_SEC)
             return
 
+        if self._process_bulk_email_once():
+            time.sleep(COLLECT_CYCLE_PAUSE_SEC)
+            return
+
         run = self.storage.get_active_run()
         if not run:
             time.sleep(COLLECT_IDLE_POLL_SEC)
@@ -390,6 +396,17 @@ class CollectorWorker:
             self._advance_recovery(run)
 
         time.sleep(COLLECT_CYCLE_PAUSE_SEC)
+
+    def _process_bulk_email_once(self) -> bool:
+        """Let durable bulk email jobs make progress even when collection is idle."""
+        try:
+            if self.bulk_email_worker is None:
+                self.bulk_email_worker = BulkEmailWorker()
+            return self.bulk_email_worker.process_next()
+        except Exception as exc:
+            _log(f"bulk email worker unavailable: {exc}")
+            self.bulk_email_worker = None
+            return False
 
 
 def main() -> None:
