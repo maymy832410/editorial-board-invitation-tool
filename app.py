@@ -2355,11 +2355,44 @@ def display_results(filters, ui_scope: str):
     
     with col_f2:
         previous_specialties_key = _scope_key(ui_scope, "specialty_filter_multi_previous")
+        specialty_filter_key = _scope_key(ui_scope, "specialty_filter_multi")
+        specialty_options = sorted(all_specialties)
+        current_specialty_values = st.session_state.get(specialty_filter_key, [])
+        if current_specialty_values:
+            valid_specialty_values = [
+                value for value in current_specialty_values
+                if value in specialty_options
+            ]
+            if valid_specialty_values != current_specialty_values:
+                st.session_state[specialty_filter_key] = valid_specialty_values
+
+        specialty_action_cols = st.columns(2)
+        with specialty_action_cols[0]:
+            if st.button(
+                "Select all specialties",
+                key=_scope_key(ui_scope, "specialty_filter_select_all"),
+                use_container_width=True,
+                disabled=not specialty_options,
+            ):
+                st.session_state[specialty_filter_key] = specialty_options
+                st.session_state[_scope_key(ui_scope, "results_page")] = 0
+                st.rerun()
+        with specialty_action_cols[1]:
+            if st.button(
+                "Clear specialties",
+                key=_scope_key(ui_scope, "specialty_filter_clear"),
+                use_container_width=True,
+                disabled=not current_specialty_values,
+            ):
+                st.session_state[specialty_filter_key] = []
+                st.session_state[_scope_key(ui_scope, "results_page")] = 0
+                st.rerun()
+
         selected_specialties = st.multiselect(
             "Filter by Specialty",
-            options=sorted(all_specialties),
+            options=specialty_options,
             default=[],
-            key=_scope_key(ui_scope, "specialty_filter_multi"),
+            key=specialty_filter_key,
             help="Type to search, then select one or more research topics."
         )
         selected_specialty_signature = tuple(sorted(selected_specialties))
