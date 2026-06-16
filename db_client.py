@@ -1434,6 +1434,9 @@ class PostgresStorage:
         """Create a durable bulk email job and recipient queue."""
         if not self.available or not recipients:
             return None
+        publisher_id = _normalize_text(publisher_id)
+        if not publisher_id:
+            return None
 
         cleaned: List[Dict[str, Any]] = []
         seen_keys: Set[str] = set()

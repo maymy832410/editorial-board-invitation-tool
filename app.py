@@ -161,6 +161,17 @@ def _author_source_label(source_mode: str) -> str:
     return "OpenAlex"
 
 
+def _publisher_display_label(publisher_id: str) -> str:
+    """Return a stable label for the selected publisher/sender."""
+    if not EMAIL_AVAILABLE:
+        return publisher_id or "Unavailable"
+    name = email_sender.get_publisher_name(publisher_id)
+    email = email_sender.get_publisher_email(publisher_id)
+    if name and email:
+        return f"{name} <{email}>"
+    return name or email or publisher_id or "Unknown publisher"
+
+
 def _scope_key(scope: str, key: str) -> str:
     """Build a deterministic widget/session key scoped to one workflow tab."""
     return f"{scope}_{key}"
@@ -1159,6 +1170,7 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
     st.caption(
         f"Sample recipient: {sample_author.get('name', 'Author')} "
         f"<{sample_author.get('email', '')}> | Template: {template_name} | "
+        f"Publisher: {_publisher_display_label(publisher_id)} | "
         f"PDF attachment: {'Yes' if bulk_attach_pdf else 'No'}"
     )
 
@@ -1913,6 +1925,12 @@ def _enqueue_bulk_send(payload: dict) -> None:
     if not db_storage.available:
         st.session_state.last_bulk_enqueue_result = "Database is required for background bulk sending."
         st.rerun()
+    publisher_id = (payload.get('publisher_id') or '').strip()
+    if not EMAIL_AVAILABLE or publisher_id not in email_sender.credentials:
+        st.session_state.last_bulk_enqueue_result = (
+            f"Bulk send cancelled: invalid selected publisher '{publisher_id or 'missing'}'."
+        )
+        st.rerun()
 
     invitation_type = payload.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     tracking_journal_name = payload.get('tracking_journal_name', '')
@@ -1931,7 +1949,7 @@ def _enqueue_bulk_send(payload: dict) -> None:
     job_id = db_storage.create_bulk_email_job(
         recipients=batch,
         invitation_type=invitation_type,
-        publisher_id=payload.get('publisher_id', 'brevo'),
+        publisher_id=publisher_id,
         journal_name=tracking_journal_name,
         template_id=payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER),
         template_strategy=payload.get('bulk_template_strategy', 'Use selected template'),
@@ -1976,6 +1994,7 @@ def _render_bulk_job_status(ui_scope: str) -> None:
         status = job.get('status') or ''
         label = (
             f"Job #{job.get('id')} | {status.title()} | "
+            f"{_publisher_display_label(job.get('publisher_id', ''))} | "
             f"{done}/{total} processed ({sent} sent, {failed} failed, {skipped} skipped)"
         )
         st.progress(min(progress, 1.0), text=label)
@@ -2575,13 +2594,19 @@ def display_results(filters, ui_scope: str):
         )
 
     with col_bulk:
+        selected_bulk_publisher_id = (filters.get('publisher') or '').strip()
+        selected_bulk_publisher_valid = EMAIL_AVAILABLE and selected_bulk_publisher_id in email_sender.credentials
         bulk_send_clicked = st.button(
             f"Queue Background Bulk ({int(batch_size)} emails)",
-            type="primary" if batch_size > 0 and EMAIL_AVAILABLE and db_storage.available else "secondary",
-            disabled=not (batch_size > 0 and EMAIL_AVAILABLE and db_storage.available),
+            type="primary" if batch_size > 0 and selected_bulk_publisher_valid and db_storage.available else "secondary",
+            disabled=not (batch_size > 0 and selected_bulk_publisher_valid and db_storage.available),
             use_container_width=True,
             key=_scope_key(ui_scope, f"bulk_send_{current_results_page}")
         )
+        if selected_bulk_publisher_valid:
+            st.caption(f"Sender: {_publisher_display_label(selected_bulk_publisher_id)}")
+        else:
+            st.warning("Select a valid publisher before bulk sending.")
     if not db_storage.available:
         st.warning("Background bulk sending is disabled because PostgreSQL is not connected.")
 
@@ -2590,7 +2615,7 @@ def display_results(filters, ui_scope: str):
             'batch': [dict(author) for author in eligible_bulk_authors[:int(batch_size)]],
             'invitation_type': invitation_type,
             'tracking_journal_name': tracking_journal_name,
-            'publisher_id': filters.get('publisher', 'brevo'),
+            'publisher_id': selected_bulk_publisher_id,
             'selected_bulk_template': selected_bulk_template,
             'bulk_template_strategy': bulk_template_strategy,
             'bulk_scopus_indexed': bulk_scopus_indexed,

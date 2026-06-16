@@ -114,12 +114,9 @@ class EmailSender:
             return json.load(f)
 
     def get_publishers(self) -> list:
-        """Get list of available publishers (Brevo only; Titan/external SMTP are hidden)."""
+        """Get list of available publisher sender identities."""
         result = []
         for key, val in self.credentials.items():
-            smtp = (val.get("smtp_server") or "").lower()
-            if "brevo" not in smtp:
-                continue
             primary_email = ""
             if "accounts" in val and len(val["accounts"]) > 0:
                 primary_email = val["accounts"][0]["email"]

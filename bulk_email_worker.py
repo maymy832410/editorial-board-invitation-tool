@@ -131,7 +131,11 @@ class BulkEmailWorker:
         ):
             raise DuplicateInvitationError("Already invited; skipped before sending")
 
-        publisher_id = job.get("publisher_id") or "brevo"
+        publisher_id = (job.get("publisher_id") or "").strip()
+        if not publisher_id:
+            raise ValueError("Bulk job has no selected publisher_id")
+        if publisher_id not in self.email_sender.credentials:
+            raise ValueError(f"Unknown selected publisher_id: {publisher_id}")
         journal_config = _parse_json(job.get("journal_config_json"), {})
         pub_info = PUBLISHER_INFO.get(publisher_id, {})
         publisher_name = pub_info.get("name") or self.email_sender.get_publisher_name(publisher_id)
