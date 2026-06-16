@@ -44,6 +44,7 @@ _PUBLICATION_PLACEHOLDERS = list(_COMMON_PLACEHOLDERS) + [
     "{journal_metrics}",
     "{invitation_goal_note}",
     "{journal_scope_note}",
+    "{journal_details_block}",
 ]
 
 TEMPLATES = {
@@ -207,7 +208,9 @@ On behalf of {journal_name} (ISSN: {journal_issn}), we are pleased to invite you
 
 Your research profile in {author_specialty} is highly relevant to the journal's readership.{author_recent_publications}
 
-{journal_name} welcomes original research, review papers, and other high-quality scholarly contributions. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+{journal_name} welcomes original research, review papers, and other high-quality scholarly contributions.
+
+{journal_details_block}
 
 Submission portal:
 {journal_submission_link}
@@ -238,7 +241,9 @@ Your research background in {author_specialty} appears to align closely with the
 
 {author_recent_publications}
 
-The journal is currently seeking high-quality original articles, review papers, and other scholarly contributions that can support meaningful discussion in the field. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+The journal is currently seeking high-quality original articles, review papers, and other scholarly contributions that can support meaningful discussion in the field.
+
+{journal_details_block}
 
 Submission portal:
 {journal_submission_link}
@@ -265,7 +270,9 @@ Website: {journal_link}"""
 
 On behalf of {journal_name} (ISSN: {journal_issn}), we are pleased to invite you to submit a manuscript for publication consideration.
 
-{journal_name} is committed to rigorous peer review, ethical publication practices, and international scholarly visibility. {journal_metrics}{invitation_goal_note}{journal_scope_note}
+{journal_name} is committed to rigorous peer review, ethical publication practices, and international scholarly visibility.
+
+{journal_details_block}
 
 Your work in {author_specialty} would be a strong fit for the journal's audience.{author_recent_publications}
 
@@ -335,6 +342,47 @@ def build_journal_metrics(
     if not details:
         return ""
     return "Journal details: " + "; ".join(details) + "."
+
+
+def _indexing_status_label(journal_indexing_status: str = "") -> str:
+    """Return a public-safe indexing status label."""
+    normalized = (journal_indexing_status or "").strip()
+    if normalized.lower() == "not indexed":
+        return "Indexed in Google Scholar, Scilit, Dimensions, Semantic Scholar, ISSN, and Crossref."
+    return _clean_sentence_note(normalized)
+
+
+def build_journal_details_block(
+    journal_cite_score: str = "",
+    journal_quartile: str = "",
+    journal_indexing_status: str = "",
+    invitation_goal: str = "",
+    journal_scope: str = "",
+) -> str:
+    """Build a structured publication details block."""
+    lines = ["Journal details:"]
+    metric_parts = []
+    if journal_cite_score:
+        metric_parts.append(f"CiteScore: {journal_cite_score}")
+    if journal_quartile:
+        metric_parts.append(f"Quartile: {journal_quartile}")
+
+    indexing_label = _indexing_status_label(journal_indexing_status)
+    if indexing_label:
+        metric_parts.append(indexing_label)
+
+    if metric_parts:
+        lines.append("; ".join(metric_parts))
+
+    invitation_goal_clean = _clean_sentence_note(invitation_goal)
+    if invitation_goal_clean:
+        lines.extend(["", "Current invitation focus:", invitation_goal_clean])
+
+    journal_scope_clean = _clean_sentence_note(journal_scope)
+    if journal_scope_clean:
+        lines.extend(["", "Scope note:", journal_scope_clean])
+
+    return "\n".join(lines)
 
 
 def _clean_sentence_note(value: str) -> str:
@@ -407,6 +455,13 @@ def format_template(
         journal_quartile=journal_quartile,
         journal_indexing_status=journal_indexing_status,
     )
+    journal_details_block = build_journal_details_block(
+        journal_cite_score=journal_cite_score,
+        journal_quartile=journal_quartile,
+        journal_indexing_status=journal_indexing_status,
+        invitation_goal=invitation_goal,
+        journal_scope=journal_scope,
+    )
     invitation_goal_clean = _clean_sentence_note(invitation_goal)
     journal_scope_clean = _clean_sentence_note(journal_scope)
     invitation_goal_note = (
@@ -434,6 +489,7 @@ def format_template(
         "{journal_metrics}": journal_metrics,
         "{invitation_goal_note}": invitation_goal_note,
         "{journal_scope_note}": journal_scope_note,
+        "{journal_details_block}": journal_details_block,
     }
 
     invitation_type = _template_invitation_type(template_id)

@@ -728,6 +728,9 @@ class EmailSender:
                 or lower.startswith("submission link")
                 or lower.startswith("submission portal")
                 or lower.startswith("journal website")
+                or lower.startswith("journal details")
+                or lower.startswith("current invitation focus")
+                or lower.startswith("scope note")
                 or lower.startswith("email:")
                 or "recent publications such as" in lower
             )
@@ -757,6 +760,9 @@ class EmailSender:
             paragraph = re.sub(r"(https?://[^\s<]+)", r'<a href="\1" target="_blank" style="color:#0f3a6d; text-decoration:underline;">\1</a>', paragraph)
             paragraph = paragraph.replace("Submission portal: ", "Submission portal:<br>")
             paragraph = paragraph.replace("Journal website: ", "Journal website:<br>")
+            paragraph = paragraph.replace("Journal details: ", "Journal details:<br>")
+            paragraph = paragraph.replace("Current invitation focus: ", "Current invitation focus:<br>")
+            paragraph = paragraph.replace("Scope note: ", "Scope note:<br>")
             paragraph = paragraph.replace(" Email:", "<br>Email:")
             paragraph = paragraph.replace(" Website:", "<br>Website:")
             html_blocks.append(
