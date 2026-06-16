@@ -41,12 +41,24 @@ class BulkEmailWorker:
     def __init__(self) -> None:
         self.storage = get_storage()
         self.email_sender = EmailSender()
+        self._idle_ticks = 0
 
     def process_next(self) -> bool:
         """Process one queued recipient. Returns True when work was attempted."""
         claimed = self.storage.claim_next_bulk_email_recipient()
         if not claimed:
+            self._idle_ticks += 1
+            if self._idle_ticks == 1 or self._idle_ticks % 12 == 0:
+                summary = self.storage.get_bulk_email_queue_summary()
+                print(
+                    "[bulk-email] idle "
+                    f"active_jobs={summary.get('active_jobs')} "
+                    f"pending={summary.get('pending_recipients')} "
+                    f"sending={summary.get('sending_recipients')}",
+                    flush=True,
+                )
             return False
+        self._idle_ticks = 0
 
         job = claimed.get("job") or {}
         recipient = claimed.get("recipient") or {}

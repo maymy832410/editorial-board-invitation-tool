@@ -1752,6 +1752,42 @@ class PostgresStorage:
             print(f"PostgreSQL get recent bulk email jobs error: {e}")
             return []
 
+    def get_bulk_email_queue_summary(self) -> Dict[str, int]:
+        """Return compact queue counts for worker diagnostics."""
+        summary = {"active_jobs": 0, "pending_recipients": 0, "sending_recipients": 0}
+        if not self.available:
+            return summary
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) AS cnt
+                    FROM {self.BULK_EMAIL_JOBS_TABLE}
+                    WHERE status IN (%s, %s) AND NOT cancel_requested;
+                    """,
+                    (BULK_JOB_STATUS_QUEUED, BULK_JOB_STATUS_RUNNING),
+                )
+                row = cur.fetchone() or {}
+                summary["active_jobs"] = int(row.get("cnt") or 0)
+                cur.execute(
+                    f"""
+                    SELECT status, COUNT(*) AS cnt
+                    FROM {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    WHERE status IN (%s, %s)
+                    GROUP BY status;
+                    """,
+                    (BULK_RECIPIENT_STATUS_PENDING, BULK_RECIPIENT_STATUS_SENDING),
+                )
+                for row in cur.fetchall():
+                    if row.get("status") == BULK_RECIPIENT_STATUS_PENDING:
+                        summary["pending_recipients"] = int(row.get("cnt") or 0)
+                    if row.get("status") == BULK_RECIPIENT_STATUS_SENDING:
+                        summary["sending_recipients"] = int(row.get("cnt") or 0)
+            return summary
+        except Exception as e:
+            print(f"PostgreSQL bulk email queue summary error: {e}")
+            return summary
+
     def cancel_bulk_email_job(self, job_id: int) -> bool:
         """Cancel a queued/running bulk email job and skip pending recipients."""
         if not self.available:
