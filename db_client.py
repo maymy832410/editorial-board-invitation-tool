@@ -150,6 +150,7 @@ class PostgresStorage:
     COLLECTION_DAILY_STATS_TABLE = "collection_daily_stats"
     BULK_EMAIL_JOBS_TABLE = "bulk_email_jobs"
     BULK_EMAIL_RECIPIENTS_TABLE = "bulk_email_recipients"
+    JOURNAL_PRESETS_TABLE = "journal_presets"
 
     def __init__(self):
         self.available = False
@@ -295,6 +296,156 @@ class PostgresStorage:
             """)
             self._ensure_collection_tables(cur)
             self._ensure_bulk_email_tables(cur)
+            self._ensure_journal_preset_tables(cur)
+
+    def _ensure_journal_preset_tables(self, cur):
+        """Create tables for saved journal invitation presets."""
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.JOURNAL_PRESETS_TABLE} (
+                id                  SERIAL PRIMARY KEY,
+                preset_name         TEXT NOT NULL UNIQUE,
+                publisher_id        TEXT DEFAULT '',
+                journal_config_json TEXT DEFAULT '{{}}',
+                created_at          TIMESTAMPTZ DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        cur.execute(f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_presets_name_unique
+            ON {self.JOURNAL_PRESETS_TABLE} (LOWER(preset_name));
+        """)
+
+    def _decode_journal_preset_row(self, row) -> Dict[str, Any]:
+        """Decode a journal preset row from PostgreSQL into app-friendly data."""
+        preset = dict(row)
+        raw_config = preset.pop("journal_config_json", "") or "{}"
+        try:
+            preset["journal_config"] = json.loads(raw_config)
+        except (TypeError, json.JSONDecodeError):
+            preset["journal_config"] = {}
+        return preset
+
+    def list_journal_presets(self) -> List[Dict[str, Any]]:
+        """Return saved journal presets ordered by name."""
+        if not self.available:
+            return []
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, preset_name, publisher_id, journal_config_json, created_at, updated_at
+                    FROM {self.JOURNAL_PRESETS_TABLE}
+                    ORDER BY LOWER(preset_name), id;
+                    """
+                )
+                return [self._decode_journal_preset_row(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL list journal presets error: {e}")
+            return []
+
+    def get_journal_preset(self, preset_id: int) -> Optional[Dict[str, Any]]:
+        """Return one saved journal preset by id."""
+        if not self.available:
+            return None
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, preset_name, publisher_id, journal_config_json, created_at, updated_at
+                    FROM {self.JOURNAL_PRESETS_TABLE}
+                    WHERE id = %s;
+                    """,
+                    (int(preset_id),),
+                )
+                row = cur.fetchone()
+                return self._decode_journal_preset_row(row) if row else None
+        except Exception as e:
+            print(f"PostgreSQL get journal preset error: {e}")
+            return None
+
+    def create_journal_preset(
+        self,
+        preset_name: str,
+        publisher_id: str,
+        journal_config: Dict[str, Any],
+    ) -> Optional[int]:
+        """Create a reusable journal preset and return its id."""
+        if not self.available:
+            return None
+        clean_name = _normalize_text(preset_name)
+        if not clean_name:
+            return None
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.JOURNAL_PRESETS_TABLE}
+                        (preset_name, publisher_id, journal_config_json, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    RETURNING id;
+                    """,
+                    (
+                        clean_name,
+                        _normalize_text(publisher_id),
+                        json.dumps(journal_config or {}, ensure_ascii=False),
+                    ),
+                )
+                row = cur.fetchone()
+                return int(row["id"]) if row else None
+        except Exception as e:
+            print(f"PostgreSQL create journal preset error: {e}")
+            return None
+
+    def update_journal_preset(
+        self,
+        preset_id: int,
+        preset_name: str,
+        publisher_id: str,
+        journal_config: Dict[str, Any],
+    ) -> bool:
+        """Update an existing reusable journal preset."""
+        if not self.available:
+            return False
+        clean_name = _normalize_text(preset_name)
+        if not clean_name:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.JOURNAL_PRESETS_TABLE}
+                    SET preset_name = %s,
+                        publisher_id = %s,
+                        journal_config_json = %s,
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        clean_name,
+                        _normalize_text(publisher_id),
+                        json.dumps(journal_config or {}, ensure_ascii=False),
+                        int(preset_id),
+                    ),
+                )
+                return cur.rowcount > 0
+        except Exception as e:
+            print(f"PostgreSQL update journal preset error: {e}")
+            return False
+
+    def delete_journal_preset(self, preset_id: int) -> bool:
+        """Delete a reusable journal preset."""
+        if not self.available:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self.JOURNAL_PRESETS_TABLE} WHERE id = %s;",
+                    (int(preset_id),),
+                )
+                return cur.rowcount > 0
+        except Exception as e:
+            print(f"PostgreSQL delete journal preset error: {e}")
+            return False
 
     def _ensure_collection_tables(self, cur):
         """Create tables for the background email-collection service."""

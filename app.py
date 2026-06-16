@@ -45,6 +45,7 @@ from db_client import (
     BULK_JOB_STATUS_QUEUED,
     BULK_JOB_STATUS_RUNNING,
 )
+from journal_presets import normalize_journal_preset_config
 
 WORKFLOW_AUTHOR = "author"
 WORKFLOW_EDITORIAL = "editorial"
@@ -52,6 +53,10 @@ WORKFLOW_EDITORIAL = "editorial"
 AUTHOR_SOURCE_OPENALEX = "openalex"
 AUTHOR_SOURCE_DATABASE = "database"
 AUTHOR_SOURCE_BOTH = "both"
+
+QUARTILE_OPTIONS = ["", "Q1", "Q2", "Q3", "Q4"]
+INDEXING_OPTIONS = ["", "Not indexed", "Scopus", "Web of Science", "DOAJ", "Other"]
+INVITATION_GOAL_OPTIONS = ["Regular submission", "Special issue", "Review article", "Fast-track consideration"]
 
 
 # Page config
@@ -122,6 +127,38 @@ if 'edited_email' not in st.session_state:
 def save_state():
     """Save current state to file."""
     state_mgr.save_state(st.session_state.app_state)
+
+
+def _current_journal_preset_config() -> dict:
+    """Return the current journal config restricted to preset-supported fields."""
+    return normalize_journal_preset_config(st.session_state.app_state.get('journal_config', {}))
+
+
+def _sync_journal_preset_widget_state(config: dict) -> None:
+    """Prime sidebar widgets with a loaded journal preset before they render."""
+    normalized = normalize_journal_preset_config(config)
+    widget_keys = {
+        "name": "journal_name",
+        "issn": "journal_issn",
+        "link": "journal_link",
+        "location": "publisher_location",
+        "editor_in_chief": "editor_name",
+        "submission_link": "journal_submission_link",
+        "cite_score": "journal_cite_score",
+        "quartile": "journal_quartile",
+        "indexing_status": "journal_indexing_status",
+        "invitation_goal": "journal_invitation_goal",
+        "scope": "journal_scope",
+    }
+    normalized["quartile"] = normalized["quartile"] if normalized["quartile"] in QUARTILE_OPTIONS else ""
+    normalized["indexing_status"] = normalized["indexing_status"] if normalized["indexing_status"] in INDEXING_OPTIONS else "Other"
+    normalized["invitation_goal"] = (
+        normalized["invitation_goal"]
+        if normalized["invitation_goal"] in INVITATION_GOAL_OPTIONS
+        else "Regular submission"
+    )
+    for field, key in widget_keys.items():
+        st.session_state[key] = normalized.get(field, "")
 
 
 def _safe_select_index(options, value, default=0):
@@ -1207,14 +1244,110 @@ def render_sidebar():
                 st.caption(f"Error: {db_status['error'][:50]}...")
         
         st.divider()
+
+        publisher_options = {}
+        if EMAIL_AVAILABLE:
+            publishers = email_sender.get_publishers()
+            publisher_options = {p['id']: f"{p['name']}" for p in publishers}
+
+        # Saved Journal Presets
+        st.subheader("Saved Journal Presets")
+        if not db_storage.available:
+            st.info("Journal presets require PostgreSQL. Current draft fields still work for this session.")
+        else:
+            st.caption("Load a saved setup, or edit the fields below and save/update it here.")
+            presets = db_storage.list_journal_presets()
+            preset_labels = {
+                str(preset.get("id")): preset.get("preset_name", f"Preset {preset.get('id')}")
+                for preset in presets
+            }
+            preset_by_id = {str(preset.get("id")): preset for preset in presets}
+            selected_preset_id = st.selectbox(
+                "Load saved preset",
+                options=[""] + list(preset_labels.keys()),
+                format_func=lambda value: "Select preset" if not value else preset_labels.get(value, value),
+                key="journal_preset_select",
+            )
+            selected_preset = preset_by_id.get(selected_preset_id)
+            if selected_preset and st.session_state.get("journal_preset_name_source") != selected_preset_id:
+                st.session_state["journal_preset_name"] = selected_preset.get("preset_name", "")
+                st.session_state["journal_preset_name_source"] = selected_preset_id
+
+            preset_name = st.text_input(
+                "Preset name",
+                placeholder="e.g., Babylonian Journal of Internet of Things",
+                key="journal_preset_name",
+            ).strip()
+
+            col_load, col_save = st.columns(2)
+            with col_load:
+                load_clicked = st.button("Load", use_container_width=True, disabled=not bool(selected_preset))
+            with col_save:
+                save_clicked = st.button("Save as new", use_container_width=True, disabled=not bool(preset_name))
+
+            col_update, col_delete = st.columns(2)
+            with col_update:
+                update_clicked = st.button(
+                    "Update selected",
+                    use_container_width=True,
+                    disabled=not (bool(selected_preset) and bool(preset_name)),
+                )
+            with col_delete:
+                delete_clicked = st.button("Delete selected", use_container_width=True, disabled=not bool(selected_preset))
+
+            if load_clicked and selected_preset:
+                loaded_config = normalize_journal_preset_config(selected_preset.get("journal_config", {}))
+                loaded_publisher = (selected_preset.get("publisher_id") or "").strip()
+                if publisher_options and loaded_publisher not in publisher_options:
+                    st.warning("Preset loaded, but its saved publisher is not configured in this app.")
+                elif loaded_publisher:
+                    st.session_state.app_state["publisher"] = loaded_publisher
+                    st.session_state["publisher_select"] = loaded_publisher
+                st.session_state.app_state["journal_config"] = loaded_config
+                _sync_journal_preset_widget_state(loaded_config)
+                save_state()
+                st.success(f"Loaded preset: {selected_preset.get('preset_name')}")
+                st.rerun()
+
+            if save_clicked:
+                new_id = db_storage.create_journal_preset(
+                    preset_name=preset_name,
+                    publisher_id=st.session_state.app_state.get("publisher", "brevo"),
+                    journal_config=_current_journal_preset_config(),
+                )
+                if new_id:
+                    st.success("Preset saved.")
+                    st.rerun()
+                else:
+                    st.error("Could not save preset. Check that the name is unique.")
+
+            if update_clicked and selected_preset:
+                updated = db_storage.update_journal_preset(
+                    preset_id=int(selected_preset["id"]),
+                    preset_name=preset_name,
+                    publisher_id=st.session_state.app_state.get("publisher", "brevo"),
+                    journal_config=_current_journal_preset_config(),
+                )
+                if updated:
+                    st.success("Preset updated.")
+                    st.rerun()
+                else:
+                    st.error("Could not update preset. Check that the name is unique.")
+
+            if delete_clicked and selected_preset:
+                deleted = db_storage.delete_journal_preset(int(selected_preset["id"]))
+                if deleted:
+                    st.success("Preset deleted.")
+                    st.rerun()
+                else:
+                    st.error("Could not delete preset.")
+
+        st.divider()
         
         # Publisher Selection
         st.subheader("Publisher")
         
         if EMAIL_AVAILABLE:
-            publishers = email_sender.get_publishers()
-            publisher_options = {p['id']: f"{p['name']}" for p in publishers}
-            
             current_publisher = st.session_state.app_state.get('publisher', 'brevo')
             if publisher_options and current_publisher not in publisher_options:
                 current_publisher = list(publisher_options.keys())[0]
@@ -1341,27 +1474,24 @@ def render_sidebar():
                 key="journal_cite_score"
             )
         with col_metric2:
-            quartile_options = ["", "Q1", "Q2", "Q3", "Q4"]
             quartile = st.selectbox(
                 "Quartile",
-                options=quartile_options,
-                index=_safe_select_index(quartile_options, journal_config.get('quartile', '')),
+                options=QUARTILE_OPTIONS,
+                index=_safe_select_index(QUARTILE_OPTIONS, journal_config.get('quartile', '')),
                 key="journal_quartile"
             )
 
-        indexing_options = ["", "Not indexed", "Scopus", "Web of Science", "DOAJ", "Other"]
         indexing_status = st.selectbox(
             "Indexing Status",
-            options=indexing_options,
-            index=_safe_select_index(indexing_options, journal_config.get('indexing_status', '')),
+            options=INDEXING_OPTIONS,
+            index=_safe_select_index(INDEXING_OPTIONS, journal_config.get('indexing_status', '')),
             key="journal_indexing_status"
         )
 
-        goal_options = ["Regular submission", "Special issue", "Review article", "Fast-track consideration"]
         invitation_goal = st.selectbox(
             "Invitation Goal",
-            options=goal_options,
-            index=_safe_select_index(goal_options, journal_config.get('invitation_goal', 'Regular submission')),
+            options=INVITATION_GOAL_OPTIONS,
+            index=_safe_select_index(INVITATION_GOAL_OPTIONS, journal_config.get('invitation_goal', 'Regular submission')),
             key="journal_invitation_goal"
         )
 
