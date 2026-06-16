@@ -20,6 +20,7 @@ from openalex_client import OpenAlexClient, OpenAlexRequestError
 from orcid_async import fetch_emails_async
 from openai_email_async import AsyncOpenAIEmailClient
 from progress_manager import StateManager
+from author_filters import author_matches_any_specialty, dedupe_authors
 from bulk_email_jobs import prepare_bulk_recipients
 from bulk_email_worker import BulkEmailWorker
 from disciplines import ALL_DISCIPLINES
@@ -2353,24 +2354,32 @@ def display_results(filters, ui_scope: str):
         )
     
     with col_f2:
-        # Specialty filter (single select with search)
-        selected_specialty = st.selectbox(
+        previous_specialties_key = _scope_key(ui_scope, "specialty_filter_multi_previous")
+        selected_specialties = st.multiselect(
             "Filter by Specialty",
-            options=["All Specialties"] + sorted(all_specialties),
-            key=_scope_key(ui_scope, "specialty_filter"),
-            help="Select a specific research topic"
+            options=sorted(all_specialties),
+            default=[],
+            key=_scope_key(ui_scope, "specialty_filter_multi"),
+            help="Type to search, then select one or more research topics."
         )
+        selected_specialty_signature = tuple(sorted(selected_specialties))
+        if st.session_state.get(previous_specialties_key) != selected_specialty_signature:
+            st.session_state[_scope_key(ui_scope, "results_page")] = 0
+            st.session_state[previous_specialties_key] = selected_specialty_signature
     
     # Apply discipline filter
     if selected_disciplines:
         filtered = [r for r in filtered if r.get('discipline') in selected_disciplines]
     
     # Apply specialty filter
-    if selected_specialty != "All Specialties":
-        filtered = [
-            r for r in filtered 
-            if selected_specialty in (r.get('all_topics') or []) or r.get('specialty') == selected_specialty
-        ]
+    matched_before_other_filters = len(filtered)
+    if selected_specialties:
+        filtered = [r for r in filtered if author_matches_any_specialty(r, selected_specialties)]
+        matched_before_other_filters = len(filtered)
+    st.caption(
+        f"Selected specialties: {len(selected_specialties):,} | "
+        f"Matched before other filters: {matched_before_other_filters:,}"
+    )
     
     # Country exclusion post-filter (supplements API-level exclusion)
     all_countries = sorted({r.get('country') for r in results if r.get('country')})
@@ -2461,6 +2470,12 @@ def display_results(filters, ui_scope: str):
         filtered = [r for r in filtered if not r.get('is_retracted')]
         if retracted_in_scope:
             st.caption(f"Hidden retracted authors: {retracted_in_scope:,}")
+
+    before_dedupe_count = len(filtered)
+    filtered = dedupe_authors(filtered)
+    removed_duplicates = before_dedupe_count - len(filtered)
+    if removed_duplicates:
+        st.caption(f"Removed duplicate authors from filtered results: {removed_duplicates:,}")
     
     # Store filtered list in session state for email fetching
     st.session_state[_scope_key(ui_scope, "filtered_authors")] = filtered
