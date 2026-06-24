@@ -117,11 +117,11 @@ async def lifespan(app: FastAPI):
 def _start_bulk_daemon(db: PostgresStorage, sender: EmailSender):
     """Start the bulk email processing daemon in a background thread."""
     def _daemon_loop():
-        worker = BulkEmailWorker(storage=db, email_sender=sender)
+        worker = BulkEmailWorker()  # Creates its own storage and sender
         while True:
             try:
                 result = worker.process_next()
-                if result is None:
+                if result is None or result is False:
                     time.sleep(5)  # idle
                 else:
                     time.sleep(2)  # between sends
