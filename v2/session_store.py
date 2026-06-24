@@ -50,16 +50,29 @@ def ensure_session_table():
         return
     try:
         with conn.cursor() as cur:
+            # Check if table already exists
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    data JSONB DEFAULT '{}'
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'user_sessions'
                 );
-                CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
-                    ON user_sessions(updated_at);
             """)
+            exists = cur.fetchone()[0]
+            if not exists:
+                cur.execute("""
+                    CREATE TABLE user_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        data JSONB DEFAULT '{}'
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX idx_sessions_updated_at
+                        ON user_sessions(updated_at);
+                """)
+    except Exception as e:
+        print(f"Warning: ensure_session_table error (may be harmless): {e}")
     finally:
         conn.close()
 
