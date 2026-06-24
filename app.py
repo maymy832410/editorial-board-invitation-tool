@@ -2124,7 +2124,6 @@ def render_search_section(filters, ui_scope: str):
         placeholder="Type to filter by name, email, affiliation, country, ORCID, discipline, or specialty...",
         key=search_results_key,
         help="Filters the currently displayed authors by matching text against multiple fields.",
-        label_visibility="collapsed"
     ).strip().lower()
     if search_query:
         st.caption(f"Searching for: **{search_query}**")
@@ -2590,14 +2589,14 @@ def display_results(filters, ui_scope: str):
     else:
         results = openalex_results
     
+    empty_results_message = ""
     if not results:
         if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
-            st.info("No database email records match the current search and filters.")
+            empty_results_message = "No database email records match the current search and filters."
         elif db_search_active:
-            st.info("No database email records match the current search and filters.")
+            empty_results_message = "No database email records match the current search and filters."
         else:
-            st.info("No results yet. Use the search button above.")
-        return
+            empty_results_message = "No results yet. Use the search button above."
 
     if is_author_workflow and (author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH} or db_search_active):
         db_count = len(db_source_results)
@@ -2871,6 +2870,16 @@ def display_results(filters, ui_scope: str):
         if excluded_display:
             excluded_codes = {opt.split("(")[-1].rstrip(")") for opt in excluded_display}
             filtered = [r for r in filtered if r.get('country') not in excluded_codes]
+    else:
+        st.multiselect(
+            "Exclude Countries (post-filter)",
+            options=[],
+            default=[],
+            key=_scope_key(ui_scope, "exclude_countries_postfilter"),
+            help="Exclude authors from these countries in the results below",
+            disabled=True,
+        )
+        st.caption("Load or search authors to populate country filter options.")
 
     # Scientific-domain targeting filters (for example Computer Science, Biology).
     selected_domain_labels: list[str] = []
@@ -2893,6 +2902,27 @@ def display_results(filters, ui_scope: str):
                 key=_scope_key(ui_scope, "exclude_author_domains_filter"),
                 help="Hide authors whose scientific domains match the selected values."
             )
+    else:
+        col_domain1, col_domain2 = st.columns(2)
+        with col_domain1:
+            st.multiselect(
+                "Include Author Domains",
+                options=[],
+                default=[],
+                key=_scope_key(ui_scope, "include_author_domains_filter"),
+                help="Show only authors whose scientific domains match the selected values.",
+                disabled=True,
+            )
+        with col_domain2:
+            st.multiselect(
+                "Exclude Author Domains",
+                options=[],
+                default=[],
+                key=_scope_key(ui_scope, "exclude_author_domains_filter"),
+                help="Hide authors whose scientific domains match the selected values.",
+                disabled=True,
+            )
+        st.caption("Load or search authors to populate author domain filter options.")
 
     selected_domain_lookup = {label.lower() for label in selected_domain_labels}
     if selected_domain_lookup:
@@ -3021,7 +3051,7 @@ def display_results(filters, ui_scope: str):
     st.subheader(f"Authors ({len(filtered)})")
 
     if not filtered:
-        st.info("No authors match the current filters.")
+        st.info(empty_results_message or "No authors match the current filters.")
         return
 
     invitation_counts: dict[str, int] = {}
