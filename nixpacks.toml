@@ -6,4 +6,4 @@ dependsOn = ["setup"]
 cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "cd v2 && uvicorn app:app --host 0.0.0.0 --port $PORT --workers 2"
+cmd = "cd v2 && uvicorn app:app --host 0.0.0.0 --port $PORT"
