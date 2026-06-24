@@ -2980,10 +2980,42 @@ def display_results(filters, ui_scope: str):
         st.metric(f"Sent ({_invitation_type_label(invitation_type)})", sent_count)
     
     st.divider()
-    
+
+    # Text search filter within results
+    search_results_key = _scope_key(ui_scope, "search_results_text")
+    search_query = st.text_input(
+        "Search within results",
+        placeholder="Type to filter by name, email, affiliation, country, ORCID, discipline, or specialty...",
+        key=search_results_key,
+        help="Filters the currently displayed authors by matching text against multiple fields."
+    ).strip().lower()
+
+    if search_query:
+        filtered = [
+            r for r in filtered
+            if any(
+                search_query in str(value).lower()
+                for value in [
+                    r.get('name', ''),
+                    r.get('email', ''),
+                    r.get('all_emails', ''),
+                    r.get('institution', ''),
+                    r.get('country', ''),
+                    r.get('orcid_id', ''),
+                    r.get('author_id', ''),
+                    r.get('discipline', ''),
+                    r.get('specialty', ''),
+                    r.get('research_areas', ''),
+                    r.get('subfield', ''),
+                ]
+                if value
+            )
+        ]
+        st.caption(f"{len(filtered)} authors match '{search_query}'")
+
     # Results table with Send buttons
     st.subheader(f"Authors ({len(filtered)})")
-    
+
     if not filtered:
         st.info("No authors match the current filters.")
         return
