@@ -28,12 +28,16 @@ def check_database_query_contract() -> None:
     _assert("institution" in method, "database search must include affiliation/institution")
     _assert("EMAIL_SUPPRESSIONS_TABLE" in method, "database search must respect suppressions")
     _assert("LOWER(COALESCE" in method, "database search must support text matching across fields")
+    _assert("requested_limit = max(0" in method, "database search should allow uncapped results with limit=0")
+    _assert("min(int(limit or 500), 5000)" not in method, "database search must not enforce the old 5000-row cap")
 
 
 def check_app_wiring_contract() -> None:
     source = _read("app.py")
     _assert("render_database_email_search_panel" in source, "Author Invitation should render a dedicated database search panel")
     _assert("Database Email Search" in source, "UI should expose database email search with a visible heading")
+    _assert("Database email search is uncapped" in source, "database search UI should explain that results are uncapped")
+    _assert("database_email_search_limit" not in source, "database search UI should not expose the old 5000-row limit")
     _assert('"Search within results"' in source, "shared text search should be visible in invitation tabs")
     _assert("empty_results_message" in source, "empty result messaging should not return before filters render")
     _assert("Load or search authors to populate country filter options." in source, "country filter should render empty state")

@@ -1348,7 +1348,7 @@ class PostgresStorage:
         self,
         query: str = "",
         source: str = "all",
-        limit: int = 500,
+        limit: int = 0,
         require_email: bool = True,
         hide_suppressed: bool = True,
     ) -> List[Dict[str, Any]]:
@@ -1356,7 +1356,8 @@ class PostgresStorage:
         if not self.available:
             return []
 
-        safe_limit = max(1, min(int(limit or 500), 5000))
+        requested_limit = max(0, int(limit or 0))
+        limit_clause = " LIMIT %s" if requested_limit > 0 else ""
         normalized_source = (source or "all").strip().lower()
         if normalized_source not in {"all", "profiles", "harvested"}:
             normalized_source = "all"
@@ -1394,6 +1395,9 @@ class PostgresStorage:
                         "publisher",
                         "source",
                     ]
+                    profile_params = [bool(require_email), *_term_params(profile_columns), bool(hide_suppressed)]
+                    if requested_limit > 0:
+                        profile_params.append(requested_limit)
                     cur.execute(
                         f"""
                         SELECT
@@ -1437,14 +1441,14 @@ class PostgresStorage:
                               )
                           )
                         ORDER BY updated_at DESC
-                        LIMIT %s;
+                        {limit_clause};
                         """,
-                        [bool(require_email), *_term_params(profile_columns), bool(hide_suppressed), safe_limit],
+                        profile_params,
                     )
                     rows.extend(dict(row) for row in cur.fetchall())
 
-                remaining = safe_limit - len(rows)
-                if remaining > 0 and normalized_source in {"all", "harvested"}:
+                remaining = max(requested_limit - len(rows), 0) if requested_limit > 0 else 0
+                if (requested_limit == 0 or remaining > 0) and normalized_source in {"all", "harvested"}:
                     harvested_columns = [
                         "openalex_id",
                         "orcid_id",
@@ -1459,6 +1463,10 @@ class PostgresStorage:
                         "research_areas",
                         "all_topics_json",
                     ]
+                    harvested_limit_clause = " LIMIT %s" if requested_limit > 0 else ""
+                    harvested_params = [bool(require_email), *_term_params(harvested_columns), bool(hide_suppressed)]
+                    if requested_limit > 0:
+                        harvested_params.append(remaining)
                     cur.execute(
                         f"""
                         SELECT
@@ -1501,12 +1509,12 @@ class PostgresStorage:
                               )
                           )
                         ORDER BY updated_at DESC
-                        LIMIT %s;
+                        {harvested_limit_clause};
                         """,
-                        [bool(require_email), *_term_params(harvested_columns), bool(hide_suppressed), remaining],
+                        harvested_params,
                     )
                     rows.extend(dict(row) for row in cur.fetchall())
-            return rows[:safe_limit]
+            return rows[:requested_limit] if requested_limit > 0 else rows
         except Exception as e:
             print(f"PostgreSQL search database email recipients error: {e}")
             return []

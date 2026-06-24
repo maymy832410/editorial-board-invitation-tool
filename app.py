@@ -2001,7 +2001,6 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_PUBLICATION)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
     sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
-    db_source_limit = int(filters.get('max_results', DEFAULT_MAX_RESULTS))
     panel_state = {
         'results': [],
         'total': 0,
@@ -2017,7 +2016,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
         st.warning("Database email search requires PostgreSQL.")
         return panel_state
 
-    db_search_cols = st.columns([2.2, 1.2, 1, 1, 1])
+    db_search_cols = st.columns([2.4, 1.2, 1, 1, 1])
     with db_search_cols[0]:
         db_search_query = st.text_input(
             "Search database emails",
@@ -2049,20 +2048,12 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
             value=True,
             key=_scope_key(ui_scope, "database_email_hide_sent"),
         )
-
-    db_source_limit = st.number_input(
-        "Database search result limit",
-        min_value=25,
-        max_value=5000,
-        value=max(25, min(db_source_limit, 5000)),
-        step=25,
-        key=_scope_key(ui_scope, "database_email_search_limit"),
-    )
+    st.caption("Database email search is uncapped and returns all matching stored email records.")
 
     db_source_results = _search_database_email_rows(
         query=db_search_query,
         source=db_search_source,
-        limit=int(db_source_limit),
+        limit=0,
         require_email=db_require_email,
         hide_suppressed=db_hide_suppressed,
     )
