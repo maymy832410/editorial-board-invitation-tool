@@ -2117,6 +2117,18 @@ def render_search_section(filters, ui_scope: str):
     if is_author_workflow:
         st.caption(f"Source mode: {_author_source_label(author_source_mode)}")
 
+    # Text search filter — visible immediately for finding specific authors
+    search_results_key = _scope_key(ui_scope, "search_results_text")
+    search_query = st.text_input(
+        "Search within results",
+        placeholder="Type to filter by name, email, affiliation, country, ORCID, discipline, or specialty...",
+        key=search_results_key,
+        help="Filters the currently displayed authors by matching text against multiple fields.",
+        label_visibility="collapsed"
+    ).strip().lower()
+    if search_query:
+        st.caption(f"Searching for: **{search_query}**")
+
     if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
         search_button_label = "Load Database Authors"
     elif is_author_workflow and author_source_mode == AUTHOR_SOURCE_BOTH:
@@ -2688,6 +2700,30 @@ def display_results(filters, ui_scope: str):
     
     filtered = results.copy()
 
+    # Apply text search filter from top-of-page search input
+    active_search_query = st.session_state.get(_scope_key(ui_scope, "search_results_text"), '').strip().lower()
+    if active_search_query:
+        filtered = [
+            r for r in filtered
+            if any(
+                active_search_query in str(value).lower()
+                for value in [
+                    r.get('name', ''),
+                    r.get('email', ''),
+                    r.get('all_emails', ''),
+                    r.get('institution', ''),
+                    r.get('country', ''),
+                    r.get('orcid_id', ''),
+                    r.get('author_id', ''),
+                    r.get('discipline', ''),
+                    r.get('specialty', ''),
+                    r.get('research_areas', ''),
+                    r.get('subfield', ''),
+                ]
+                if value
+            )
+        ]
+
     # Reuse known database emails so invitations can be sent without refetching.
     if _hydrate_result_emails_from_db(filtered):
         if show_openalex_batch_controls:
@@ -2980,38 +3016,6 @@ def display_results(filters, ui_scope: str):
         st.metric(f"Sent ({_invitation_type_label(invitation_type)})", sent_count)
     
     st.divider()
-
-    # Text search filter within results
-    search_results_key = _scope_key(ui_scope, "search_results_text")
-    search_query = st.text_input(
-        "Search within results",
-        placeholder="Type to filter by name, email, affiliation, country, ORCID, discipline, or specialty...",
-        key=search_results_key,
-        help="Filters the currently displayed authors by matching text against multiple fields."
-    ).strip().lower()
-
-    if search_query:
-        filtered = [
-            r for r in filtered
-            if any(
-                search_query in str(value).lower()
-                for value in [
-                    r.get('name', ''),
-                    r.get('email', ''),
-                    r.get('all_emails', ''),
-                    r.get('institution', ''),
-                    r.get('country', ''),
-                    r.get('orcid_id', ''),
-                    r.get('author_id', ''),
-                    r.get('discipline', ''),
-                    r.get('specialty', ''),
-                    r.get('research_areas', ''),
-                    r.get('subfield', ''),
-                ]
-                if value
-            )
-        ]
-        st.caption(f"{len(filtered)} authors match '{search_query}'")
 
     # Results table with Send buttons
     st.subheader(f"Authors ({len(filtered)})")
