@@ -1,0 +1,209 @@
+<!-- Invitation email composition dialog -->
+<div class="modal-overlay" @click.self="$store.app.closeModal()">
+    <div class="modal-dialog modal-large">
+        <div class="modal-header">
+            <h2>📧 Send {{ 'Publication' if invitation_type == 'publication' else 'Editorial' }} Invitation</h2>
+            <button class="modal-close" @click="$store.app.closeModal()">×</button>
+        </div>
+
+        <div class="modal-body" x-data="{
+            templateId: '{{ template_names.keys()|list|first if template_names else '' }}',
+            toEmail: '{{ author.email or '' }}',
+            subject: '{{ subject|e }}',
+            body: '{{ body|e }}',
+            attachPdf: false,
+            mentionPubs: false,
+            scopusIndexed: false,
+            confirmResend: false,
+            showPubs: false,
+            sending: false,
+
+            async sendInvitation() {
+                this.sending = true;
+                const formData = new FormData();
+                formData.append('invitation_type', '{{ invitation_type }}');
+                formData.append('template_id', this.templateId);
+                formData.append('to_email', this.toEmail);
+                formData.append('subject', this.subject);
+                formData.append('body', this.body);
+                formData.append('attach_pdf', this.attachPdf ? 'true' : 'false');
+                formData.append('scopus_indexed', this.scopusIndexed ? 'true' : 'false');
+                formData.append('mention_publications', this.mentionPubs ? 'true' : 'false');
+                formData.append('confirm_resend', this.confirmResend ? 'true' : 'false');
+
+                try {
+                    const resp = await fetch('/author/{{ author.orcid_id }}/send', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await resp.json();
+                    if (data.ok) {
+                        alert('✅ ' + data.message);
+                        $store.app.closeModal();
+                        // Refresh results
+                        htmx.ajax('GET', window.location.href, { target: '#results-area', swap: 'innerHTML' });
+                    } else {
+                        alert('❌ ' + data.error);
+                    }
+                } catch (e) {
+                    alert('❌ Failed to send: ' + e.message);
+                } finally {
+                    this.sending = false;
+                }
+            },
+
+            async previewPdf() {
+                try {
+                    const formData = new FormData();
+                    formData.append('invitation_type', '{{ invitation_type }}');
+                    formData.append('template_id', this.templateId);
+                    formData.append('subject', this.subject);
+                    formData.append('body', this.body);
+
+                    const resp = await fetch('/author/{{ author.orcid_id }}/pdf', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const blob = await resp.blob();
+                    const url = URL.createObjectURL(blob);
+                    window.open(url, '_blank');
+                } catch (e) {
+                    alert('Failed to generate PDF: ' + e.message);
+                }
+            }
+        }">
+
+            <!-- Warnings -->
+            {% if is_suppressed %}
+            <div class="alert alert-warning">
+                ⚠️ This recipient is <strong>suppressed</strong>. You cannot send to this email.
+            </div>
+            {% endif %}
+
+            {% if already_invited and not is_suppressed %}
+            <div class="alert alert-error">
+                ⚠️ This author has <strong>already been invited</strong> for this journal.
+            </div>
+            {% endif %}
+
+            <!-- Author info -->
+            <div class="author-info-card">
+                <h3>{{ author.name or author.author_name or 'Unknown Author' }}</h3>
+                {% if author.affiliation or author.institution %}
+                <p class="text-muted">{{ author.affiliation or author.institution }}</p>
+                {% endif %}
+                {% if author.specialty or author.research_area %}
+                <p class="text-sm">Specialty: {{ author.specialty or author.research_area }}</p>
+                {% endif %}
+            </div>
+
+            <!-- Publication options (publication only) -->
+            {% if invitation_type == 'publication' %}
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="mentionPubs">
+                    Mention recent OpenAlex publications
+                </label>
+            </div>
+
+            <div x-show="recent_publications and recent_publications.length > 0">
+                <details>
+                    <summary>Recent Publications ({{ recent_publications|length }})</summary>
+                    <ul class="pub-list">
+                        {% for pub in recent_publications %}
+                        <li>
+                            <strong>{{ pub.title or 'Untitled' }}</strong>
+                            {% if pub.year or pub.source %}
+                            <br><small class="text-muted">{{ pub.year or '' }}{% if pub.year and pub.source %}, {% endif %}{{ pub.source or '' }}</small>
+                            {% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </details>
+            </div>
+            {% endif %}
+
+            <!-- Template selection -->
+            <div class="form-group">
+                <label>Template</label>
+                <select x-model="templateId" class="form-input">
+                    {% for tid, tname in template_names.items() %}
+                    <option value="{{ tid }}">{{ tname }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <!-- Scopus indexed (editorial only) -->
+            {% if invitation_type == 'editorial' %}
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="scopusIndexed">
+                    Scopus-indexed journal
+                </label>
+            </div>
+            {% endif %}
+
+            <!-- To email -->
+            <div class="form-group">
+                <label>To</label>
+                <input type="email" x-model="toEmail" class="form-input">
+            </div>
+
+            <!-- Subject -->
+            <div class="form-group">
+                <label>Subject</label>
+                <input type="text" x-model="subject" class="form-input">
+            </div>
+
+            <!-- Body -->
+            <div class="form-group">
+                <label>Email Body</label>
+                <textarea x-model="body" class="form-input" rows="12"></textarea>
+            </div>
+
+            <!-- PDF attachment -->
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="attachPdf">
+                    Attach PDF invitation letter
+                </label>
+                <button class="btn btn-sm btn-secondary" @click="previewPdf()" x-show="attachPdf">
+                    Preview PDF
+                </button>
+            </div>
+
+            <!-- Resend confirmation -->
+            {% if already_invited %}
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="confirmResend">
+                    Confirm resend to already-notified author
+                </label>
+            </div>
+            {% endif %}
+
+            <!-- Actions -->
+            <div class="modal-actions">
+                <button class="btn" @click="$store.app.closeModal()">Cancel</button>
+                <button class="btn btn-primary"
+                        @click="sendInvitation()"
+                        :disabled="sending || (confirmResend === false && {{ 'true' if already_invited else 'false' }})">
+                    <span x-show="!sending">📧 Send Invitation</span>
+                    <span x-show="sending">Sending...</span>
+                </button>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script>
+    // Register Alpine store for modal management
+    document.addEventListener('alpine:init', () => {
+        Alpine.store('app', {
+            closeModal() {
+                document.getElementById('modal-container').innerHTML = '';
+            }
+        });
+    });
+</script>

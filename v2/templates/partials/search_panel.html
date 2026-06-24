@@ -1,0 +1,175 @@
+<!-- Search panel with filters -->
+<div class="search-panel" x-data="{
+    sourceMode: 'openalex',
+    searchQuery: '',
+    dbSource: 'all',
+    withEmail: true,
+    hideSuppressed: true,
+    hideSent: true,
+    textFilter: '',
+    selectedSpecialties: [],
+    showOnlyWithEmail: true,
+    hideAlreadySent: true,
+    hideRetracted: true,
+    selectedAuthors: [],
+
+    toggleAuthor(orcidId) {
+        if (this.selectedAuthors.includes(orcidId)) {
+            this.selectedAuthors = this.selectedAuthors.filter(id => id !== orcidId);
+        } else {
+            this.selectedAuthors.push(orcidId);
+        }
+    },
+
+    selectAll(authors) {
+        authors.forEach(a => {
+            if (a.orcid_id && !this.selectedAuthors.includes(a.orcid_id)) {
+                this.selectedAuthors.push(a.orcid_id);
+            }
+        });
+    },
+
+    clearAll() {
+        this.selectedAuthors = [];
+    }
+}">
+
+    <!-- Source mode selector -->
+    <div class="source-selector">
+        <label>Author Source:</label>
+        <select x-model="sourceMode" class="form-input form-input-sm">
+            <option value="openalex">🔍 OpenAlex</option>
+            <option value="database">📧 Database Emails</option>
+            <option value="both">🔍📧 OpenAlex + Database Emails</option>
+        </select>
+    </div>
+
+    <!-- OpenAlex search form -->
+    <div x-show="sourceMode === 'openalex' || sourceMode === 'both'" class="search-form">
+        <div class="search-row">
+            <div class="search-field">
+                <label>Keyword Tags</label>
+                <textarea id="keywords" class="form-input" rows="2"
+                          placeholder="One keyword per line, e.g.&#10;machine learning&#10;deep learning&#10;neural networks"></textarea>
+            </div>
+            <div class="search-actions">
+                <button class="btn btn-primary"
+                        :hx-post="sourceMode === 'both' ? '/search/both' : '/search/openalex'"
+                        hx-include="#keywords, #h-index-min, #h-index-max, #countries-exclude, #disciplines-select, #max-results, #jump-size"
+                        hx-target="{{ '{#results-area}' if request.url.path == '/' else '#editorial-results-area' }}"
+                        hx-swap="innerHTML">
+                    🔍 Search
+                </button>
+            </div>
+        </div>
+
+        <div class="filter-row">
+            <div class="filter-group">
+                <label>H-Index Min</label>
+                <input type="number" id="h-index-min" value="{{ h_index_min }}" min="0" max="500" class="form-input form-input-sm">
+            </div>
+            <div class="filter-group">
+                <label>H-Index Max</label>
+                <input type="number" id="h-index-max" value="{{ h_index_max }}" min="0" max="500" class="form-input form-input-sm">
+            </div>
+            <div class="filter-group">
+                <label>Max Results</label>
+                <input type="number" id="max-results" value="{{ max_results }}" min="10" max="100000" class="form-input form-input-sm">
+            </div>
+            <div class="filter-group">
+                <label>Jump Size</label>
+                <input type="number" id="jump-size" value="{{ jump_size }}" min="100" max="1000" class="form-input form-input-sm">
+            </div>
+        </div>
+
+        <div class="filter-row">
+            <div class="filter-group filter-wide">
+                <label>Exclude Countries</label>
+                <select id="countries-exclude" class="form-input form-input-sm" multiple size="3">
+                    {% for country in countries %}
+                    <option value="{{ country }}">{{ country }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="filter-group filter-wide">
+                <label>Disciplines</label>
+                <select id="disciplines-select" class="form-input form-input-sm" multiple size="3">
+                    {% for discipline in disciplines %}
+                    <option value="{{ discipline }}">{{ discipline }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- Database search form -->
+    <div x-show="sourceMode === 'database'" class="search-form">
+        <div class="search-row">
+            <div class="search-field">
+                <label>Search Query</label>
+                <input type="text" id="db-query" class="form-input" placeholder="Name, email, affiliation, ORCID...">
+            </div>
+            <div class="search-actions">
+                <button class="btn btn-primary"
+                        hx-post="/search/database"
+                        hx-include="#db-query, #db-source, #with-email, #hide-suppressed, #hide-sent"
+                        hx-target="{{ '{#results-area}' if request.url.path == '/' else '#editorial-results-area' }}"
+                        hx-swap="innerHTML">
+                    🔍 Search DB
+                </button>
+            </div>
+        </div>
+        <div class="filter-row">
+            <div class="filter-group">
+                <label>Source</label>
+                <select id="db-source" class="form-input form-input-sm">
+                    <option value="all">All database records</option>
+                    <option value="profiles">Author profiles</option>
+                    <option value="harvested">Collected emails</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="with-email" checked>
+                    With email only
+                </label>
+            </div>
+            <div class="filter-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="hide-suppressed" checked>
+                    Hide suppressed
+                </label>
+            </div>
+            <div class="filter-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="hide-sent" checked>
+                    Hide already sent
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Inline filters (shown when results exist) -->
+    <div id="inline-filters" class="inline-filters" style="display: none;">
+        <input type="text" x-model="textFilter" class="form-input form-input-sm"
+               placeholder="🔍 Filter results by name, email, institution, country, ORCID, discipline, specialty..."
+               style="flex: 1;">
+
+        <label class="checkbox-label">
+            <input type="checkbox" x-model="showOnlyWithEmail">
+            Only with email
+        </label>
+        <label class="checkbox-label">
+            <input type="checkbox" x-model="hideAlreadySent">
+            Hide already sent
+        </label>
+        <label class="checkbox-label">
+            <input type="checkbox" x-model="hideRetracted">
+            Hide retracted
+        </label>
+
+        <button class="btn btn-sm" @click="selectAll($store.results?.authors || [])">Select All</button>
+        <button class="btn btn-sm" @click="clearAll()">Clear Selection</button>
+    </div>
+
+</div>

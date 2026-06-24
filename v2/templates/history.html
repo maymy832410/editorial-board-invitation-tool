@@ -1,0 +1,37 @@
+<!-- Invitation history -->
+<div class="history-panel">
+    <h2>📋 Invitation History</h2>
+
+    {% if invitations %}
+    <div class="table-wrapper">
+        <table class="results-table">
+            <thead>
+                <tr>
+                    <th>Author</th>
+                    <th>Email</th>
+                    <th>Type</th>
+                    <th>Journal</th>
+                    <th>Sent At</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for inv in invitations %}
+                <tr>
+                    <td>{{ inv.author_name or 'Unknown' }}</td>
+                    <td>{{ inv.email or '-' }}</td>
+                    <td>
+                        <span class="status-badge {% if inv.invitation_type == 'editorial' %}status-editorial{% else %}status-publication{% endif %}">
+                            {{ inv.invitation_type }}
+                        </span>
+                    </td>
+                    <td>{{ inv.journal_name or '-' }}</td>
+                    <td>{{ inv.sent_at }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="placeholder-text">No invitations sent yet.</p>
+    {% endif %}
+</div>

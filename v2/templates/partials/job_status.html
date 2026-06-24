@@ -1,0 +1,40 @@
+<!-- Bulk email job status -->
+<div class="jobs-panel">
+    <h2>⚡ Bulk Email Jobs</h2>
+
+    {% if jobs %}
+    <div class="jobs-list">
+        {% for job in jobs %}
+        <div class="job-card">
+            <div class="job-header">
+                <span class="job-id">Job #{{ job.id }}</span>
+                <span class="job-status status-{{ job.status }}">{{ job.status }}</span>
+            </div>
+            <div class="job-details">
+                <span>{{ job.publisher_id }} / {{ job.journal_name or 'N/A' }}</span>
+                <span>{{ job.invitation_type }}</span>
+            </div>
+            <div class="job-progress">
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {{ (job.sent_count / job.total_count * 100) if job.total_count > 0 else 0 }}%"></div>
+                </div>
+                <div class="progress-stats">
+                    <span class="stat-sent">✅ {{ job.sent_count }} sent</span>
+                    <span class="stat-failed">❌ {{ job.failed_count }} failed</span>
+                    <span class="stat-skipped">⏭️ {{ job.skipped_count }} skipped</span>
+                    <span class="stat-total">📊 {{ job.total_count }} total</span>
+                </div>
+            </div>
+            {% if job.last_error %}
+            <div class="job-error text-danger text-sm">{{ job.last_error }}</div>
+            {% endif %}
+            <div class="job-time text-muted text-sm">
+                Created: {{ job.created_at }} | Updated: {{ job.updated_at }}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="placeholder-text">No bulk email jobs yet.</p>
+    {% endif %}
+</div>

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Editorial Board Invitation Tool{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@2.0.4"
+            integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LM3GvrH1"
+            crossorigin="anonymous"></script>
+    <!-- Alpine.js -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="top-nav">
+        <div class="nav-content">
+            <h1 class="nav-title">📬 Editorial Board Invitation Tool</h1>
+            <div class="nav-right">
+                <span class="db-status {% if db_available %}db-online{% else %}db-offline{% endif %}">
+                    {% if db_available %}🟢 DB Connected{% else %}🔴 DB Offline{% endif %}
+                </span>
+                <span class="session-id">Session: {{ session_id[:8] }}...</span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="app-layout" x-data="{ activeTab: 'author' }">
+        <!-- Sidebar -->
+        <aside class="sidebar" x-show="true">
+            {% include 'partials/sidebar.html' %}
+        </aside>
+
+        <!-- Main content -->
+        <main class="main-content">
+            <div class="tab-bar">
+                <button class="tab-btn"
+                        :class="{ 'active': activeTab === 'author' }"
+                        @click="activeTab = 'author'">
+                    📝 Author Invitation
+                </button>
+                <button class="tab-btn"
+                        :class="{ 'active': activeTab === 'editorial' }"
+                        @click="activeTab = 'editorial'">
+                    🏛️ Editorial Invitation
+                </button>
+                <button class="tab-btn"
+                        :class="{ 'active': activeTab === 'collection' }"
+                        @click="activeTab = 'collection'"
+                        hx-get="/collection"
+                        hx-target="#collection-panel"
+                        hx-swap="innerHTML">
+                    📥 Collection
+                </button>
+                <button class="tab-btn"
+                        :class="{ 'active': activeTab === 'history' }"
+                        @click="activeTab = 'history'"
+                        hx-get="/history"
+                        hx-target="#history-panel"
+                        hx-swap="innerHTML">
+                    📋 History
+                </button>
+                <button class="tab-btn"
+                        :class="{ 'active': activeTab === 'jobs' }"
+                        @click="activeTab = 'jobs'"
+                        hx-get="/jobs"
+                        hx-target="#jobs-panel"
+                        hx-swap="innerHTML">
+                    ⚡ Jobs
+                </button>
+            </div>
+
+            <div class="content-area">
+                <div x-show="activeTab === 'author'">
+                    {% include 'partials/search_panel.html' %}
+                    <div id="results-area">
+                        <p class="placeholder-text">Configure filters above and click Search to find authors.</p>
+                    </div>
+                </div>
+
+                <div x-show="activeTab === 'editorial'" x-cloak>
+                    {% include 'partials/search_panel.html' %}
+                    <div id="editorial-results-area">
+                        <p class="placeholder-text">Configure filters above and click Search to find authors.</p>
+                    </div>
+                </div>
+
+                <div x-show="activeTab === 'collection'" x-cloak>
+                    <div id="collection-panel">Loading...</div>
+                </div>
+
+                <div x-show="activeTab === 'history'" x-cloak>
+                    <div id="history-panel">Loading...</div>
+                </div>
+
+                <div x-show="activeTab === 'jobs'" x-cloak>
+                    <div id="jobs-panel">Loading...</div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal container for dialogs -->
+    <div id="modal-container"></div>
+
+    <script>
+        // Global helper for HTMX error handling
+        document.body.addEventListener('htmx:responseError', function(evt) {
+            console.error('HTMX Error:', evt.detail);
+            const resultsArea = document.getElementById('results-area') ||
+                                document.getElementById('editorial-results-area');
+            if (resultsArea) {
+                resultsArea.innerHTML = '<div class="error-banner">Request failed. Please try again.</div>';
+            }
+        });
+
+        // HTMX loading indicator
+        document.body.addEventListener('htmx:beforeRequest', function(evt) {
+            const target = evt.detail.target;
+            target.classList.add('loading');
+        });
+        document.body.addEventListener('htmx:afterRequest', function(evt) {
+            const target = evt.detail.target;
+            target.classList.remove('loading');
+        });
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

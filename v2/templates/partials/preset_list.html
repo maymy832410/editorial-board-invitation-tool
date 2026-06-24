@@ -1,0 +1,38 @@
+<!-- Preset list partial -->
+<div class="preset-list">
+    {% if presets %}
+    <div class="form-group">
+        <label>Load Preset</label>
+        <select id="preset-select" class="form-input">
+            <option value="">-- Select preset --</option>
+            {% for preset in presets %}
+            <option value="{{ preset.id }}">{{ preset.name }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <button class="btn btn-sm btn-primary"
+            hx-post="/presets/load/"
+            hx-include="#preset-select"
+            hx-target="#preset-load-result"
+            hx-swap="innerHTML">
+        Load
+    </button>
+    <div id="preset-load-result"></div>
+
+    <div class="form-group">
+        <label>Save New Preset</label>
+        <input type="text" id="preset-name" class="form-input" placeholder="Preset name">
+    </div>
+    <button class="btn btn-sm"
+            hx-post="/presets/save"
+            hx-include="#preset-name"
+            hx-vals='{"journal_config_json": JSON.stringify(JSON.parse(localStorage.getItem("journalConfig") || "{}"))}'
+            hx-target="#preset-save-result"
+            hx-swap="innerHTML">
+        Save as New
+    </button>
+    <div id="preset-save-result"></div>
+    {% else %}
+    <p class="text-sm text-muted">No saved presets yet.</p>
+    {% endif %}
+</div>

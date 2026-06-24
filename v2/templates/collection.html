@@ -1,0 +1,162 @@
+<!-- Collection worker control panel -->
+<div class="collection-panel" x-data="{
+    status: '{{ run_status.status }}',
+    config: {{ run_status.config | default('{}') | tojson }},
+    saving: false,
+
+    async action(endpoint) {
+        try {
+            const resp = await fetch('/collection/' + endpoint, { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                alert('✅ ' + data.message);
+                // Refresh
+                htmx.ajax('GET', '/collection', { target: '#collection-panel', swap: 'innerHTML' });
+            }
+        } catch (e) {
+            alert('❌ ' + e.message);
+        }
+    },
+
+    async saveConfig() {
+        this.saving = true;
+        const formData = new FormData();
+        formData.append('keywords', document.getElementById('coll-keywords')?.value || '');
+        formData.append('disciplines', document.getElementById('coll-disciplines')?.value || '');
+        formData.append('specialty_terms', document.getElementById('coll-specialties')?.value || '');
+        formData.append('h_index_min', document.getElementById('coll-h-min')?.value || '10');
+        formData.append('h_index_max', document.getElementById('coll-h-max')?.value || '50');
+        formData.append('exclude_countries', document.getElementById('coll-countries')?.value || '');
+        formData.append('baseline_concurrency', document.getElementById('coll-concurrency')?.value || '2');
+        formData.append('baseline_delay', document.getElementById('coll-delay')?.value || '3');
+
+        try {
+            const resp = await fetch('/collection/config', { method: 'POST', body: formData });
+            const data = await resp.json();
+            if (data.ok) {
+                alert('✅ ' + data.message);
+            }
+        } catch (e) {
+            alert('❌ ' + e.message);
+        } finally {
+            this.saving = false;
+        }
+    }
+}">
+
+    <!-- Status indicator -->
+    <div class="status-header">
+        <span class="status-indicator"
+              :class="{
+                  'status-active': status === 'active',
+                  'status-idle': status === 'idle',
+                  'status-paused': status === 'paused',
+                  'status-cooldown': status === 'cooldown',
+                  'status-recovery': status === 'recovery',
+                  'status-stopped': status === 'stopped_today'
+              }">
+            {% if run_status.status == 'active' %}🟢
+            {% elif run_status.status == 'idle' %}⚪
+            {% elif run_status.status == 'paused' %}🟡
+            {% elif run_status.status in ['cooldown', 'recovery'] %}🟠
+            {% elif run_status.status == 'stopped_today' %}🔴
+            {% else %}⚪
+            {% endif %}
+            {{ run_status.status | replace('_', ' ') | title }}
+        </span>
+    </div>
+
+    <!-- Metrics -->
+    <div class="metrics-grid">
+        <div class="metric-card">
+            <span class="metric-value">{{ run_status.total_collected }}</span>
+            <span class="metric-label">Total Collected</span>
+        </div>
+        <div class="metric-card">
+            <span class="metric-value">{{ run_status.queue_pending }}</span>
+            <span class="metric-label">Queue Pending</span>
+        </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="control-buttons">
+        <button class="btn btn-primary" @click="action('start')"
+                :disabled="status === 'active'">
+            ▶️ Start
+        </button>
+        <button class="btn btn-warning" @click="action('pause')"
+                :disabled="status !== 'active'">
+            ⏸️ Pause
+        </button>
+        <button class="btn btn-danger" @click="action('stop')"
+                :disabled="status === 'stopped_today'">
+            ⏹️ Stop for Today
+        </button>
+    </div>
+
+    <!-- Configuration -->
+    <div class="config-section">
+        <h3>Collection Configuration</h3>
+
+        <div class="form-group">
+            <label>Keyword Tags</label>
+            <textarea id="coll-keywords" class="form-input" rows="2"
+                      placeholder="One per line">{{ config.keywords or '' }}</textarea>
+        </div>
+
+        <div class="form-group">
+            <label>Disciplines</label>
+            <select id="coll-disciplines" class="form-input" multiple size="3">
+                {% for d in disciplines %}
+                <option value="{{ d }}" {% if d in (config.disciplines or []) %}selected{% endif %}>{{ d }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>Specialty Terms</label>
+            <input type="text" id="coll-specialties" class="form-input"
+                   value="{{ config.specialty_terms | join(', ') if config.specialty_terms else '' }}"
+                   placeholder="Comma-separated">
+        </div>
+
+        <div class="filter-row">
+            <div class="filter-group">
+                <label>H-Index Min</label>
+                <input type="number" id="coll-h-min" value="{{ config.h_index_min or 10 }}" class="form-input">
+            </div>
+            <div class="filter-group">
+                <label>H-Index Max</label>
+                <input type="number" id="coll-h-max" value="{{ config.h_index_max or 50 }}" class="form-input">
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>Exclude Countries</label>
+            <select id="coll-countries" class="form-input" multiple size="3">
+                {% for country in countries %}
+                <option value="{{ country }}">{{ country }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="filter-row">
+            <div class="filter-group">
+                <label>Baseline Concurrency</label>
+                <input type="number" id="coll-concurrency" value="{{ config.baseline_concurrency or 2 }}"
+                       min="1" max="10" class="form-input">
+            </div>
+            <div class="filter-group">
+                <label>Baseline Delay (sec)</label>
+                <input type="number" id="coll-delay" value="{{ config.baseline_delay_sec or 3 }}"
+                       min="1" max="10" step="0.5" class="form-input">
+            </div>
+        </div>
+
+        <button class="btn btn-primary" @click="saveConfig()" :disabled="saving">
+            <span x-show="!saving">💾 Save Filters</span>
+            <span x-show="saving">Saving...</span>
+        </button>
+    </div>
+
+</div>

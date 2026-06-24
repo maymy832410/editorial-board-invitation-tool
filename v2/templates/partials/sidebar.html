@@ -1,0 +1,162 @@
+<!-- Sidebar with filters, journal config, and tools -->
+<div class="sidebar-content" x-data="{ openSection: 'journal' }">
+
+    <!-- Journal Configuration -->
+    <div class="sidebar-section">
+        <button class="section-toggle" @click="openSection = openSection === 'journal' ? '' : 'journal'">
+            <span>📰 Journal Configuration</span>
+            <span class="arrow" :class="{ 'open': openSection === 'journal' }">▼</span>
+        </button>
+        <div x-show="openSection === 'journal'" x-collapse>
+            <div class="form-group">
+                <label>Journal Name</label>
+                <input type="text" id="journal-name" value="{{ journal_config.name }}"
+                       class="form-input" placeholder="Journal name">
+            </div>
+            <div class="form-group">
+                <label>ISSN</label>
+                <input type="text" id="journal-issn" value="{{ journal_config.issn }}"
+                       class="form-input" placeholder="XXXX-XXXX">
+            </div>
+            <div class="form-group">
+                <label>Journal Link</label>
+                <input type="url" id="journal-link" value="{{ journal_config.link }}"
+                       class="form-input" placeholder="https://...">
+            </div>
+            <div class="form-group">
+                <label>Location</label>
+                <input type="text" id="journal-location" value="{{ journal_config.location }}"
+                       class="form-input" placeholder="City, Country">
+            </div>
+            <div class="form-group">
+                <label>Editor-in-Chief</label>
+                <input type="text" id="journal-eic" value="{{ journal_config.editor_in_chief }}"
+                       class="form-input" placeholder="Prof. Name">
+            </div>
+            <div class="form-group">
+                <label>Submission Link</label>
+                <input type="url" id="journal-submission" value="{{ journal_config.submission_link }}"
+                       class="form-input" placeholder="https://...">
+            </div>
+            <div class="form-group">
+                <label>CiteScore</label>
+                <input type="text" id="journal-cite-score" value="{{ journal_config.cite_score }}"
+                       class="form-input" placeholder="e.g., 3.5">
+            </div>
+            <div class="form-group">
+                <label>Quartile</label>
+                <select id="journal-quartile" class="form-input">
+                    <option value="">Select...</option>
+                    <option value="Q1" {% if journal_config.quartile == 'Q1' %}selected{% endif %}>Q1</option>
+                    <option value="Q2" {% if journal_config.quartile == 'Q2' %}selected{% endif %}>Q2</option>
+                    <option value="Q3" {% if journal_config.quartile == 'Q3' %}selected{% endif %}>Q3</option>
+                    <option value="Q4" {% if journal_config.quartile == 'Q4' %}selected{% endif %}>Q4</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Indexing Status</label>
+                <select id="journal-indexing" class="form-input">
+                    <option value="">Select...</option>
+                    <option value="Scopus" {% if journal_config.indexing_status == 'Scopus' %}selected{% endif %}>Scopus</option>
+                    <option value="Web of Science" {% if journal_config.indexing_status == 'Web of Science' %}selected{% endif %}>Web of Science</option>
+                    <option value="DOAJ" {% if journal_config.indexing_status == 'DOAJ' %}selected{% endif %}>DOAJ</option>
+                    <option value="Not indexed" {% if journal_config.indexing_status == 'Not indexed' %}selected{% endif %}>Not indexed</option>
+                    <option value="Other" {% if journal_config.indexing_status == 'Other' %}selected{% endif %}>Other</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Invitation Goal</label>
+                <select id="journal-goal" class="form-input">
+                    <option value="Regular submission" {% if journal_config.invitation_goal == 'Regular submission' %}selected{% endif %}>Regular submission</option>
+                    <option value="Special issue" {% if journal_config.invitation_goal == 'Special issue' %}selected{% endif %}>Special issue</option>
+                    <option value="Review article" {% if journal_config.invitation_goal == 'Review article' %}selected{% endif %}>Review article</option>
+                    <option value="Fast-track consideration" {% if journal_config.invitation_goal == 'Fast-track consideration' %}selected{% endif %}>Fast-track consideration</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Journal Scope</label>
+                <textarea id="journal-scope" class="form-input" rows="2"
+                          placeholder="Brief scope description...">{{ journal_config.scope }}</textarea>
+            </div>
+            <button class="btn btn-primary btn-full"
+                    hx-post="/journal/config"
+                    hx-include="#journal-name, #journal-issn, #journal-link, #journal-location, #journal-eic, #journal-submission, #journal-cite-score, #journal-quartile, #journal-indexing, #journal-goal, #journal-scope"
+                    hx-swap="none">
+                Save Journal Config
+            </button>
+        </div>
+    </div>
+
+    <!-- Publisher Selection -->
+    <div class="sidebar-section">
+        <button class="section-toggle" @click="openSection = openSection === 'publisher' ? '' : 'publisher'">
+            <span>📧 Publisher</span>
+            <span class="arrow" :class="{ 'open': openSection === 'publisher' }">▼</span>
+        </button>
+        <div x-show="openSection === 'publisher'" x-collapse>
+            <div class="form-group">
+                <label>Selected Publisher</label>
+                <select id="publisher-select" class="form-input"
+                        hx-post="/publisher/select"
+                        hx-include="#publisher-select"
+                        hx-swap="none">
+                    <option value="brevo" {% if publisher == 'brevo' %}selected{% endif %}>Peninsula Publishing Press (Brevo)</option>
+                    <option value="mesopotamian" {% if publisher == 'mesopotamian' %}selected{% endif %}>Mesopotamian Academic Press</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- Journal Presets -->
+    {% if db_available %}
+    <div class="sidebar-section">
+        <button class="section-toggle" @click="openSection = openSection === 'presets' ? '' : 'presets'"
+                hx-get="/presets/list"
+                hx-target="#preset-list"
+                hx-swap="innerHTML"
+                hx-trigger="click once">
+            <span>💾 Saved Presets</span>
+            <span class="arrow" :class="{ 'open': openSection === 'presets' }">▼</span>
+        </button>
+        <div x-show="openSection === 'presets'" x-collapse>
+            <div id="preset-list">Loading presets...</div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Manual Unsubscribe -->
+    <div class="sidebar-section">
+        <button class="section-toggle" @click="openSection = openSection === 'unsubscribe' ? '' : 'unsubscribe'">
+            <span>🚫 Manual Unsubscribe</span>
+            <span class="arrow" :class="{ 'open': openSection === 'unsubscribe' }">▼</span>
+        </button>
+        <div x-show="openSection === 'unsubscribe'" x-collapse>
+            <div class="form-group">
+                <label>Email or pasted reply</label>
+                <textarea id="unsubscribe-text" class="form-input" rows="3"
+                          placeholder="Paste email or type address..."></textarea>
+            </div>
+            <button class="btn btn-danger btn-full"
+                    hx-post="/unsubscribe/manual"
+                    hx-include="#unsubscribe-text"
+                    hx-target="#unsubscribe-result"
+                    hx-swap="innerHTML">
+                Suppress & Purge
+            </button>
+            <div id="unsubscribe-result"></div>
+        </div>
+    </div>
+
+    <!-- Data Import -->
+    <div class="sidebar-section">
+        <button class="section-toggle" @click="openSection = openSection === 'import' ? '' : 'import'">
+            <span>📂 Data Import</span>
+            <span class="arrow" :class="{ 'open': openSection === 'import' }">▼</span>
+        </button>
+        <div x-show="openSection === 'import'" x-collapse>
+            <p class="text-sm text-muted">Import CSV files for sent invitations and retraction data.</p>
+            <p class="text-sm text-muted">Use the Railway CLI or database direct import.</p>
+        </div>
+    </div>
+
+</div>

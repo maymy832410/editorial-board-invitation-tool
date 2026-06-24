@@ -1,0 +1,126 @@
+<!-- Bulk send preview dialog -->
+<div class="modal-overlay" @click.self="$store.app.closeModal()">
+    <div class="modal-dialog modal-large">
+        <div class="modal-header">
+            <h2>📦 Confirm Background Bulk Send</h2>
+            <button class="modal-close" @click="$store.app.closeModal()">×</button>
+        </div>
+
+        <div class="modal-body" x-data="{
+            templateId: '{{ template_names.keys()|list|first if template_names else '' }}',
+            scopusIndexed: false,
+            attachPdf: false,
+            queuing: false,
+
+            async queueSend() {
+                this.queuing = true;
+                const formData = new FormData();
+                formData.append('invitation_type', '{{ invitation_type }}');
+                formData.append('template_id', this.templateId);
+                formData.append('scopus_indexed', this.scopusIndexed ? 'true' : 'false');
+                formData.append('attach_pdf', this.attachPdf ? 'true' : 'false');
+                formData.append('orcid_ids', '{{ recipients | map(attribute="orcid_id") | join(",") }}');
+
+                try {
+                    const resp = await fetch('/bulk/queue', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await resp.json();
+                    if (data.ok) {
+                        alert('✅ ' + data.queued_count + ' recipients queued for background sending (Job #' + data.job_id + ')');
+                        $store.app.closeModal();
+                    } else {
+                        alert('❌ ' + data.error);
+                    }
+                } catch (e) {
+                    alert('❌ Failed to queue: ' + e.message);
+                } finally {
+                    this.queuing = false;
+                }
+            }
+        }">
+
+            <!-- Summary -->
+            <div class="bulk-summary">
+                <div class="bulk-stat">
+                    <span class="stat-number">{{ total_count }}</span>
+                    <span class="stat-label">Total Selected</span>
+                </div>
+                <div class="bulk-stat">
+                    <span class="stat-number stat-success">{{ eligible_count }}</span>
+                    <span class="stat-label">Eligible to Send</span>
+                </div>
+                <div class="bulk-stat">
+                    <span class="stat-number stat-danger">{{ filtered_count }}</span>
+                    <span class="stat-label">Filtered Out</span>
+                </div>
+            </div>
+
+            {% if filtered_count > 0 %}
+            <div class="alert alert-warning">
+                {{ filtered_count }} recipients filtered: already invited, suppressed, no email, or retracted.
+            </div>
+            {% endif %}
+
+            {% if eligible_count == 0 %}
+            <div class="alert alert-error">
+                No eligible recipients remaining after filtering.
+            </div>
+            {% else %}
+
+            <!-- Template selection (editorial) -->
+            {% if invitation_type == 'editorial' %}
+            <div class="form-group">
+                <label>Template</label>
+                <select x-model="templateId" class="form-input">
+                    {% for tid, tname in template_names.items() %}
+                    <option value="{{ tid }}">{{ tname }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="scopusIndexed">
+                    Scopus-indexed journal
+                </label>
+            </div>
+            {% endif %}
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="attachPdf">
+                    Attach PDF invitation letter
+                </label>
+            </div>
+
+            <!-- Sample recipient -->
+            {% if recipients %}
+            <details>
+                <summary>Sample Recipient</summary>
+                <div class="sample-recipient">
+                    <strong>{{ recipients[0].name or recipients[0].author_name }}</strong><br>
+                    <span class="text-muted">{{ recipients[0].email }}</span><br>
+                    {% if recipients[0].affiliation or recipients[0].institution %}
+                    <span class="text-sm">{{ recipients[0].affiliation or recipients[0].institution }}</span>
+                    {% endif %}
+                </div>
+            </details>
+            {% endif %}
+
+            <!-- Actions -->
+            <div class="modal-actions">
+                <button class="btn" @click="$store.app.closeModal()">Cancel</button>
+                <button class="btn btn-primary"
+                        @click="queueSend()"
+                        :disabled="queuing">
+                    <span x-show="!queuing">📦 Queue Background Bulk Send</span>
+                    <span x-show="queuing">Queueing...</span>
+                </button>
+            </div>
+
+            {% endif %}
+        </div>
+    </div>
+</div>

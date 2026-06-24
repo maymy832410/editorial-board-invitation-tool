@@ -1,0 +1,209 @@
+<!-- Results table partial -->
+<div class="results-container" x-data="{
+    page: 0,
+    pageSize: 25,
+    invitationType: '{{ invitation_type if invitation_type else 'author' }}',
+
+    get paginatedAuthors() {
+        const all = Array.from(document.querySelectorAll('.author-row')).map(row => {
+            return {
+                orcid_id: row.dataset.orcidId || '',
+                name: row.dataset.name || '',
+                email: row.dataset.email || '',
+                h_index: row.dataset.hIndex || '',
+                specialty: row.dataset.specialty || '',
+                discipline: row.dataset.discipline || '',
+                country: row.dataset.country || '',
+                institution: row.dataset.institution || '',
+                openalex_id: row.dataset.openalexId || '',
+            };
+        });
+        const start = this.page * this.pageSize;
+        return all.slice(start, start + this.pageSize);
+    },
+
+    get totalPages() {
+        const count = document.querySelectorAll('.author-row').length;
+        return Math.ceil(count / this.pageSize) || 1;
+    },
+
+    prevPage() {
+        if (this.page > 0) this.page--;
+    },
+
+    nextPage() {
+        if (this.page < this.totalPages - 1) this.page++;
+    },
+
+    openInvite(orcidId) {
+        const type = this.invitationType === 'editorial' ? 'editorial' : 'author';
+        htmx.ajax('GET', `/author/${orcidId}/invite?invitation_type=${type}`, {
+            target: '#modal-container',
+            swap: 'innerHTML'
+        });
+    },
+
+    closeModal() {
+        document.getElementById('modal-container').innerHTML = '';
+    }
+}">
+
+    <!-- Summary -->
+    <div class="results-summary">
+        <span class="result-count">
+            {% if total_estimate %}
+                ~{{ total_estimate }} authors found
+            {% else %}
+                {{ authors|length }} authors
+            {% endif %}
+        </span>
+        <span class="batch-nav">
+            Batch {{ batch_offset + 1 }} of {{ total_batches }}
+            {% if total_batches > 1 %}
+                {% if batch_offset > 0 %}
+                    <button class="btn btn-sm"
+                            hx-get="/results/{{ batch_offset - 1 }}"
+                            hx-vals='{"invitation_type": "{{ invitation_type if invitation_type else "author" }}"}'
+                            hx-target="#{{ 'results-area' if request.url.path == '/' else 'editorial-results-area' }}"
+                            hx-swap="innerHTML">
+                        ← Prev
+                    </button>
+                {% endif %}
+                {% if batch_offset < total_batches - 1 %}
+                    <button class="btn btn-sm"
+                            hx-get="/results/{{ batch_offset + 1 }}"
+                            hx-vals='{"invitation_type": "{{ invitation_type if invitation_type else "author" }}"}'
+                            hx-target="#{{ 'results-area' if request.url.path == '/' else 'editorial-results-area' }}"
+                            hx-swap="innerHTML">
+                        Next →
+                    </button>
+                {% endif %}
+            {% endif %}
+        </span>
+    </div>
+
+    <!-- Table -->
+    <div class="table-wrapper">
+        <table class="results-table">
+            <thead>
+                <tr>
+                    <th class="col-select">
+                        <input type="checkbox" id="select-all-visible"
+                               onclick="document.querySelectorAll('.author-row').forEach(row => {
+                                   const cb = row.querySelector('.author-cb');
+                                   if (cb) cb.checked = this.checked;
+                               })">
+                    </th>
+                    <th class="col-name">Name</th>
+                    <th class="col-hindex">H-Index</th>
+                    <th class="col-specialty">Specialty</th>
+                    <th class="col-discipline">Discipline</th>
+                    <th class="col-country">Country</th>
+                    <th class="col-email">Email</th>
+                    <th class="col-status">Status</th>
+                    <th class="col-action">Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for author in authors %}
+                <tr class="author-row"
+                    data-orcid-id="{{ author.orcid_id or '' }}"
+                    data-name="{{ author.name or author.author_name or '' }}"
+                    data-email="{{ author.email or '' }}"
+                    data-h-index="{{ author.h_index or '' }}"
+                    data-specialty="{{ author.specialty or author.research_area or '' }}"
+                    data-discipline="{{ author.discipline or '' }}"
+                    data-country="{{ author.country or '' }}"
+                    data-institution="{{ author.institution or author.affiliation or '' }}"
+                    data-openalex-id="{{ author.openalex_id or '' }}">
+
+                    <td class="col-select">
+                        <input type="checkbox" class="author-cb" value="{{ author.orcid_id or '' }}">
+                    </td>
+                    <td class="col-name">
+                        <strong>{{ author.name or author.author_name or 'Unknown' }}</strong>
+                        {% if author.openalex_id %}
+                            <br><small class="text-muted">OA: {{ author.openalex_id }}</small>
+                        {% endif %}
+                    </td>
+                    <td class="col-hindex">{{ author.h_index or '-' }}</td>
+                    <td class="col-specialty">{{ author.specialty or author.research_area or '-' }}</td>
+                    <td class="col-discipline">{{ author.discipline or '-' }}</td>
+                    <td class="col-country">{{ author.country or '-' }}</td>
+                    <td class="col-email">
+                        {% if author.email %}
+                            <span class="email-badge">{{ author.email }}</span>
+                        {% elif author.all_emails %}
+                            <span class="email-badge">{{ author.all_emails[0] }}</span>
+                            <small class="text-muted">(+{{ author.all_emails|length - 1 }})</small>
+                        {% else %}
+                            <span class="no-email">No email</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-status">
+                        {% if db and db.is_email_suppressed(author.email or '') %}
+                            <span class="status-badge status-suppressed">🚫 Suppressed</span>
+                        {% elif db and author.orcid_id and db.is_author_notified(author.orcid_id, 'publication' if invitation_type == 'author' else 'editorial', journal_config.name or '') %}
+                            <span class="status-badge status-invited">✅ Already Invited</span>
+                        {% else %}
+                            <span class="status-badge status-ready">📧 Ready</span>
+                        {% endif %}
+                    </td>
+                    <td class="col-action">
+                        {% if author.email %}
+                            <button class="btn btn-sm btn-primary"
+                                    @click="openInvite('{{ author.orcid_id }}')">
+                                Send
+                            </button>
+                        {% else %}
+                            <span class="text-muted">No email</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Pagination -->
+    <div class="pagination" x-show="totalPages > 1">
+        <button class="btn btn-sm" @click="prevPage" :disabled="page === 0">← Previous</button>
+        <span class="page-info">Page <span x-text="page + 1"></span> of <span x-text="totalPages"></span></span>
+        <button class="btn btn-sm" @click="nextPage" :disabled="page >= totalPages - 1">Next →</button>
+    </div>
+
+    <!-- Bulk send bar -->
+    <div class="bulk-bar" x-show="selectedAuthors.length > 0">
+        <span x-text="selectedAuthors.length + ' authors selected'"></span>
+        <button class="btn btn-primary btn-sm"
+                @click="htmx.ajax('POST', '/bulk/send', {
+                    values: {
+                        invitation_type: invitationType === 'editorial' ? 'editorial' : 'publication',
+                        orcid_ids: selectedAuthors.join(',')
+                    },
+                    target: '#modal-container',
+                    swap: 'innerHTML'
+                })">
+            📦 Bulk Send Selected
+        </button>
+    </div>
+
+    <!-- Export buttons -->
+    <div class="export-bar">
+        <button class="btn btn-sm"
+                hx-post="/export/csv"
+                hx-vals='{"with_email": false}'
+                hx-target="body"
+                hx-swap="none">
+            📄 Export CSV
+        </button>
+        <button class="btn btn-sm"
+                hx-post="/export/csv"
+                hx-vals='{"with_email": true}'
+                hx-target="body"
+                hx-swap="none">
+            📄 Export With Email
+        </button>
+    </div>
+
+</div>
