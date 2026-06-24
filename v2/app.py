@@ -15,9 +15,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-# Add parent directory to path so we can reuse existing modules
+# Add parent directory to path so we can reuse existing modules.
+# Use append (not insert at 0) to avoid shadowing the v2 app module.
 PARENT_DIR = Path(__file__).parent.parent
-sys.path.insert(0, str(PARENT_DIR))
+if str(PARENT_DIR) not in sys.path:
+    sys.path.append(str(PARENT_DIR))
 
 from config import (
     COUNTRIES,
