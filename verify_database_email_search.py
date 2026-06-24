@@ -32,8 +32,10 @@ def check_database_query_contract() -> None:
 
 def check_app_wiring_contract() -> None:
     source = _read("app.py")
-    _assert("Search database emails" in source, "UI should expose database email search")
+    _assert("render_database_email_search_panel" in source, "Author Invitation should render a dedicated database search panel")
+    _assert("Database Email Search" in source, "UI should expose database email search with a visible heading")
     _assert("_search_database_email_rows" in source, "UI should use mapped database search rows")
+    _assert("filters['database_email_panel']" in source, "database search results should feed the author result table")
     _assert("_recipient_tracking_id" in source, "email-only rows need a stable sent-tracking identity")
     _assert("email_dialog(pending_author, dialog_filters)" in source, "database rows should reuse preview dialog")
     _assert("is_suppressed=lambda email, orcid_id" in source, "bulk queue should skip suppressed rows")

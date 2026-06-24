@@ -1995,6 +1995,99 @@ def render_sidebar():
         }
 
 
+def render_database_email_search_panel(filters: dict, ui_scope: str, author_source_mode: str) -> dict:
+    """Render the always-visible database search controls for Author Invitation."""
+    journal_config = st.session_state.app_state.get('journal_config', {})
+    invitation_type = filters.get('invitation_type', INVITATION_TYPE_PUBLICATION)
+    tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
+    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
+    db_source_limit = int(filters.get('max_results', DEFAULT_MAX_RESULTS))
+    panel_state = {
+        'results': [],
+        'total': 0,
+        'active': False,
+        'query': '',
+    }
+
+    st.markdown("### Database Email Search")
+    st.info("Search saved email recipients here. Matching people will appear in the send table below with email preview before sending.")
+    st.caption("Search by name, email, affiliation, country, ORCID/OpenAlex, discipline, specialty, or research area.")
+
+    if not db_storage.available:
+        st.warning("Database email search requires PostgreSQL.")
+        return panel_state
+
+    db_search_cols = st.columns([2.2, 1.2, 1, 1, 1])
+    with db_search_cols[0]:
+        db_search_query = st.text_input(
+            "Search database emails",
+            placeholder="Name, email, affiliation, ORCID, country, specialty...",
+            key=_scope_key(ui_scope, "database_email_search_query"),
+        ).strip()
+    with db_search_cols[1]:
+        db_search_source = st.selectbox(
+            "Database source",
+            options=["all", "profiles", "harvested"],
+            format_func=_database_email_source_label,
+            key=_scope_key(ui_scope, "database_email_search_source"),
+        )
+    with db_search_cols[2]:
+        db_require_email = st.checkbox(
+            "With email",
+            value=True,
+            key=_scope_key(ui_scope, "database_email_require_email"),
+        )
+    with db_search_cols[3]:
+        db_hide_suppressed = st.checkbox(
+            "Hide suppressed",
+            value=True,
+            key=_scope_key(ui_scope, "database_email_hide_suppressed"),
+        )
+    with db_search_cols[4]:
+        db_hide_sent = st.checkbox(
+            "Hide sent",
+            value=True,
+            key=_scope_key(ui_scope, "database_email_hide_sent"),
+        )
+
+    db_source_limit = st.number_input(
+        "Database search result limit",
+        min_value=25,
+        max_value=5000,
+        value=max(25, min(db_source_limit, 5000)),
+        step=25,
+        key=_scope_key(ui_scope, "database_email_search_limit"),
+    )
+
+    db_source_results = _search_database_email_rows(
+        query=db_search_query,
+        source=db_search_source,
+        limit=int(db_source_limit),
+        require_email=db_require_email,
+        hide_suppressed=db_hide_suppressed,
+    )
+    if db_hide_sent:
+        db_source_results = [
+            row for row in db_source_results
+            if _recipient_tracking_id(row) not in sent_invitations
+        ]
+
+    db_search_active = (
+        author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}
+        or bool(db_search_query)
+    )
+    if author_source_mode == AUTHOR_SOURCE_OPENALEX and not db_search_query:
+        st.caption("Tip: type here to show database recipients below, or switch Author Source to Database Emails.")
+
+    panel_state.update({
+        'results': db_source_results,
+        'total': len(db_source_results),
+        'active': db_search_active,
+        'query': db_search_query,
+    })
+    return panel_state
+
+
 def render_search_section(filters, ui_scope: str):
     """Render the search and results section."""
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
@@ -2016,6 +2109,8 @@ def render_search_section(filters, ui_scope: str):
             st.session_state.app_state['author_source_mode'] = author_source_mode
             save_state()
         filters['author_source_mode'] = author_source_mode
+        filters['database_email_panel'] = render_database_email_search_panel(filters, ui_scope, author_source_mode)
+        st.divider()
 
     st.header("Search Authors")
     st.caption(f"Active workflow: {_invitation_type_label(invitation_type)}")
@@ -2470,78 +2565,11 @@ def display_results(filters, ui_scope: str):
         st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH),
     )
 
-    db_source_results: list[dict] = []
-    db_source_total = 0
-    db_source_limit = int(filters.get('max_results', DEFAULT_MAX_RESULTS))
-    db_search_query = ""
-    db_search_active = False
-    if is_author_workflow:
-        st.subheader("Database Email Search")
-        st.caption("Search saved recipients by name, email, affiliation, country, ORCID/OpenAlex, discipline, specialty, or research area.")
-        if db_storage.available:
-            db_search_cols = st.columns([2.2, 1.2, 1, 1, 1])
-            with db_search_cols[0]:
-                db_search_query = st.text_input(
-                    "Search database emails",
-                    placeholder="Name, email, affiliation, ORCID, country, specialty...",
-                    key=_scope_key(ui_scope, "database_email_search_query"),
-                    label_visibility="collapsed",
-                ).strip()
-            with db_search_cols[1]:
-                db_search_source = st.selectbox(
-                    "Database source",
-                    options=["all", "profiles", "harvested"],
-                    format_func=_database_email_source_label,
-                    key=_scope_key(ui_scope, "database_email_search_source"),
-                    label_visibility="collapsed",
-                )
-            with db_search_cols[2]:
-                db_require_email = st.checkbox(
-                    "With email",
-                    value=True,
-                    key=_scope_key(ui_scope, "database_email_require_email"),
-                )
-            with db_search_cols[3]:
-                db_hide_suppressed = st.checkbox(
-                    "Hide suppressed",
-                    value=True,
-                    key=_scope_key(ui_scope, "database_email_hide_suppressed"),
-                )
-            with db_search_cols[4]:
-                db_hide_sent = st.checkbox(
-                    "Hide sent",
-                    value=True,
-                    key=_scope_key(ui_scope, "database_email_hide_sent"),
-                )
-            db_source_limit = st.number_input(
-                "Database search result limit",
-                min_value=25,
-                max_value=5000,
-                value=max(25, min(db_source_limit, 5000)),
-                step=25,
-                key=_scope_key(ui_scope, "database_email_search_limit"),
-            )
-            db_search_active = (
-                author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}
-                or bool(db_search_query)
-            )
-            db_source_results = _search_database_email_rows(
-                query=db_search_query,
-                source=db_search_source,
-                limit=int(db_source_limit),
-                require_email=db_require_email,
-                hide_suppressed=db_hide_suppressed,
-            )
-            if db_hide_sent:
-                db_source_results = [
-                    row for row in db_source_results
-                    if _recipient_tracking_id(row) not in sent_invitations
-                ]
-            db_source_total = len(db_source_results)
-            if author_source_mode == AUTHOR_SOURCE_OPENALEX and not db_search_query:
-                st.caption("Tip: type in this database search box to show database recipients, or set Author Source to Database Emails.")
-        else:
-            st.info("Database email search requires PostgreSQL.")
+    db_panel = filters.get('database_email_panel') if isinstance(filters.get('database_email_panel'), dict) else {}
+    db_source_results = db_panel.get('results') or []
+    db_source_total = int(db_panel.get('total') or len(db_source_results))
+    db_search_active = bool(db_panel.get('active'))
+    db_search_query = db_panel.get('query') or ''
 
     if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
         results = db_source_results
@@ -2552,6 +2580,8 @@ def display_results(filters, ui_scope: str):
     
     if not results:
         if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
+            st.info("No database email records match the current search and filters.")
+        elif db_search_active:
             st.info("No database email records match the current search and filters.")
         else:
             st.info("No results yet. Use the search button above.")
