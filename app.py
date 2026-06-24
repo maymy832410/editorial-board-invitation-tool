@@ -2473,9 +2473,12 @@ def display_results(filters, ui_scope: str):
     db_source_results: list[dict] = []
     db_source_total = 0
     db_source_limit = int(filters.get('max_results', DEFAULT_MAX_RESULTS))
-    if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
+    db_search_query = ""
+    db_search_active = False
+    if is_author_workflow:
+        st.subheader("Database Email Search")
+        st.caption("Search saved recipients by name, email, affiliation, country, ORCID/OpenAlex, discipline, specialty, or research area.")
         if db_storage.available:
-            st.markdown("**Search database emails**")
             db_search_cols = st.columns([2.2, 1.2, 1, 1, 1])
             with db_search_cols[0]:
                 db_search_query = st.text_input(
@@ -2518,6 +2521,10 @@ def display_results(filters, ui_scope: str):
                 step=25,
                 key=_scope_key(ui_scope, "database_email_search_limit"),
             )
+            db_search_active = (
+                author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}
+                or bool(db_search_query)
+            )
             db_source_results = _search_database_email_rows(
                 query=db_search_query,
                 source=db_search_source,
@@ -2531,12 +2538,14 @@ def display_results(filters, ui_scope: str):
                     if _recipient_tracking_id(row) not in sent_invitations
                 ]
             db_source_total = len(db_source_results)
+            if author_source_mode == AUTHOR_SOURCE_OPENALEX and not db_search_query:
+                st.caption("Tip: type in this database search box to show database recipients, or set Author Source to Database Emails.")
         else:
             st.info("Database email search requires PostgreSQL.")
 
     if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
         results = db_source_results
-    elif is_author_workflow and author_source_mode == AUTHOR_SOURCE_BOTH:
+    elif is_author_workflow and (author_source_mode == AUTHOR_SOURCE_BOTH or db_search_active):
         results = _merge_author_source_results(openalex_results, db_source_results)
     else:
         results = openalex_results
@@ -2548,7 +2557,7 @@ def display_results(filters, ui_scope: str):
             st.info("No results yet. Use the search button above.")
         return
 
-    if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
+    if is_author_workflow and (author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH} or db_search_active):
         db_count = len(db_source_results)
         openalex_count = len(openalex_results)
         st.caption(
