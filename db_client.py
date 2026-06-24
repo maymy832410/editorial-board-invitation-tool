@@ -1344,6 +1344,173 @@ class PostgresStorage:
             print(f"PostgreSQL count author profile candidates error: {e}")
             return 0
 
+    def search_database_email_recipients(
+        self,
+        query: str = "",
+        source: str = "all",
+        limit: int = 500,
+        require_email: bool = True,
+        hide_suppressed: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Search email-bearing recipient records across profile and harvested tables."""
+        if not self.available:
+            return []
+
+        safe_limit = max(1, min(int(limit or 500), 5000))
+        normalized_source = (source or "all").strip().lower()
+        if normalized_source not in {"all", "profiles", "harvested"}:
+            normalized_source = "all"
+
+        terms = [term.strip().lower() for term in re.split(r"\s+", query or "") if term.strip()]
+        like_terms = [f"%{term}%" for term in terms]
+
+        def _term_clause(columns: List[str]) -> str:
+            if not terms:
+                return "TRUE"
+            per_term = []
+            for _ in terms:
+                per_term.append("(" + " OR ".join(f"LOWER(COALESCE({column}, '')) LIKE %s" for column in columns) + ")")
+            return " AND ".join(per_term)
+
+        def _term_params(columns: List[str]) -> List[str]:
+            params: List[str] = []
+            for like_term in like_terms:
+                params.extend([like_term] * len(columns))
+            return params
+
+        rows: List[Dict[str, Any]] = []
+        try:
+            with self._get_cursor() as cur:
+                if normalized_source in {"all", "profiles"}:
+                    profile_columns = [
+                        "profile_key",
+                        "orcid_id",
+                        "openalex_id",
+                        "author_name",
+                        "email",
+                        "email_domain",
+                        "scientific_domain",
+                        "scientific_domains_json",
+                        "publisher",
+                        "source",
+                    ]
+                    cur.execute(
+                        f"""
+                        SELECT
+                            'profiles' AS source_table,
+                            profile_key,
+                            orcid_id,
+                            openalex_id,
+                            author_name,
+                            email,
+                            '' AS all_emails,
+                            '' AS institution,
+                            '' AS country,
+                            scientific_domain AS discipline,
+                            '' AS specialty,
+                            '' AS subfield,
+                            scientific_domain,
+                            scientific_domains_json,
+                            '' AS research_areas,
+                            0 AS h_index,
+                            0 AS works_count,
+                            0 AS cited_by_count,
+                            invitation_count_total,
+                            invitation_count_editorial,
+                            invitation_count_publication,
+                            last_invited_at,
+                            updated_at
+                        FROM {self.PROFILE_TABLE_NAME} p
+                        WHERE (%s = FALSE OR (email <> '' AND email IS NOT NULL))
+                          AND ({_term_clause(profile_columns)})
+                          AND (
+                              %s = FALSE
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM {self.EMAIL_SUPPRESSIONS_TABLE} s
+                                  WHERE s.is_suppressed = TRUE
+                                    AND (
+                                        s.email_lower = p.email_lower
+                                        OR (s.orcid_id <> '' AND s.orcid_id = p.orcid_id)
+                                        OR (s.profile_key <> '' AND s.profile_key = p.profile_key)
+                                    )
+                              )
+                          )
+                        ORDER BY updated_at DESC
+                        LIMIT %s;
+                        """,
+                        [bool(require_email), *_term_params(profile_columns), bool(hide_suppressed), safe_limit],
+                    )
+                    rows.extend(dict(row) for row in cur.fetchall())
+
+                remaining = safe_limit - len(rows)
+                if remaining > 0 and normalized_source in {"all", "harvested"}:
+                    harvested_columns = [
+                        "openalex_id",
+                        "orcid_id",
+                        "author_name",
+                        "email",
+                        "all_emails",
+                        "institution",
+                        "country",
+                        "discipline",
+                        "specialty",
+                        "subfield",
+                        "research_areas",
+                        "all_topics_json",
+                    ]
+                    cur.execute(
+                        f"""
+                        SELECT
+                            'harvested' AS source_table,
+                            '' AS profile_key,
+                            orcid_id,
+                            openalex_id,
+                            author_name,
+                            email,
+                            all_emails,
+                            institution,
+                            country,
+                            discipline,
+                            specialty,
+                            subfield,
+                            discipline AS scientific_domain,
+                            all_topics_json AS scientific_domains_json,
+                            research_areas,
+                            COALESCE(h_index, 0) AS h_index,
+                            COALESCE(works_count, 0) AS works_count,
+                            COALESCE(cited_by_count, 0) AS cited_by_count,
+                            0 AS invitation_count_total,
+                            0 AS invitation_count_editorial,
+                            0 AS invitation_count_publication,
+                            NULL AS last_invited_at,
+                            updated_at
+                        FROM {self.HARVESTED_AUTHORS_TABLE} h
+                        WHERE (%s = FALSE OR (email <> '' AND email IS NOT NULL))
+                          AND ({_term_clause(harvested_columns)})
+                          AND (
+                              %s = FALSE
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM {self.EMAIL_SUPPRESSIONS_TABLE} s
+                                  WHERE s.is_suppressed = TRUE
+                                    AND (
+                                        s.email_lower = LOWER(h.email)
+                                        OR (s.orcid_id <> '' AND s.orcid_id = h.orcid_id)
+                                    )
+                              )
+                          )
+                        ORDER BY updated_at DESC
+                        LIMIT %s;
+                        """,
+                        [bool(require_email), *_term_params(harvested_columns), bool(hide_suppressed), remaining],
+                    )
+                    rows.extend(dict(row) for row in cur.fetchall())
+            return rows[:safe_limit]
+        except Exception as e:
+            print(f"PostgreSQL search database email recipients error: {e}")
+            return []
+
     def get_invitation_counts(self, orcid_ids: List[str]) -> Dict[str, int]:
         """Get invitation counts for a list of ORCID IDs."""
         if not self.available:
@@ -2103,7 +2270,7 @@ class PostgresStorage:
             if identity_key in seen_keys:
                 continue
             seen_keys.add(identity_key)
-            cleaned.append({**recipient, "email": email, "orcid_id": orcid_id})
+            cleaned.append({**recipient, "email": email, "orcid_id": identity_key})
 
         if not cleaned:
             return None

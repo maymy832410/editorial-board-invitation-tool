@@ -202,6 +202,16 @@ def _author_source_label(source_mode: str) -> str:
     return "OpenAlex"
 
 
+def _database_email_source_label(source: str) -> str:
+    """Return a readable label for database email source filters."""
+    labels = {
+        "all": "All database email records",
+        "profiles": "Author profiles",
+        "harvested": "Collected emails",
+    }
+    return labels.get(source, source or "Database")
+
+
 def _publisher_display_label(publisher_id: str) -> str:
     """Return a stable label for the selected publisher/sender."""
     if not EMAIL_AVAILABLE:
@@ -228,6 +238,24 @@ def _tracking_journal_name(invitation_type: str, journal_config: dict) -> str:
 def _typed_invitation_key(orcid_id: str, invitation_type: str, journal_name: str = "") -> str:
     """Build a stable local key for offline typed invitation tracking."""
     return f"{invitation_type}::{journal_name or ''}::{orcid_id or ''}"
+
+
+def _recipient_tracking_id(author: dict, email: str = "") -> str:
+    """Return the stable identity used for sent tracking, falling back to email-only rows."""
+    orcid_id = (author.get('orcid_id') or '').strip()
+    if orcid_id:
+        return orcid_id
+
+    normalized_email = (email or author.get('email') or '').strip().lower()
+    if normalized_email:
+        return f"email:{normalized_email}"
+
+    author_id = (author.get('author_id') or author.get('openalex_id') or '').strip().rstrip('/')
+    if author_id:
+        return f"openalex:{author_id.lower()}"
+
+    profile_key = (author.get('profile_key') or '').strip().lower()
+    return f"profile:{profile_key}" if profile_key else ""
 
 
 def _clean_domain_label(value: str) -> str:
@@ -317,6 +345,51 @@ def _map_db_profile_row_to_author(row: dict) -> dict:
     }
 
 
+def _map_database_email_row_to_author(row: dict) -> dict:
+    """Convert a database email search row into the shared author result schema."""
+    topics = _parse_scientific_domains_json(row.get('scientific_domains_json'))
+    research_areas = _clean_domain_label(row.get('research_areas', ''))
+    if research_areas and not topics:
+        topics = [_clean_domain_label(value) for value in research_areas.split(",") if _clean_domain_label(value)]
+
+    scientific_domain = _clean_domain_label(row.get('scientific_domain', ''))
+    specialty = _clean_domain_label(row.get('specialty', '')) or (topics[0] if topics else "")
+    discipline = _clean_domain_label(row.get('discipline', '')) or scientific_domain or specialty or "Other"
+    source_table = (row.get('source_table') or '').strip()
+    source_origin = AUTHOR_SOURCE_DATABASE
+    email_source = f"db_{source_table}" if source_table else "db"
+
+    orcid_id = (row.get('orcid_id') or '').strip()
+    openalex_id = (row.get('openalex_id') or '').strip()
+    email = (row.get('email') or '').strip()
+    all_emails = (row.get('all_emails') or '').strip() or email
+    author_name = (row.get('author_name') or '').strip() or f"Author {orcid_id or openalex_id or email}"
+
+    return {
+        'profile_key': row.get('profile_key', ''),
+        'author_id': openalex_id,
+        'name': author_name,
+        'orcid_id': orcid_id,
+        'orcid_url': f"https://orcid.org/{orcid_id}" if orcid_id else '',
+        'h_index': row.get('h_index') or None,
+        'works_count': row.get('works_count') or None,
+        'cited_by_count': row.get('cited_by_count') or None,
+        'institution': row.get('institution', '') or '',
+        'country': row.get('country', '') or '',
+        'discipline': discipline,
+        'specialty': specialty,
+        'subfield': row.get('subfield', '') or '',
+        'all_topics': topics,
+        'research_areas': research_areas or ", ".join(topics[:3]),
+        'email': email,
+        'all_emails': all_emails,
+        'email_source': email_source,
+        'scientific_domain': scientific_domain,
+        'source_origin': source_origin,
+        'source_table': source_table,
+    }
+
+
 def _load_author_source_rows_from_db(limit: int) -> list[dict]:
     """Load Author Invitation candidates from author_profiles (ORCID + email only)."""
     if not db_storage.available:
@@ -344,10 +417,43 @@ def _load_author_source_rows_from_db(limit: int) -> list[dict]:
     return [row for row in mapped_rows if row.get('orcid_id') and row.get('email')]
 
 
+def _search_database_email_rows(
+    query: str,
+    source: str,
+    limit: int,
+    require_email: bool,
+    hide_suppressed: bool,
+) -> list[dict]:
+    """Search stored database recipients and map them into author rows."""
+    if not db_storage.available:
+        return []
+    rows = db_storage.search_database_email_recipients(
+        query=query,
+        source=source,
+        limit=limit,
+        require_email=require_email,
+        hide_suppressed=hide_suppressed,
+    )
+    return [_map_database_email_row_to_author(row) for row in rows]
+
+
 def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict]) -> list[dict]:
     """Merge OpenAlex and DB rows by ORCID with deterministic field precedence."""
     merged_rows: list[dict] = []
-    index_by_orcid: dict[str, dict] = {}
+    index_by_key: dict[str, dict] = {}
+
+    def _merge_key(row: dict) -> str:
+        orcid_id = (row.get('orcid_id') or '').strip().lower()
+        if orcid_id:
+            return f"orcid:{orcid_id}"
+        email = (row.get('email') or '').strip().lower()
+        if email:
+            return f"email:{email}"
+        author_id = (row.get('author_id') or row.get('openalex_id') or '').strip().rstrip('/').lower()
+        if author_id:
+            return f"openalex:{author_id}"
+        profile_key = (row.get('profile_key') or '').strip().lower()
+        return f"profile:{profile_key}" if profile_key else ""
 
     for openalex_row in openalex_rows:
         row = dict(openalex_row)
@@ -355,19 +461,17 @@ def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict])
         row.setdefault('source_origin', AUTHOR_SOURCE_OPENALEX)
         row.setdefault('scientific_domain', _clean_domain_label(row.get('discipline', '')))
         merged_rows.append(row)
-        orcid_id = row.get('orcid_id', '')
-        if orcid_id:
-            index_by_orcid[orcid_id] = row
+        key = _merge_key(row)
+        if key:
+            index_by_key[key] = row
 
     for db_row in db_rows:
-        orcid_id = db_row.get('orcid_id', '')
-        if not orcid_id:
-            continue
-
-        existing = index_by_orcid.get(orcid_id)
+        key = _merge_key(db_row)
+        existing = index_by_key.get(key) if key else None
         if not existing:
             merged_rows.append(dict(db_row))
-            index_by_orcid[orcid_id] = merged_rows[-1]
+            if key:
+                index_by_key[key] = merged_rows[-1]
             continue
 
         existing['source_origin'] = AUTHOR_SOURCE_BOTH
@@ -1126,8 +1230,9 @@ def email_dialog(author: dict, filters: dict):
     st.caption(f"Workflow: {_workflow_label(workflow)}")
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
     
+    tracking_id = _recipient_tracking_id(author)
     is_already_notified = is_author_notified(
-        author.get('orcid_id', ''),
+        tracking_id,
         invitation_type=invitation_type,
         journal_name=tracking_journal_name
     )
@@ -1135,8 +1240,12 @@ def email_dialog(author: dict, filters: dict):
     # WARNING BANNER for already notified authors
     if is_already_notified:
         st.error(f"⚠️ WARNING: This author has ALREADY been sent a {_invitation_type_label(invitation_type)} invitation for this tracking scope.")
-    recipient_suppressed = is_recipient_suppressed(author.get('email', ''), author.get('orcid_id', ''))
-    if recipient_suppressed:
+    initial_recipient_suppressed = is_recipient_suppressed(
+        author.get('email', ''),
+        author.get('orcid_id', ''),
+        author.get('profile_key', ''),
+    )
+    if initial_recipient_suppressed:
         st.warning("This recipient has unsubscribed before. Sending is blocked.")
     
     # Author info header
@@ -1225,6 +1334,13 @@ def email_dialog(author: dict, filters: dict):
         value=author.get('email', ''),
         key=f"dialog_to_{author_key}_{invitation_type}"
     )
+    recipient_suppressed = is_recipient_suppressed(
+        to_email,
+        author.get('orcid_id', ''),
+        author.get('profile_key', ''),
+    )
+    if recipient_suppressed and not initial_recipient_suppressed:
+        st.warning("This email address is suppressed. Sending is blocked.")
     subject = st.text_input(
         "Subject",
         value=formatted['subject'],
@@ -1325,8 +1441,9 @@ def email_dialog(author: dict, filters: dict):
                 )
                 
                 if success:
+                    send_tracking_id = _recipient_tracking_id(author, to_email)
                     db_ok = mark_author_notified(
-                        author['orcid_id'],
+                        send_tracking_id,
                         author_name=author.get('name', ''),
                         email=to_email,
                         publisher=publisher_id,
@@ -2341,6 +2458,7 @@ def display_results(filters, ui_scope: str):
     journal_config = st.session_state.app_state.get('journal_config', {})
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
+    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
 
     confirmed_bulk_payload = st.session_state.pop(confirmed_bulk_send_key, None)
     if isinstance(confirmed_bulk_payload, dict):
@@ -2357,8 +2475,64 @@ def display_results(filters, ui_scope: str):
     db_source_limit = int(filters.get('max_results', DEFAULT_MAX_RESULTS))
     if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
         if db_storage.available:
-            db_source_total = db_storage.count_author_profile_candidates()
-        db_source_results = _load_author_source_rows_from_db(limit=db_source_limit)
+            st.markdown("**Search database emails**")
+            db_search_cols = st.columns([2.2, 1.2, 1, 1, 1])
+            with db_search_cols[0]:
+                db_search_query = st.text_input(
+                    "Search database emails",
+                    placeholder="Name, email, affiliation, ORCID, country, specialty...",
+                    key=_scope_key(ui_scope, "database_email_search_query"),
+                    label_visibility="collapsed",
+                ).strip()
+            with db_search_cols[1]:
+                db_search_source = st.selectbox(
+                    "Database source",
+                    options=["all", "profiles", "harvested"],
+                    format_func=_database_email_source_label,
+                    key=_scope_key(ui_scope, "database_email_search_source"),
+                    label_visibility="collapsed",
+                )
+            with db_search_cols[2]:
+                db_require_email = st.checkbox(
+                    "With email",
+                    value=True,
+                    key=_scope_key(ui_scope, "database_email_require_email"),
+                )
+            with db_search_cols[3]:
+                db_hide_suppressed = st.checkbox(
+                    "Hide suppressed",
+                    value=True,
+                    key=_scope_key(ui_scope, "database_email_hide_suppressed"),
+                )
+            with db_search_cols[4]:
+                db_hide_sent = st.checkbox(
+                    "Hide sent",
+                    value=True,
+                    key=_scope_key(ui_scope, "database_email_hide_sent"),
+                )
+            db_source_limit = st.number_input(
+                "Database search result limit",
+                min_value=25,
+                max_value=5000,
+                value=max(25, min(db_source_limit, 5000)),
+                step=25,
+                key=_scope_key(ui_scope, "database_email_search_limit"),
+            )
+            db_source_results = _search_database_email_rows(
+                query=db_search_query,
+                source=db_search_source,
+                limit=int(db_source_limit),
+                require_email=db_require_email,
+                hide_suppressed=db_hide_suppressed,
+            )
+            if db_hide_sent:
+                db_source_results = [
+                    row for row in db_source_results
+                    if _recipient_tracking_id(row) not in sent_invitations
+                ]
+            db_source_total = len(db_source_results)
+        else:
+            st.info("Database email search requires PostgreSQL.")
 
     if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
         results = db_source_results
@@ -2369,7 +2543,7 @@ def display_results(filters, ui_scope: str):
     
     if not results:
         if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
-            st.info("No author_profiles rows with ORCID + email were found in the database source.")
+            st.info("No database email records match the current search and filters.")
         else:
             st.info("No results yet. Use the search button above.")
         return
@@ -2379,13 +2553,8 @@ def display_results(filters, ui_scope: str):
         openalex_count = len(openalex_results)
         st.caption(
             f"Source counts: OpenAlex={openalex_count:,}, "
-            f"DatabaseLoaded={db_count:,}/{db_source_total:,}, Displayed={len(results):,}."
+            f"DatabaseLoaded={db_count:,}, Displayed={len(results):,}."
         )
-        if db_source_total > db_count:
-            st.info(
-                f"Database source currently loads the first {db_count:,} of {db_source_total:,} rows "
-                f"because Max Results is {db_source_limit:,}. Increase Max Results to load more."
-            )
 
         missing_domain_rows = [
             row for row in results
@@ -2486,8 +2655,6 @@ def display_results(filters, ui_scope: str):
             _sync_current_batch_cache()
         save_state()
     
-    # Get sent invitations from DB (persistent) for the active invitation workflow.
-    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
     _render_bulk_job_status(ui_scope)
     
     # Get retracted author names from DB (lowercased set for fast matching)
@@ -2695,7 +2862,7 @@ def display_results(filters, ui_scope: str):
     
     # Apply sent filter
     if show_only_not_sent:
-        filtered = [r for r in filtered if r.get('orcid_id') not in sent_invitations]
+        filtered = [r for r in filtered if _recipient_tracking_id(r) not in sent_invitations]
     
     # Apply retraction filter
     if hide_retracted:
@@ -2770,7 +2937,7 @@ def display_results(filters, ui_scope: str):
         retracted_count = sum(1 for r in filtered if r.get('is_retracted'))
         st.metric("Retracted", retracted_count)
     with col5:
-        sent_count = sum(1 for r in filtered if r.get('orcid_id') in sent_invitations)
+        sent_count = sum(1 for r in filtered if _recipient_tracking_id(r) in sent_invitations)
         st.metric(f"Sent ({_invitation_type_label(invitation_type)})", sent_count)
     
     st.divider()
@@ -2800,9 +2967,11 @@ def display_results(filters, ui_scope: str):
         invited_count = int(invitation_counts.get(orcid_id, 0))
         source_origin = r.get('source_origin', AUTHOR_SOURCE_OPENALEX)
         status = ''
-        if r.get('is_retracted'):
+        if is_recipient_suppressed(r.get('email', ''), orcid_id, r.get('profile_key', '')):
+            status = 'SUPPRESSED'
+        elif r.get('is_retracted'):
             status = '🚫 RETRACTED'
-        elif orcid_id in sent_invitations:
+        elif _recipient_tracking_id(r) in sent_invitations:
             status = f"✅ SENT {_invitation_type_label(invitation_type).upper()}"
         df_data.append({
             'Name': r.get('name', ''),
@@ -2913,7 +3082,11 @@ def display_results(filters, ui_scope: str):
     filtered_with_email = [a for a in filtered if a.get('email')]
     eligible_bulk_authors = prepare_bulk_recipients(
         filtered,
-        is_already_sent=lambda orcid_id: orcid_id in sent_invitations,
+        is_already_sent=lambda recipient_id: recipient_id in sent_invitations,
+        is_suppressed=lambda email, orcid_id: db_storage.is_recipient_suppressed(
+            email,
+            orcid_id=orcid_id,
+        ) if db_storage.available else False,
         retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
     )
 
@@ -3036,9 +3209,15 @@ def display_results(filters, ui_scope: str):
     for idx, author in enumerate(page_results):
         orcid_id = author.get('orcid_id', '')
         invited_count = int(invitation_counts.get(orcid_id, 0))
-        is_notified = orcid_id in sent_invitations
+        tracking_id = _recipient_tracking_id(author)
+        is_notified = tracking_id in sent_invitations
         is_retracted = author.get('is_retracted', False)
         has_email = bool(author.get('email'))
+        is_suppressed = is_recipient_suppressed(
+            author.get('email', ''),
+            orcid_id,
+            author.get('profile_key', ''),
+        )
         
         cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
         
@@ -3052,9 +3231,16 @@ def display_results(filters, ui_scope: str):
             else:
                 st.write(name_display)
             if source_origin != AUTHOR_SOURCE_OPENALEX:
-                st.caption(f"Source: {_author_source_label(source_origin)}")
+                source_label = _author_source_label(source_origin)
+                if author.get('source_table'):
+                    source_label = f"{source_label} / {_database_email_source_label(author.get('source_table'))}"
+                st.caption(f"Source: {source_label}")
+            if author.get('institution'):
+                st.caption(author.get('institution'))
             if invited_count > 0:
                 st.caption(f"Invited: {invited_count}")
+            if is_suppressed:
+                st.caption("Suppressed")
         
         with cols[1]:
             st.write(author.get('h_index', ''))
@@ -3090,7 +3276,14 @@ def display_results(filters, ui_scope: str):
                 st.caption("No email")
         
         with cols[6]:
-            if is_retracted:
+            if is_suppressed:
+                st.button(
+                    "Suppressed",
+                    disabled=True,
+                    key=_scope_key(ui_scope, f"suppressed_{orcid_id}_{start_idx + idx}"),
+                    use_container_width=True
+                )
+            elif is_retracted:
                 st.button(
                     "🚫",
                     disabled=True,

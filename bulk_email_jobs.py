@@ -28,8 +28,12 @@ def prepare_bulk_recipients(
         normalized_email = email.lower()
         if is_suppressed and is_suppressed(email, orcid_id):
             continue
+        tracking_id = orcid_id or f"email:{normalized_email}"
+        if is_already_sent(tracking_id):
+            continue
+
         if orcid_id:
-            if orcid_id in seen_orcids or is_already_sent(orcid_id):
+            if orcid_id in seen_orcids:
                 continue
             seen_orcids.add(orcid_id)
         elif normalized_email in seen_emails:
