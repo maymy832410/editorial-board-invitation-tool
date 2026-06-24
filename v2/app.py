@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request, Response, Form, Cookie, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 # Add parent directory to path so we can reuse existing modules.
 # Use append (not insert at 0) to avoid shadowing the v2 app module.
@@ -140,11 +141,21 @@ app.mount("/static", StaticFiles(directory=str(PARENT_DIR / "v2" / "static")), n
 # Also mount shared static assets from parent (logos, pdf templates)
 app.mount("/assets", StaticFiles(directory=str(PARENT_DIR)), name="assets")
 
-# Templates
-templates = Jinja2Templates(directory=str(PARENT_DIR / "v2" / "templates"))
+# Templates — use raw Jinja2 Environment to avoid Starlette's
+# TemplateResponse cache bug with unhashable context dicts
+_templates_dir = str(PARENT_DIR / "v2" / "templates")
+jinja_env = Environment(
+    loader=FileSystemLoader(_templates_dir),
+    autoescape=select_autoescape(["html", "xml"]),
+    enable_async=False,
+)
+jinja_env.filters["json_dumps"] = json.dumps
 
-# Add custom filters to Jinja2
-templates.env.filters["json_dumps"] = json.dumps
+
+def render_template(name: str, context: dict) -> HTMLResponse:
+    """Render a Jinja2 template and return HTMLResponse."""
+    template = jinja_env.get_template(name)
+    return HTMLResponse(content=template.render(context))
 
 
 # ── Session middleware ─────────────────────────────────────────────
@@ -177,7 +188,7 @@ async def index(request: Request, response: Response):
     db = get_db()
     sd = get_or_create_session(request, response)
 
-    return templates.TemplateResponse("dashboard.html", {
+    return render_template("dashboard.html", {
         "request": request,
         "session_id": sd.session_id,
         "db_available": db.available,
@@ -214,7 +225,7 @@ async def update_session_endpoint(
 async def search_page(request: Request, response: Response):
     """Search panel with filters."""
     sd = get_or_create_session(request, response)
-    return templates.TemplateResponse("partials/search_panel.html", {
+    return render_template("partials/search_panel.html", {
         "request": request,
         "countries": COUNTRIES,
         "disciplines": ALL_DISCIPLINES,
@@ -253,7 +264,7 @@ async def search_openalex(
     try:
         topic_ids = client.search_topics(keywords) if keywords else []
     except OpenAlexRequestError:
-        return templates.TemplateResponse("partials/error_message.html", {
+        return render_template("partials/error_message.html", {
             "request": request,
             "message": "Failed to resolve keywords to topics. Check your connection.",
         })
@@ -282,7 +293,7 @@ async def search_openalex(
             if next_cursor:
                 cache["checkpoints"][str(batch_offset + 1)] = next_cursor
         except OpenAlexRequestError as e:
-            return templates.TemplateResponse("partials/error_message.html", {
+            return render_template("partials/error_message.html", {
                 "request": request,
                 "message": f"OpenAlex API error: {str(e)}",
             })
@@ -324,7 +335,7 @@ async def search_openalex(
         except OpenAlexRequestError:
             pass
 
-    return templates.TemplateResponse("partials/results_table.html", {
+    return render_template("partials/results_table.html", {
         "request": request,
         "authors": current_batch,
         "batch_offset": batch_offset,
@@ -352,7 +363,7 @@ async def search_database(
     db = get_db()
 
     if not db.available:
-        return templates.TemplateResponse("partials/error_message.html", {
+        return render_template("partials/error_message.html", {
             "request": request,
             "message": "Database not available.",
         })
@@ -365,7 +376,7 @@ async def search_database(
     sd.search_results = authors
     sd.save()
 
-    return templates.TemplateResponse("partials/results_table.html", {
+    return render_template("partials/results_table.html", {
         "request": request,
         "authors": authors,
         "batch_offset": 0,
@@ -435,7 +446,7 @@ async def search_both(
     sd.search_results = merged
     sd.save()
 
-    return templates.TemplateResponse("partials/results_table.html", {
+    return render_template("partials/results_table.html", {
         "request": request,
         "authors": merged,
         "batch_offset": 0,
@@ -467,14 +478,14 @@ async def get_results_batch(
             batch_key = key
 
     if not batch_key or batch_key not in batch_cache:
-        return templates.TemplateResponse("partials/error_message.html", {
+        return render_template("partials/error_message.html", {
             "request": request,
             "message": "No cached results. Please run a search first.",
         })
 
     cache = batch_cache[batch_key]
     if batch_offset >= len(cache["batches"]):
-        return templates.TemplateResponse("partials/error_message.html", {
+        return render_template("partials/error_message.html", {
             "request": request,
             "message": "Batch not available yet. Use 'Next' to load more.",
         })
@@ -486,7 +497,7 @@ async def get_results_batch(
     if db.available:
         authors = _hydrate_emails_from_db(db, authors)
 
-    return templates.TemplateResponse("partials/results_table.html", {
+    return render_template("partials/results_table.html", {
         "request": request,
         "authors": authors,
         "batch_offset": batch_offset,
@@ -514,7 +525,7 @@ async def author_invite_dialog(
     # Find author in search results
     author = _find_author_in_session(sd, orcid_id)
     if not author:
-        return templates.TemplateResponse("partials/error_message.html", {
+        return render_template("partials/error_message.html", {
             "request": request,
             "message": "Author not found in current results.",
         })
@@ -581,7 +592,7 @@ async def author_invite_dialog(
         INVITATION_TYPE_PUBLICATION if invitation_type == WORKFLOW_AUTHOR else INVITATION_TYPE_EDITORIAL
     )
 
-    return templates.TemplateResponse("partials/invite_dialog.html", {
+    return render_template("partials/invite_dialog.html", {
         "request": request,
         "author": author,
         "invitation_type": invitation_type_value,
@@ -762,7 +773,7 @@ async def bulk_send_preview(
     authors = [a for a in authors if a]
 
     if not authors:
-        return templates.TemplateResponse("partials/error_message.html", {
+        return render_template("partials/error_message.html", {
             "request": request,
             "message": "No valid authors selected.",
         })
@@ -791,7 +802,7 @@ async def bulk_send_preview(
     # Get template options
     template_names = get_template_names(invitation_type)
 
-    return templates.TemplateResponse("partials/bulk_preview.html", {
+    return render_template("partials/bulk_preview.html", {
         "request": request,
         "recipients": recipients,
         "total_count": len(authors),
@@ -901,7 +912,7 @@ async def collection_panel(request: Request, response: Response):
             r = cur.fetchone()
             run_status["queue_pending"] = r[0] if r else 0
 
-    return templates.TemplateResponse("collection.html", {
+    return render_template("collection.html", {
         "request": request,
         "run_status": run_status,
         "countries": COUNTRIES,
@@ -1018,7 +1029,7 @@ async def invitation_history(request: Request, response: Response):
                     "sent_at": str(row[5]) if row[5] else "",
                 })
 
-    return templates.TemplateResponse("history.html", {
+    return render_template("history.html", {
         "request": request,
         "invitations": invitations,
     })
@@ -1057,7 +1068,7 @@ async def bulk_job_status(request: Request, response: Response):
                     "last_error": row[11],
                 })
 
-    return templates.TemplateResponse("partials/job_status.html", {
+    return render_template("partials/job_status.html", {
         "request": request,
         "jobs": jobs,
     })
@@ -1069,7 +1080,7 @@ async def handle_unsubscribe(request: Request, response: Response, token: str = 
     db = get_db()
 
     if not token or not db.available:
-        return templates.TemplateResponse("unsubscribe_result.html", {
+        return render_template("unsubscribe_result.html", {
             "request": request,
             "success": False,
             "message": "Invalid unsubscribe link.",
@@ -1077,7 +1088,7 @@ async def handle_unsubscribe(request: Request, response: Response, token: str = 
 
     record = db.get_email_suppression_by_token(token)
     if not record:
-        return templates.TemplateResponse("unsubscribe_result.html", {
+        return render_template("unsubscribe_result.html", {
             "request": request,
             "success": False,
             "message": "This unsubscribe link is invalid or has expired.",
@@ -1092,13 +1103,13 @@ async def handle_unsubscribe(request: Request, response: Response, token: str = 
     )
 
     if result:
-        return templates.TemplateResponse("unsubscribe_result.html", {
+        return render_template("unsubscribe_result.html", {
             "request": request,
             "success": True,
             "message": "You have been unsubscribed successfully. No further emails will be sent.",
         })
 
-    return templates.TemplateResponse("unsubscribe_result.html", {
+    return render_template("unsubscribe_result.html", {
         "request": request,
         "success": False,
         "message": "Unable to process unsubscribe request. Please contact us directly.",
@@ -1185,7 +1196,7 @@ async def list_presets(request: Request, response: Response):
     if db.available:
         presets = db.list_journal_presets()
 
-    return templates.TemplateResponse("partials/preset_list.html", {
+    return render_template("partials/preset_list.html", {
         "request": request,
         "presets": presets,
     })
