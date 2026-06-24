@@ -889,20 +889,26 @@ async def collection_panel(request: Request, response: Response):
     if db.available:
         with db._get_cursor() as cur:
             cur.execute("""
-                SELECT status, config
+                SELECT status, keyword_tags, disciplines_json, specialties_json,
+                       exclude_countries_json, h_index_min, h_index_max,
+                       baseline_concurrency, baseline_delay
                 FROM collection_runs
                 LIMIT 1
             """)
             row = cur.fetchone()
             if row:
+                import json as _json
                 run_status["status"] = row[0] or "idle"
-                config = row[1] or {}
-                if isinstance(config, str):
-                    try:
-                        config = json.loads(config)
-                    except json.JSONDecodeError:
-                        config = {}
-                run_status["config"] = config
+                run_status["config"] = {
+                    "keywords": row[1] or "",
+                    "disciplines": _json.loads(row[2] or "[]"),
+                    "specialty_terms": _json.loads(row[3] or "[]"),
+                    "exclude_countries": _json.loads(row[4] or "[]"),
+                    "h_index_min": row[5] or 10,
+                    "h_index_max": row[6] or 50,
+                    "baseline_concurrency": row[7] or 2,
+                    "baseline_delay_sec": row[8] or 3.0,
+                }
 
             cur.execute("SELECT COUNT(*) FROM harvested_authors WHERE email_status = 'found'")
             r = cur.fetchone()
@@ -994,12 +1000,31 @@ async def collection_save_config(
         with db._get_cursor() as cur:
             cur.execute("SELECT id FROM collection_runs LIMIT 1")
             row = cur.fetchone()
+            disciplines_json = json.dumps([d for d in disciplines.split(",") if d])
+            specialties_json = json.dumps([s.strip() for s in specialty_terms.split(",") if s.strip()])
+            exclude_countries_json = json.dumps([c for c in exclude_countries.split(",") if c])
             if row:
-                cur.execute("UPDATE collection_runs SET config = %s WHERE id = %s",
-                           (json.dumps(config), row[0]))
+                cur.execute("""
+                    UPDATE collection_runs SET 
+                        keyword_tags = %s,
+                        disciplines_json = %s,
+                        specialties_json = %s,
+                        exclude_countries_json = %s,
+                        h_index_min = %s,
+                        h_index_max = %s,
+                        baseline_concurrency = %s,
+                        baseline_delay = %s
+                    WHERE id = %s
+                """, (keywords, disciplines_json, specialties_json, exclude_countries_json,
+                      h_index_min, h_index_max, baseline_concurrency, baseline_delay, row[0]))
             else:
-                cur.execute("INSERT INTO collection_runs (status, config) VALUES (%s, %s)",
-                           (RUN_STATUS_IDLE, json.dumps(config)))
+                cur.execute("""
+                    INSERT INTO collection_runs (id, status, keyword_tags, disciplines_json,
+                        specialties_json, exclude_countries_json, h_index_min, h_index_max,
+                        baseline_concurrency, baseline_delay)
+                    VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (RUN_STATUS_IDLE, keywords, disciplines_json, specialties_json,
+                      exclude_countries_json, h_index_min, h_index_max, baseline_concurrency, baseline_delay))
 
     return JSONResponse({"ok": True, "message": "Collection config saved"})
 
