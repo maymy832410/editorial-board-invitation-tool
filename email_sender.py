@@ -165,6 +165,7 @@ class EmailSender:
         journal_cite_score: str = "",
         journal_quartile: str = "",
         html_body: Optional[str] = None,
+        unsubscribe_url: str = "",
     ) -> Tuple[bool, str]:
         """
         Send an email using the publisher's first account.
@@ -202,6 +203,14 @@ class EmailSender:
                     scopus_indexed=scopus_indexed,
                     journal_cite_score=journal_cite_score,
                     journal_quartile=journal_quartile,
+                    unsubscribe_url=unsubscribe_url,
+                )
+            text_body = body
+            if unsubscribe_url:
+                text_body = (
+                    f"{body}\n\n"
+                    "To unsubscribe from future invitations, visit:\n"
+                    f"{unsubscribe_url}"
                 )
             brevo_api_key = os.environ.get("BREVO_API_KEY", "").strip()
             if brevo_api_key and "brevo" in (pub_config.get("smtp_server") or "").lower():
@@ -212,7 +221,7 @@ class EmailSender:
                     to_email=to_email,
                     to_name=to_name,
                     subject=subject,
-                    body=body,
+                    body=text_body,
                     html_body=html_body,
                     pdf_attachment=pdf_attachment,
                     attachment_filename=attachment_filename,
@@ -225,6 +234,8 @@ class EmailSender:
 
             message["Subject"] = subject
             message["From"] = formataddr((pub_config['name'], sender_email))
+            if unsubscribe_url:
+                message["List-Unsubscribe"] = f"<{unsubscribe_url}>"
 
             if to_name:
                 safe_name = ''.join(c for c in to_name if c.isalnum() or c in ' .-')
@@ -233,7 +244,7 @@ class EmailSender:
                 message["To"] = to_email
 
             body_part = MIMEMultipart("alternative")
-            text_part = MIMEText(body, "plain", "utf-8")
+            text_part = MIMEText(text_body, "plain", "utf-8")
             body_part.attach(text_part)
             html_part = MIMEText(html_body, "html", "utf-8")
             body_part.attach(html_part)
@@ -403,6 +414,7 @@ class EmailSender:
         journal_cite_score: str,
         journal_quartile: str,
         subject: str = "",
+        unsubscribe_url: str = "",
     ) -> str:
         """Render a premium navy-themed HTML email with branding and CTA buttons."""
         logo_data_uri = self._get_logo_data_uri(publisher_id)
@@ -422,6 +434,7 @@ class EmailSender:
         safe_journal_name = html.escape(journal_name or "Academic Journal")
         safe_subject = html.escape(subject or "Invitation")
         safe_invitation_label = html.escape(invitation_label)
+        unsubscribe_html = self._build_unsubscribe_html(unsubscribe_url)
 
         logo_block = ""
         if logo_data_uri:
@@ -495,6 +508,7 @@ class EmailSender:
                         <td style="padding:0 32px 30px 32px; font-family:Arial, Helvetica, sans-serif; color:#5f6f87; font-size:12px; line-height:1.62; border-top:1px solid #e2eaf5;">
                             <div style="padding-top:16px;">This invitation was sent by {safe_publisher_name}.</div>
               <div>If a button does not open, copy and paste the links from the message body.</div>
+              {unsubscribe_html}
             </td>
           </tr>
         </table>
@@ -811,6 +825,25 @@ class EmailSender:
             "</div>"
             '<div style="margin:0;">' + "".join(links_html) + "</div>"
         )
+
+    def _build_unsubscribe_html(self, unsubscribe_url: str) -> str:
+        """Render a visible unsubscribe control for the email footer."""
+        if not unsubscribe_url:
+            return ""
+        safe_url = html.escape(unsubscribe_url.strip(), quote=True)
+        return (
+            '<div style="margin-top:18px; padding-top:14px; border-top:1px solid #d7e1ec;">'
+            '<a href="{href}" target="_blank" '
+            'style="display:inline-block; padding:10px 16px; font-family:Arial, Helvetica, sans-serif; '
+            'font-size:13px; font-weight:700; color:#a11a1a; text-decoration:none; '
+            'background:#fff5f5; border:1px solid #efb5b5; border-radius:999px;">'
+            'Unsubscribe'
+            '</a>'
+            '<div style="margin-top:8px; color:#6d7a8d;">'
+            'You may opt out of future invitations at any time.'
+            '</div>'
+            '</div>'
+        ).format(href=safe_url)
 
     def test_connection(self, publisher_id: str) -> Tuple[bool, str]:
         """Test SMTP connection using the publisher's first account."""

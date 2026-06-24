@@ -1,6 +1,7 @@
 """Background processor for durable bulk invitation email jobs."""
 
 import json
+import os
 import time
 from typing import Any, Dict, List
 
@@ -122,6 +123,12 @@ class BulkEmailWorker:
 
         if not to_email or "@" not in to_email:
             raise ValueError("Recipient has no valid email")
+        if self.storage.is_recipient_suppressed(
+            to_email,
+            orcid_id=orcid_id,
+            profile_key=recipient.get("profile_key") or "",
+        ):
+            raise DuplicateInvitationError("Recipient unsubscribed; skipped before sending")
         if orcid_id and self.storage.is_sent(
             orcid_id,
             invitation_type,
@@ -203,6 +210,11 @@ class BulkEmailWorker:
             scopus_indexed=bool(job.get("scopus_indexed")),
             journal_cite_score=journal_config.get("cite_score", ""),
             journal_quartile=journal_config.get("quartile", ""),
+            unsubscribe_url=self._build_unsubscribe_url(
+                to_email,
+                orcid_id=orcid_id,
+                profile_key=recipient.get("profile_key") or "",
+            ),
         )
         if not success:
             raise RuntimeError(message)
@@ -218,10 +230,31 @@ class BulkEmailWorker:
                 template_id=template_id,
                 cite_score=journal_config.get("cite_score", ""),
                 quartile=journal_config.get("quartile", ""),
-            )
+                )
             if not saved:
                 print("Bulk email sent, but sent status could not be saved", flush=True)
         return message
+
+    def _build_unsubscribe_url(self, email: str, orcid_id: str = "", profile_key: str = "") -> str:
+        """Create or reuse an unsubscribe token URL for one recipient."""
+        if not self.storage.available:
+            return ""
+        record = self.storage.register_unsubscribe_token(
+            email,
+            orcid_id=orcid_id,
+            profile_key=profile_key,
+        )
+        if not record:
+            return ""
+        token = record.get("unsubscribe_token", "")
+        if not token:
+            return ""
+        base_url = (
+            os.environ.get("PUBLIC_APP_BASE_URL")
+            or os.environ.get("PUBLIC_ASSET_BASE_URL")
+            or "https://editorial-board-app-production.up.railway.app"
+        ).strip().rstrip("/")
+        return f"{base_url}/?action=unsubscribe&token={token}"
 
     def _resolve_template_id(self, job: Dict[str, Any], recipient: Dict[str, Any]) -> str:
         return job.get("template_id") or TEMPLATE_BOARD_MEMBER

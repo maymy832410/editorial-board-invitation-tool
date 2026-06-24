@@ -3,6 +3,7 @@
 import os
 import json
 import re
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Set, Dict, List, Any
 from urllib.parse import urlparse
@@ -46,6 +47,7 @@ BULK_RECIPIENT_STATUS_SENDING = "sending"
 BULK_RECIPIENT_STATUS_SENT = "sent"
 BULK_RECIPIENT_STATUS_FAILED = "failed"
 BULK_RECIPIENT_STATUS_SKIPPED = "skipped"
+EMAIL_SUPPRESSION_SOURCE_UNSUBSCRIBE = "unsubscribe_link"
 
 
 def _normalize_text(value: Optional[str]) -> str:
@@ -151,6 +153,7 @@ class PostgresStorage:
     BULK_EMAIL_JOBS_TABLE = "bulk_email_jobs"
     BULK_EMAIL_RECIPIENTS_TABLE = "bulk_email_recipients"
     JOURNAL_PRESETS_TABLE = "journal_presets"
+    EMAIL_SUPPRESSIONS_TABLE = "email_suppressions"
 
     def __init__(self):
         self.available = False
@@ -293,6 +296,32 @@ class PostgresStorage:
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_retracted_name_lower
                 ON retracted_authors (author_name_lower);
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.EMAIL_SUPPRESSIONS_TABLE} (
+                    id               SERIAL PRIMARY KEY,
+                    email_lower      TEXT NOT NULL UNIQUE,
+                    orcid_id         TEXT DEFAULT '',
+                    profile_key      TEXT DEFAULT '',
+                    unsubscribe_token TEXT NOT NULL UNIQUE,
+                    is_suppressed    BOOLEAN DEFAULT FALSE,
+                    reason           TEXT DEFAULT '',
+                    source           TEXT DEFAULT '{EMAIL_SUPPRESSION_SOURCE_UNSUBSCRIBE}',
+                    suppressed_at    TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at       TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute(f"""
+                ALTER TABLE {self.EMAIL_SUPPRESSIONS_TABLE}
+                ADD COLUMN IF NOT EXISTS is_suppressed BOOLEAN DEFAULT FALSE;
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_email_suppressions_orcid
+                ON {self.EMAIL_SUPPRESSIONS_TABLE} (orcid_id);
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_email_suppressions_profile_key
+                ON {self.EMAIL_SUPPRESSIONS_TABLE} (profile_key);
             """)
             self._ensure_collection_tables(cur)
             self._ensure_bulk_email_tables(cur)
@@ -1566,6 +1595,476 @@ class PostgresStorage:
         except Exception as e:
             print(f"PostgreSQL remove_sent error: {e}")
             return False
+
+    def get_email_suppression_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Look up a suppression record by unsubscribe token."""
+        if not self.available or not token:
+            return None
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.EMAIL_SUPPRESSIONS_TABLE}
+                    WHERE unsubscribe_token = %s
+                    LIMIT 1;
+                    """,
+                    (token,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"PostgreSQL get email suppression by token error: {e}")
+            return None
+
+    def is_email_suppressed(self, email: str) -> bool:
+        """Check whether a normalized email has an active suppression record."""
+        if not self.available:
+            return False
+        normalized_email = _normalize_email(email)
+        if not normalized_email:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT 1
+                    FROM {self.EMAIL_SUPPRESSIONS_TABLE}
+                    WHERE email_lower = %s
+                      AND is_suppressed = TRUE
+                    LIMIT 1;
+                    """,
+                    (normalized_email,),
+                )
+                return cur.fetchone() is not None
+        except Exception as e:
+            print(f"PostgreSQL is_email_suppressed error: {e}")
+            return False
+
+    def is_recipient_suppressed(
+        self,
+        email: str,
+        orcid_id: str = "",
+        profile_key: str = "",
+    ) -> bool:
+        """Check whether a recipient should be suppressed from future sends."""
+        if not self.available:
+            return False
+        normalized_email = _normalize_email(email)
+        normalized_orcid = _normalize_orcid(orcid_id)
+        normalized_profile_key = _normalize_text(profile_key)
+        if not normalized_email and not normalized_orcid and not normalized_profile_key:
+            return False
+
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT 1
+                    FROM {self.EMAIL_SUPPRESSIONS_TABLE}
+                    WHERE (email_lower = %s AND is_suppressed = TRUE)
+                       OR (%s <> '' AND orcid_id = %s AND is_suppressed = TRUE)
+                       OR (%s <> '' AND profile_key = %s AND is_suppressed = TRUE)
+                    LIMIT 1;
+                    """,
+                    (
+                        normalized_email,
+                        normalized_orcid,
+                        normalized_orcid,
+                        normalized_profile_key,
+                        normalized_profile_key,
+                    ),
+                )
+                return cur.fetchone() is not None
+        except Exception as e:
+            print(f"PostgreSQL is_recipient_suppressed error: {e}")
+            return False
+
+    def _collect_suppression_identifiers(
+        self,
+        cur,
+        email: str,
+        orcid_id: str = "",
+        profile_key: str = "",
+    ) -> Dict[str, Set[str]]:
+        """Collect known identifiers before purging personal mailing data."""
+        identifiers: Dict[str, Set[str]] = {
+            "emails": set(),
+            "orcids": set(),
+            "profile_keys": set(),
+            "openalex_ids": set(),
+        }
+        normalized_email = _normalize_email(email)
+        normalized_orcid = _normalize_orcid(orcid_id)
+        normalized_profile_key = _normalize_text(profile_key)
+        if normalized_email:
+            identifiers["emails"].add(normalized_email)
+        if normalized_orcid:
+            identifiers["orcids"].add(normalized_orcid)
+        if normalized_profile_key:
+            identifiers["profile_keys"].add(normalized_profile_key)
+
+        # Iterate a few times so identifiers found in one table can expose matches in another.
+        for _ in range(3):
+            before = sum(len(values) for values in identifiers.values())
+            emails = sorted(identifiers["emails"]) or [""]
+            orcids = sorted(identifiers["orcids"]) or [""]
+            profile_keys = sorted(identifiers["profile_keys"]) or [""]
+            openalex_ids = sorted(identifiers["openalex_ids"]) or [""]
+
+            cur.execute(
+                f"""
+                SELECT profile_key, orcid_id, openalex_id, email_lower, email
+                FROM {self.PROFILE_TABLE_NAME}
+                WHERE email_lower = ANY(%s)
+                   OR email = ANY(%s)
+                   OR orcid_id = ANY(%s)
+                   OR profile_key = ANY(%s)
+                   OR openalex_id = ANY(%s);
+                """,
+                (emails, emails, orcids, profile_keys, openalex_ids),
+            )
+            for row in cur.fetchall():
+                identifiers["profile_keys"].add(_normalize_text(row.get("profile_key")))
+                identifiers["orcids"].add(_normalize_orcid(row.get("orcid_id")))
+                identifiers["openalex_ids"].add(_normalize_openalex_id(row.get("openalex_id")))
+                identifiers["emails"].add(_normalize_email(row.get("email_lower") or row.get("email")))
+
+            cur.execute(
+                f"""
+                SELECT orcid_id, openalex_id, email
+                FROM {self.TABLE_NAME}
+                WHERE LOWER(email) = ANY(%s)
+                   OR orcid_id = ANY(%s)
+                   OR openalex_id = ANY(%s);
+                """,
+                (emails, orcids, openalex_ids),
+            )
+            for row in cur.fetchall():
+                identifiers["orcids"].add(_normalize_orcid(row.get("orcid_id")))
+                identifiers["openalex_ids"].add(_normalize_openalex_id(row.get("openalex_id")))
+                identifiers["emails"].add(_normalize_email(row.get("email")))
+
+            cur.execute(
+                f"""
+                SELECT orcid_id, email
+                FROM {self.INVITATION_TABLE_NAME}
+                WHERE LOWER(email) = ANY(%s)
+                   OR orcid_id = ANY(%s);
+                """,
+                (emails, orcids),
+            )
+            for row in cur.fetchall():
+                identifiers["orcids"].add(_normalize_orcid(row.get("orcid_id")))
+                identifiers["emails"].add(_normalize_email(row.get("email")))
+
+            cur.execute(
+                f"""
+                SELECT openalex_id, orcid_id, email, all_emails
+                FROM {self.HARVESTED_AUTHORS_TABLE}
+                WHERE LOWER(email) = ANY(%s)
+                   OR orcid_id = ANY(%s)
+                   OR openalex_id = ANY(%s)
+                   OR LOWER(all_emails) LIKE %s;
+                """,
+                (
+                    emails,
+                    orcids,
+                    openalex_ids,
+                    f"%{normalized_email}%" if normalized_email else "__never_match__",
+                ),
+            )
+            for row in cur.fetchall():
+                identifiers["openalex_ids"].add(_normalize_openalex_id(row.get("openalex_id")))
+                identifiers["orcids"].add(_normalize_orcid(row.get("orcid_id")))
+                identifiers["emails"].add(_normalize_email(row.get("email")))
+
+            cur.execute(
+                f"""
+                SELECT orcid_id, openalex_id, email
+                FROM {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                WHERE LOWER(email) = ANY(%s)
+                   OR orcid_id = ANY(%s)
+                   OR openalex_id = ANY(%s);
+                """,
+                (emails, orcids, openalex_ids),
+            )
+            for row in cur.fetchall():
+                identifiers["orcids"].add(_normalize_orcid(row.get("orcid_id")))
+                identifiers["openalex_ids"].add(_normalize_openalex_id(row.get("openalex_id")))
+                identifiers["emails"].add(_normalize_email(row.get("email")))
+
+            for key in list(identifiers):
+                identifiers[key] = {value for value in identifiers[key] if value}
+            after = sum(len(values) for values in identifiers.values())
+            if after == before:
+                break
+        return identifiers
+
+    def _purge_suppressed_recipient_data(
+        self,
+        cur,
+        identifiers: Dict[str, Set[str]],
+        suppressed_email: str,
+    ) -> Set[int]:
+        """Remove or anonymize mailing-source personal data for a suppressed recipient."""
+        emails = sorted(identifiers.get("emails") or {suppressed_email})
+        orcids = sorted(identifiers.get("orcids") or [])
+        profile_keys = sorted(identifiers.get("profile_keys") or [])
+        openalex_ids = sorted(identifiers.get("openalex_ids") or [])
+        affected_job_ids: Set[int] = set()
+
+        cur.execute(
+            f"""
+            DELETE FROM {self.PROFILE_TABLE_NAME}
+            WHERE email_lower = ANY(%s)
+               OR email = ANY(%s)
+               OR orcid_id = ANY(%s)
+               OR profile_key = ANY(%s)
+               OR openalex_id = ANY(%s);
+            """,
+            (emails, emails, orcids or [""], profile_keys or [""], openalex_ids or [""]),
+        )
+        cur.execute(
+            f"""
+            DELETE FROM {self.HARVESTED_AUTHORS_TABLE}
+            WHERE LOWER(email) = ANY(%s)
+               OR orcid_id = ANY(%s)
+               OR openalex_id = ANY(%s)
+               OR LOWER(all_emails) LIKE %s;
+            """,
+            (
+                emails,
+                orcids or [""],
+                openalex_ids or [""],
+                f"%{suppressed_email}%" if suppressed_email else "__never_match__",
+            ),
+        )
+        cur.execute(
+            f"""
+            DELETE FROM {self.TABLE_NAME}
+            WHERE LOWER(email) = ANY(%s)
+               OR orcid_id = ANY(%s)
+               OR openalex_id = ANY(%s);
+            """,
+            (emails, orcids or [""], openalex_ids or [""]),
+        )
+        cur.execute(
+            f"""
+            UPDATE {self.INVITATION_TABLE_NAME}
+            SET orcid_id = 'suppressed:' || id::TEXT,
+                author_name = '',
+                email = '',
+                email_domain = '',
+                publisher = ''
+            WHERE LOWER(email) = ANY(%s)
+               OR orcid_id = ANY(%s);
+            """,
+            (emails, orcids or [""]),
+        )
+        cur.execute(
+            f"""
+            SELECT DISTINCT job_id
+            FROM {self.BULK_EMAIL_RECIPIENTS_TABLE}
+            WHERE LOWER(email) = ANY(%s)
+               OR orcid_id = ANY(%s)
+               OR openalex_id = ANY(%s);
+            """,
+            (emails, orcids or [""], openalex_ids or [""]),
+        )
+        affected_job_ids = {int(row["job_id"]) for row in cur.fetchall() if row.get("job_id")}
+        cur.execute(
+            f"""
+            UPDATE {self.BULK_EMAIL_RECIPIENTS_TABLE}
+            SET status = CASE
+                    WHEN status IN (%s, %s) THEN %s
+                    ELSE status
+                END,
+                orcid_id = '',
+                author_name = '',
+                email = '',
+                openalex_id = '',
+                specialty = '',
+                research_areas = '',
+                all_topics_json = '[]',
+                recent_publications_json = '[]',
+                last_error = CASE
+                    WHEN status IN (%s, %s) THEN 'Recipient unsubscribed'
+                    ELSE last_error
+                END,
+                updated_at = NOW()
+            WHERE LOWER(email) = ANY(%s)
+               OR orcid_id = ANY(%s)
+               OR openalex_id = ANY(%s);
+            """,
+            (
+                BULK_RECIPIENT_STATUS_PENDING,
+                BULK_RECIPIENT_STATUS_SENDING,
+                BULK_RECIPIENT_STATUS_SKIPPED,
+                BULK_RECIPIENT_STATUS_PENDING,
+                BULK_RECIPIENT_STATUS_SENDING,
+                emails,
+                orcids or [""],
+                openalex_ids or [""],
+            ),
+        )
+        return affected_job_ids
+
+    def suppress_recipient(
+        self,
+        email: str,
+        orcid_id: str = "",
+        profile_key: str = "",
+        reason: str = "Unsubscribed via email link",
+        source: str = EMAIL_SUPPRESSION_SOURCE_UNSUBSCRIBE,
+    ) -> Optional[Dict[str, Any]]:
+        """Create or update a suppression row for a recipient."""
+        if not self.available:
+            return None
+        normalized_email = _normalize_email(email)
+        if not normalized_email:
+            return None
+        normalized_orcid = _normalize_orcid(orcid_id)
+        normalized_profile_key = _normalize_text(profile_key)
+        affected_job_ids: Set[int] = set()
+
+        try:
+            with self._get_cursor() as cur:
+                identifiers = self._collect_suppression_identifiers(
+                    cur,
+                    normalized_email,
+                    orcid_id=normalized_orcid,
+                    profile_key=normalized_profile_key,
+                )
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.EMAIL_SUPPRESSIONS_TABLE}
+                    WHERE email_lower = %s
+                    LIMIT 1;
+                    """,
+                    (normalized_email,),
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        f"""
+                        UPDATE {self.EMAIL_SUPPRESSIONS_TABLE}
+                        SET is_suppressed = TRUE,
+                            suppressed_at = COALESCE(suppressed_at, NOW()),
+                            updated_at = NOW(),
+                            orcid_id = '',
+                            profile_key = '',
+                            reason = CASE
+                                WHEN %s <> '' THEN %s
+                                ELSE reason
+                            END,
+                            source = CASE
+                                WHEN %s <> '' THEN %s
+                                ELSE source
+                            END
+                        WHERE email_lower = %s
+                        RETURNING *;
+                        """,
+                        (
+                            reason,
+                            reason,
+                            source,
+                            source,
+                            normalized_email,
+                        ),
+                    )
+                    updated = cur.fetchone()
+                    result = dict(updated) if updated else dict(row)
+                    affected_job_ids = self._purge_suppressed_recipient_data(
+                        cur,
+                        identifiers,
+                        normalized_email,
+                    )
+                    for job_id in affected_job_ids:
+                        self._refresh_bulk_job_counts(job_id)
+                    return result
+
+                token = secrets.token_urlsafe(24)
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.EMAIL_SUPPRESSIONS_TABLE}
+                        (email_lower, orcid_id, profile_key, unsubscribe_token, is_suppressed, reason, source, suppressed_at, updated_at)
+                    VALUES (%s, '', '', %s, TRUE, %s, %s, NOW(), NOW())
+                    RETURNING *;
+                    """,
+                    (
+                        normalized_email,
+                        token,
+                        reason,
+                        source,
+                    ),
+                )
+                created = cur.fetchone()
+                result = dict(created) if created else None
+                affected_job_ids = self._purge_suppressed_recipient_data(
+                    cur,
+                    identifiers,
+                    normalized_email,
+                )
+                for job_id in affected_job_ids:
+                    self._refresh_bulk_job_counts(job_id)
+                return result
+        except Exception as e:
+            print(f"PostgreSQL suppress recipient error: {e}")
+            return None
+
+    def register_unsubscribe_token(
+        self,
+        email: str,
+        orcid_id: str = "",
+        profile_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Ensure a token exists for one recipient without suppressing them."""
+        if not self.available:
+            return None
+        normalized_email = _normalize_email(email)
+        if not normalized_email:
+            return None
+        normalized_orcid = _normalize_orcid(orcid_id)
+        normalized_profile_key = _normalize_text(profile_key)
+
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT *
+                    FROM {self.EMAIL_SUPPRESSIONS_TABLE}
+                    WHERE email_lower = %s
+                    LIMIT 1;
+                    """,
+                    (normalized_email,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    return dict(existing)
+
+                token = secrets.token_urlsafe(24)
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.EMAIL_SUPPRESSIONS_TABLE}
+                        (email_lower, orcid_id, profile_key, unsubscribe_token, is_suppressed, reason, source, suppressed_at, updated_at)
+                    VALUES (%s, %s, %s, %s, FALSE, '', %s, NULL, NOW())
+                    RETURNING *;
+                    """,
+                    (
+                        normalized_email,
+                        normalized_orcid,
+                        normalized_profile_key,
+                        token,
+                        EMAIL_SUPPRESSION_SOURCE_UNSUBSCRIBE,
+                    ),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"PostgreSQL register unsubscribe token error: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Background bulk email jobs

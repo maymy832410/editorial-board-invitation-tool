@@ -6,6 +6,7 @@ from typing import Callable, Iterable, Optional
 def prepare_bulk_recipients(
     authors: Iterable[dict],
     is_already_sent: Callable[[str], bool],
+    is_suppressed: Optional[Callable[[str, str], bool]] = None,
     retracted_names: Optional[set[str]] = None,
 ) -> list[dict]:
     """Return unique, sendable bulk recipients from an author list."""
@@ -25,6 +26,8 @@ def prepare_bulk_recipients(
 
         orcid_id = (author.get("orcid_id") or "").strip()
         normalized_email = email.lower()
+        if is_suppressed and is_suppressed(email, orcid_id):
+            continue
         if orcid_id:
             if orcid_id in seen_orcids or is_already_sent(orcid_id):
                 continue

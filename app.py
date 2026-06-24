@@ -5,6 +5,8 @@ A unified tool for finding academic authors and sending editorial board invitati
 
 import asyncio
 import json
+import os
+import re
 import threading
 import time
 import streamlit as st
@@ -904,6 +906,13 @@ def is_author_notified(
     return False
 
 
+def is_recipient_suppressed(email: str, orcid_id: str = "", profile_key: str = "") -> bool:
+    """Check whether a recipient should be blocked from future sends."""
+    if db_storage.available:
+        return db_storage.is_recipient_suppressed(email, orcid_id=orcid_id, profile_key=profile_key)
+    return False
+
+
 def mark_author_notified(
     orcid_id: str,
     author_name: str = "",
@@ -951,6 +960,157 @@ def mark_author_notified(
     return db_ok
 
 
+def _public_app_base_url() -> str:
+    """Return the public base URL used in outbound email links."""
+    return (
+        os.environ.get("PUBLIC_APP_BASE_URL")
+        or os.environ.get("PUBLIC_ASSET_BASE_URL")
+        or "https://editorial-board-app-production.up.railway.app"
+    ).strip().rstrip("/")
+
+
+def _build_unsubscribe_url(email: str, orcid_id: str = "", profile_key: str = "") -> str:
+    """Build a durable unsubscribe URL for one recipient."""
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email:
+        return ""
+
+    suppression = None
+    if db_storage.available:
+        suppression = db_storage.register_unsubscribe_token(
+            normalized_email,
+            orcid_id=orcid_id,
+            profile_key=profile_key,
+        )
+    if not suppression:
+        return ""
+    token = suppression.get("unsubscribe_token", "")
+    if not token:
+        return ""
+    return f"{_public_app_base_url()}/?action=unsubscribe&token={token}"
+
+
+def _get_query_params() -> dict:
+    """Read Streamlit query params in a version-tolerant way."""
+    try:
+        params = dict(st.query_params)
+    except Exception:
+        try:
+            params = st.experimental_get_query_params()
+        except Exception:
+            params = {}
+
+    flat: dict[str, str] = {}
+    for key, value in params.items():
+        if isinstance(value, list):
+            flat[key] = value[0] if value else ""
+        else:
+            flat[key] = value
+    return flat
+
+
+def _handle_unsubscribe_request() -> bool:
+    """Process a public unsubscribe request and stop the app when handled."""
+    params = _get_query_params()
+    action = (params.get("action") or "").strip().lower()
+    token = (params.get("token") or "").strip()
+    if action != "unsubscribe" or not token:
+        return False
+
+    st.title("Unsubscribe")
+    if not db_storage.available:
+        st.error("Unsubscribe is temporarily unavailable because the database is offline.")
+        st.stop()
+
+    record = db_storage.get_email_suppression_by_token(token)
+    if not record:
+        st.error("This unsubscribe link is invalid or has expired.")
+        st.stop()
+
+    updated = db_storage.suppress_recipient(
+        record.get("email_lower", ""),
+        orcid_id=record.get("orcid_id", ""),
+        profile_key=record.get("profile_key", ""),
+        reason="Unsubscribed by recipient",
+        source="unsubscribe_link",
+    )
+    if not updated:
+        st.error("We could not complete the unsubscribe request. Please contact the editorial office.")
+        st.stop()
+
+    email = updated.get("email_lower", "")
+    if email:
+        st.success(f"{email} has been removed from future email invitations.")
+        st.caption("We keep a minimal suppression record so we do not email you again.")
+    else:
+        st.success("You have been removed from future email invitations.")
+    st.stop()
+
+
+_handle_unsubscribe_request()
+
+
+def _extract_email_from_text(value: str) -> str:
+    """Find the first email address in a pasted unsubscribe request."""
+    match = re.search(r"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}", value or "")
+    return match.group(0).lower() if match else ""
+
+
+def _purge_local_suppressed_email(email: str) -> None:
+    """Remove a suppressed email from current Streamlit session caches."""
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return
+    changed = False
+    for author in st.session_state.app_state.get("search_results", []) or []:
+        author_email = (author.get("email") or "").strip().lower()
+        all_emails = (author.get("all_emails") or "").strip().lower()
+        if author_email == normalized or normalized in all_emails:
+            author["email"] = ""
+            author["all_emails"] = ""
+            author["email_source"] = ""
+            author["email_status"] = "suppressed"
+            changed = True
+    if changed:
+        save_state()
+
+
+def render_manual_unsubscribe_tool() -> None:
+    """Render an admin tool for recipient unsubscribe replies."""
+    st.subheader("Manual Unsubscribe")
+    if not db_storage.available:
+        st.caption("Database connection is required.")
+        return
+
+    with st.form("manual_unsubscribe_form", clear_on_submit=True):
+        request_text = st.text_area(
+            "Email or pasted reply",
+            placeholder="name@example.com or paste the unsubscribe reply",
+            height=90,
+        )
+        submitted = st.form_submit_button("Suppress and purge")
+
+    if not submitted:
+        return
+
+    email = _extract_email_from_text(request_text)
+    if not email:
+        st.warning("No valid email address was found.")
+        return
+
+    suppressed = db_storage.suppress_recipient(
+        email,
+        reason="Manual unsubscribe request",
+        source="manual_admin",
+    )
+    if not suppressed:
+        st.error("Could not suppress this recipient. Please check the database connection.")
+        return
+
+    _purge_local_suppressed_email(email)
+    st.success(f"{email} is suppressed and purged from mailing sources.")
+
+
 @st.dialog("Send Invitation Email", width="large")
 def email_dialog(author: dict, filters: dict):
     """Dialog for composing and sending invitation email to a specific author."""
@@ -975,6 +1135,9 @@ def email_dialog(author: dict, filters: dict):
     # WARNING BANNER for already notified authors
     if is_already_notified:
         st.error(f"⚠️ WARNING: This author has ALREADY been sent a {_invitation_type_label(invitation_type)} invitation for this tracking scope.")
+    recipient_suppressed = is_recipient_suppressed(author.get('email', ''), author.get('orcid_id', ''))
+    if recipient_suppressed:
+        st.warning("This recipient has unsubscribed before. Sending is blocked.")
     
     # Author info header
     st.markdown(f"### To: **{author['name']}**")
@@ -1120,7 +1283,12 @@ def email_dialog(author: dict, filters: dict):
             st.rerun()
     
     with col2:
-        send_disabled = not EMAIL_AVAILABLE or not to_email or (is_already_notified and not confirm_resend)
+        send_disabled = (
+            not EMAIL_AVAILABLE
+            or not to_email
+            or recipient_suppressed
+            or (is_already_notified and not confirm_resend)
+        )
         if st.button("Send Email", type="primary", use_container_width=True, disabled=send_disabled):
             with st.spinner("Sending..."):
                 pdf_bytes = None
@@ -1153,6 +1321,7 @@ def email_dialog(author: dict, filters: dict):
                     scopus_indexed=scopus_indexed,
                     journal_cite_score=journal_config.get('cite_score', ''),
                     journal_quartile=journal_config.get('quartile', ''),
+                    unsubscribe_url=_build_unsubscribe_url(to_email, author.get('orcid_id', '')),
                 )
                 
                 if success:
@@ -1244,6 +1413,8 @@ def render_sidebar():
             if db_status["error"]:
                 st.caption(f"Error: {db_status['error'][:50]}...")
         
+        st.divider()
+        render_manual_unsubscribe_tool()
         st.divider()
 
         publisher_options = {}
@@ -2076,6 +2247,10 @@ def _enqueue_bulk_send(payload: dict) -> None:
     batch = prepare_bulk_recipients(
         payload.get('batch') or [],
         is_already_sent=lambda orcid_id: db_storage.is_sent(orcid_id, invitation_type, journal_filter),
+        is_suppressed=lambda email, orcid_id: db_storage.is_recipient_suppressed(
+            email,
+            orcid_id=orcid_id,
+        ),
         retracted_names=retracted_names,
     )
 
@@ -2999,6 +3174,9 @@ def render_invitation_section(filters):
     
     if is_already_notified:
         st.error("⚠️ WARNING: This author has ALREADY been notified! Sending again will result in a DUPLICATE invitation.")
+    recipient_suppressed = is_recipient_suppressed(selected.get('email', ''), selected.get('orcid_id', ''))
+    if recipient_suppressed:
+        st.warning("This recipient has unsubscribed before. Sending is blocked.")
     
     # Template selection
     col1, col2 = st.columns([2, 1])
@@ -3127,7 +3305,7 @@ def render_invitation_section(filters):
     
     with col3:
         # Send button
-        send_blocked = is_already_notified and not confirm_resend
+        send_blocked = recipient_suppressed or (is_already_notified and not confirm_resend)
         if EMAIL_AVAILABLE and to_email and not send_blocked:
             send_label = "Send Email with PDF" if attach_pdf else "Send Email"
             if st.button(send_label, type="primary", use_container_width=True):
@@ -3161,6 +3339,7 @@ def render_invitation_section(filters):
                         scopus_indexed=scopus_indexed,
                         journal_cite_score=journal_config.get('cite_score', ''),
                         journal_quartile=journal_config.get('quartile', ''),
+                        unsubscribe_url=_build_unsubscribe_url(to_email, selected.get('orcid_id', '')),
                     )
                 
                 if success:
