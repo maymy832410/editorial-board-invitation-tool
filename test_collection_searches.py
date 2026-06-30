@@ -81,6 +81,7 @@ class CollectionDatabaseTests(unittest.TestCase):
             cur.execute("TRUNCATE harvested_authors CASCADE;")
             cur.execute("DELETE FROM collection_runs;")
             cur.execute("DELETE FROM collection_daily_stats;")
+            cur.execute("DELETE FROM email_suppressions;")
         self.storage.get_or_create_run()
 
     @staticmethod
@@ -149,6 +150,28 @@ class CollectionDatabaseTests(unittest.TestCase):
         self.assertTrue(self.storage.acquire_worker_lease("worker-a", 60))
         self.assertTrue(self.storage.release_worker_lease("worker-a"))
         self.assertTrue(self.storage.acquire_worker_lease("worker-b", 60))
+
+    def test_bulk_suppression_lookup_resolves_all_identifier_types(self):
+        with self.storage._get_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO email_suppressions
+                    (email_lower, orcid_id, profile_key, unsubscribe_token, is_suppressed)
+                VALUES (%s, %s, %s, %s, TRUE);
+                """,
+                ("blocked@example.com", "0000-0001", "orcid:0000-0001", "test-token"),
+            )
+        keys = self.storage.get_suppressed_recipient_keys([
+            {
+                "email": "BLOCKED@example.com",
+                "orcid_id": "https://orcid.org/0000-0001",
+                "profile_key": "orcid:0000-0001",
+            },
+            {"email": "allowed@example.com", "orcid_id": "0000-0002"},
+        ])
+        self.assertEqual(keys["emails"], {"blocked@example.com"})
+        self.assertEqual(keys["orcids"], {"0000-0001"})
+        self.assertEqual(keys["profile_keys"], {"orcid:0000-0001"})
 
 
 if __name__ == "__main__":

@@ -3079,6 +3079,7 @@ def display_results(filters, ui_scope: str):
         return
 
     invitation_counts: dict[str, int] = {}
+    suppressed_keys = {"emails": set(), "orcids": set(), "profile_keys": set()}
     if db_storage.available:
         try:
             invitation_counts = db_storage.get_invitation_counts([
@@ -3088,6 +3089,15 @@ def display_results(filters, ui_scope: str):
             ])
         except Exception:
             invitation_counts = {}
+        suppressed_keys = db_storage.get_suppressed_recipient_keys(filtered)
+
+    def result_is_suppressed(row: dict) -> bool:
+        return (
+            (row.get('email') or '').strip().lower() in suppressed_keys["emails"]
+            or (row.get('orcid_id') or '').strip().lower().replace('https://orcid.org/', '')
+                in suppressed_keys["orcids"]
+            or (row.get('profile_key') or '').strip() in suppressed_keys["profile_keys"]
+        )
     
     # Prepare dataframe for export
     df_data = []
@@ -3096,7 +3106,7 @@ def display_results(filters, ui_scope: str):
         invited_count = int(invitation_counts.get(orcid_id, 0))
         source_origin = r.get('source_origin', AUTHOR_SOURCE_OPENALEX)
         status = ''
-        if is_recipient_suppressed(r.get('email', ''), orcid_id, r.get('profile_key', '')):
+        if result_is_suppressed(r):
             status = 'SUPPRESSED'
         elif r.get('is_retracted'):
             status = '🚫 RETRACTED'
@@ -3212,10 +3222,11 @@ def display_results(filters, ui_scope: str):
     eligible_bulk_authors = prepare_bulk_recipients(
         filtered,
         is_already_sent=lambda recipient_id: recipient_id in sent_invitations,
-        is_suppressed=lambda email, orcid_id: db_storage.is_recipient_suppressed(
-            email,
-            orcid_id=orcid_id,
-        ) if db_storage.available else False,
+        is_suppressed=lambda email, orcid_id: (
+            (email or '').strip().lower() in suppressed_keys["emails"]
+            or (orcid_id or '').strip().lower().replace('https://orcid.org/', '')
+                in suppressed_keys["orcids"]
+        ),
         retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
     )
 
@@ -3951,25 +3962,30 @@ def main():
     # Render sidebar and get filters
     shared_filters = render_sidebar()
 
-    author_tab, editorial_tab, collection_tab = st.tabs([
+    views = [
         _workflow_label(WORKFLOW_AUTHOR),
         _workflow_label(WORKFLOW_EDITORIAL),
         "📥 Collection",
-    ])
+    ]
+    active_view = st.radio(
+        "Workspace",
+        options=views,
+        horizontal=True,
+        key="active_workspace_view",
+        label_visibility="collapsed",
+    )
 
-    with author_tab:
+    if active_view == views[0]:
         st.caption("Publication-submission invitations with scientific-domain targeting.")
         author_filters = dict(shared_filters)
         author_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_AUTHOR)
         render_search_section(author_filters, WORKFLOW_AUTHOR)
-
-    with editorial_tab:
+    elif active_view == views[1]:
         st.caption("Editorial board-role invitations with editorial templates.")
         editorial_filters = dict(shared_filters)
         editorial_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_EDITORIAL)
         render_search_section(editorial_filters, WORKFLOW_EDITORIAL)
-
-    with collection_tab:
+    else:
         render_collection_panel()
 
 

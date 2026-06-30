@@ -2072,6 +2072,52 @@ class PostgresStorage:
             print(f"PostgreSQL is_recipient_suppressed error: {e}")
             return False
 
+    def get_suppressed_recipient_keys(self, recipients: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        """Resolve suppression state for a result set with one database query."""
+        result: Dict[str, Set[str]] = {
+            "emails": set(),
+            "orcids": set(),
+            "profile_keys": set(),
+        }
+        if not self.available or not recipients:
+            return result
+        emails = sorted({
+            _normalize_email(row.get("email")) for row in recipients
+            if _normalize_email(row.get("email"))
+        }) or [""]
+        orcids = sorted({
+            _normalize_orcid(row.get("orcid_id")) for row in recipients
+            if _normalize_orcid(row.get("orcid_id"))
+        }) or [""]
+        profile_keys = sorted({
+            _normalize_text(row.get("profile_key")) for row in recipients
+            if _normalize_text(row.get("profile_key"))
+        }) or [""]
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT email_lower, orcid_id, profile_key
+                    FROM {self.EMAIL_SUPPRESSIONS_TABLE}
+                    WHERE is_suppressed = TRUE
+                      AND (email_lower = ANY(%s)
+                           OR orcid_id = ANY(%s)
+                           OR profile_key = ANY(%s));
+                    """,
+                    (emails, orcids, profile_keys),
+                )
+                for row in cur.fetchall():
+                    if row.get("email_lower"):
+                        result["emails"].add(_normalize_email(row["email_lower"]))
+                    if row.get("orcid_id"):
+                        result["orcids"].add(_normalize_orcid(row["orcid_id"]))
+                    if row.get("profile_key"):
+                        result["profile_keys"].add(_normalize_text(row["profile_key"]))
+            return result
+        except Exception as e:
+            print(f"PostgreSQL bulk suppression lookup error: {e}")
+            return result
+
     def _collect_suppression_identifiers(
         self,
         cur,
