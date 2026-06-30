@@ -1,4 +1,5 @@
 streamlit>=1.30.0
+streamlit-searchbox==0.1.24
 requests>=2.31.0
 pandas>=2.0.0
 aiohttp>=3.9.0

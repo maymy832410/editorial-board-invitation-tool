@@ -12,6 +12,11 @@ import time
 import streamlit as st
 import pandas as pd
 
+try:
+    from streamlit_searchbox import st_searchbox
+except ImportError:  # Manual-entry fallback keeps the dashboard usable.
+    st_searchbox = None
+
 from config import (
     COUNTRIES,
     DEFAULT_H_INDEX_MIN,
@@ -68,6 +73,22 @@ st.set_page_config(
     page_icon="📬",
     layout="wide"
 )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _openalex_topic_options(searchterm: str):
+    """Search OpenAlex topics and return searchbox label/value pairs."""
+    try:
+        topics = OpenAlexClient().search_topic_suggestions(searchterm, limit=12)
+    except Exception:
+        return []
+    options = []
+    for topic in topics:
+        context = " · ".join(v for v in (topic.get("subfield"), topic.get("field")) if v)
+        count = f"{int(topic.get('works_count') or 0):,} works"
+        label = f"{topic['name']} — {context} ({count})" if context else f"{topic['name']} ({count})"
+        options.append((label, topic))
+    return options
 
 # Initialize state manager
 state_mgr = StateManager()
@@ -308,6 +329,18 @@ def _parse_scientific_domains_json(value: object) -> list[str]:
         if text_value:
             cleaned.append(text_value)
     return cleaned
+
+
+def _parse_json_list(value: object) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, list) else []
+        except Exception:
+            return []
+    return []
 
 
 def _map_db_profile_row_to_author(row: dict) -> dict:
@@ -3688,14 +3721,14 @@ def render_collection_panel():
 
     # Live status metrics
     row1 = st.columns(4)
-    row1[0].metric("Collected today", summary.get("emails_found_today", 0))
-    row1[1].metric("Attempts today", summary.get("attempts_today", 0))
+    row1[0].metric("Found this search", summary.get("emails_found_today", 0))
+    row1[1].metric("Attempts this search", summary.get("attempts_today", 0))
     row1[2].metric("Hit rate", f"{summary.get('hit_rate', 0) * 100:.1f}%")
-    row1[3].metric("ORCID 429 today", summary.get("orcid_429_today", 0))
+    row1[3].metric("ORCID 429 this search", summary.get("orcid_429_today", 0))
 
     row2 = st.columns(4)
     row2[0].metric("Queue pending", summary.get("queue_pending", 0))
-    row2[1].metric("Total collected", summary.get("total_collected", 0))
+    row2[1].metric("Available this search", summary.get("search_available", 0))
     row2[2].metric("Eff. concurrency", run.get("effective_concurrency", "—"))
     row2[3].metric("Eff. delay (s)", run.get("effective_delay", "—"))
 
@@ -3711,92 +3744,181 @@ def render_collection_panel():
     if detail_bits:
         st.caption(" · ".join(str(b) for b in detail_bits))
 
-    # Controls
+    st.caption(f"{summary.get('total_collected', 0):,} emails stored across all searches")
+
+    # Filters / configuration. Widgets are intentionally outside a form so the
+    # OpenAlex typeahead and resume decision update as the draft changes.
+    st.markdown("#### Targeting filters")
+    source_id = run.get("search_run_id")
+    if st.session_state.get("collection_config_source") != source_id:
+        st.session_state["collection_config_source"] = source_id
+        st.session_state["collection_keyword_tags"] = run.get("keyword_tags", "") or ""
+        st.session_state["collection_disciplines"] = _parse_scientific_domains_json(run.get("disciplines_json"))
+        st.session_state["collection_specialties_raw"] = ", ".join(
+            _parse_scientific_domains_json(run.get("specialties_json"))
+        )
+        details = _parse_json_list(run.get("topic_details_json"))
+        if not details:
+            selected_topic_ids = _parse_scientific_domains_json(run.get("selected_topic_ids_json"))
+            if not selected_topic_ids:
+                selected_topic_ids = _parse_scientific_domains_json(run.get("topic_ids_json"))
+            details = [
+                {"id": topic_id, "name": topic_id, "subfield": "", "field": "", "works_count": 0}
+                for topic_id in selected_topic_ids
+            ]
+        st.session_state["collection_selected_topics"] = details
+        st.session_state["collection_h_min"] = int(run.get("h_index_min") or DEFAULT_H_INDEX_MIN)
+        st.session_state["collection_h_max"] = int(run.get("h_index_max") or DEFAULT_H_INDEX_MAX)
+        excluded_codes = set(_parse_scientific_domains_json(run.get("exclude_countries_json")))
+        st.session_state["collection_excluded_countries"] = [
+            name for name, code in COUNTRIES.items() if code in excluded_codes
+        ]
+        st.session_state["collection_concurrency"] = int(run.get("baseline_concurrency") or 2)
+        st.session_state["collection_delay"] = float(run.get("baseline_delay") or 3.0)
+
+    keyword_tags = st.text_input(
+        "Keyword tags (comma-separated, resolved to OpenAlex topics)",
+        key="collection_keyword_tags",
+        help="e.g. machine learning, computer vision, genomics",
+    )
+    disciplines = st.multiselect(
+        "Disciplines",
+        options=ALL_DISCIPLINES,
+        key="collection_disciplines",
+        help="Authors must belong to one of these broad OpenAlex fields.",
+    )
+
+    st.markdown("**OpenAlex specialty topics**")
+    if st_searchbox is not None:
+        selected_topic = st_searchbox(
+            _openalex_topic_options,
+            key="collection_topic_searchbox",
+            placeholder="Type at least 2 characters to search OpenAlex topics...",
+            clear_on_submit=True,
+            debounce=350,
+        )
+        if isinstance(selected_topic, dict) and selected_topic.get("id"):
+            selected_topics = list(st.session_state.get("collection_selected_topics") or [])
+            if selected_topic["id"] not in {topic.get("id") for topic in selected_topics}:
+                selected_topics.append(selected_topic)
+                st.session_state["collection_selected_topics"] = selected_topics
+                st.rerun()
+    else:
+        st.info("Live topic suggestions are unavailable; manual specialty terms remain available below.")
+
+    selected_topics = list(st.session_state.get("collection_selected_topics") or [])
+    topic_by_label = {
+        f"{topic.get('name') or topic.get('id')} [{topic.get('id')}]": topic
+        for topic in selected_topics
+    }
+    kept_topic_labels = st.multiselect(
+        "Selected topics (remove with ×)",
+        options=list(topic_by_label),
+        default=list(topic_by_label),
+        key=f"collection_topic_chips_{source_id}",
+    )
+    selected_topics = [topic_by_label[label] for label in kept_topic_labels]
+    st.session_state["collection_selected_topics"] = selected_topics
+
+    with st.expander("Advanced: manual specialty substring terms"):
+        specialties_raw = st.text_input(
+            "Specialty terms (comma-separated substring match)",
+            key="collection_specialties_raw",
+            help="Retained for legacy or uncommon terms that do not appear in OpenAlex suggestions.",
+        )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        h_index_min = st.number_input(
+            "h-index min", min_value=0, max_value=500, key="collection_h_min"
+        )
+    with col_b:
+        h_index_max = st.number_input(
+            "h-index max", min_value=0, max_value=1000, key="collection_h_max"
+        )
+    exclude_countries = st.multiselect(
+        "Exclude countries", options=list(COUNTRIES.keys()), key="collection_excluded_countries"
+    )
+    col_c, col_d = st.columns(2)
+    with col_c:
+        baseline_concurrency = st.slider(
+            "Baseline concurrency", min_value=1, max_value=10, key="collection_concurrency"
+        )
+    with col_d:
+        baseline_delay = st.slider(
+            "Baseline delay (s)", min_value=1.0, max_value=10.0, step=0.5,
+            key="collection_delay",
+        )
+
+    specialties = [s.strip() for s in specialties_raw.split(",") if s.strip()]
+    exclude_codes = [COUNTRIES[name] for name in exclude_countries if name in COUNTRIES]
+    draft_config = {
+        "disciplines": disciplines,
+        "specialties": specialties,
+        "exclude_countries": exclude_codes,
+        "keyword_tags": keyword_tags.strip(),
+        "topic_ids": [topic.get("id") for topic in selected_topics if topic.get("id")],
+        "topic_details": selected_topics,
+        "h_index_min": int(h_index_min),
+        "h_index_max": int(h_index_max),
+    }
+    checkpoint = db_storage.get_search_for_config(draft_config)
+    checkpoint_complete = bool(
+        checkpoint and checkpoint.get("seed_exhausted") and not int(checkpoint.get("pending_count") or 0)
+    )
+
     st.markdown("#### Controls")
     ctrl = st.columns(4)
-    if ctrl[0].button("▶️ Start", key="collection_start", use_container_width=True):
-        db_storage.set_run_status(RUN_STATUS_ACTIVE)
-        st.rerun()
+    primary_label = "⏯️ Resume search" if checkpoint else "▶️ Start new search"
+    if checkpoint_complete:
+        primary_label = "✅ Search complete"
+    if ctrl[0].button(
+        primary_label,
+        key="collection_primary_action",
+        use_container_width=True,
+        type="primary",
+        disabled=checkpoint_complete,
+    ):
+        activated = db_storage.activate_collection_search(
+            draft_config,
+            topic_details=selected_topics,
+            baseline_concurrency=int(baseline_concurrency),
+            baseline_delay=float(baseline_delay),
+        )
+        if activated:
+            st.session_state["collection_config_source"] = None
+            st.rerun()
+        st.error("Could not start the search. Check the database connection.")
     if ctrl[1].button("⏸️ Pause", key="collection_pause", use_container_width=True):
         db_storage.set_run_status(RUN_STATUS_PAUSED)
         st.rerun()
-    if ctrl[2].button("⏯️ Resume", key="collection_resume", use_container_width=True):
-        db_storage.set_run_status(RUN_STATUS_ACTIVE)
-        st.rerun()
-    if ctrl[3].button("⏹️ Stop", key="collection_stop", use_container_width=True):
+    if ctrl[2].button("⏹️ Stop", key="collection_stop", use_container_width=True):
         db_storage.set_run_status(RUN_STATUS_IDLE)
         st.rerun()
+    if checkpoint and ctrl[3].button(
+        "🔄 Start over", key="collection_start_over", use_container_width=True
+    ):
+        st.session_state["collection_confirm_start_over"] = True
 
-    # Filters / configuration
-    st.markdown("#### Targeting filters")
-    with st.form("collection_config_form"):
-        keyword_tags = st.text_input(
-            "Keyword tags (comma-separated, resolved to OpenAlex topics)",
-            value=run.get("keyword_tags", "") or "",
-            help="e.g. machine learning, computer vision, genomics",
-        )
-        disciplines = st.multiselect(
-            "Disciplines (post-filter on OpenAlex field)",
-            options=ALL_DISCIPLINES,
-            default=_parse_scientific_domains_json(run.get("disciplines_json")),
-        )
-        specialties_raw = st.text_input(
-            "Specialty terms (comma-separated substring match)",
-            value=", ".join(_parse_scientific_domains_json(run.get("specialties_json"))),
-        )
-        col_a, col_b = st.columns(2)
-        with col_a:
-            h_index_min = st.number_input(
-                "h-index min", min_value=0, max_value=500,
-                value=int(run.get("h_index_min") or DEFAULT_H_INDEX_MIN),
+    if checkpoint and st.session_state.get("collection_confirm_start_over"):
+        st.warning("Start over resets this search's cursor and metrics. Stored email outcomes are preserved.")
+        confirm_cols = st.columns(2)
+        if confirm_cols[0].button("Confirm start over", type="primary", use_container_width=True):
+            activated = db_storage.activate_collection_search(
+                draft_config,
+                topic_details=selected_topics,
+                start_over=True,
+                baseline_concurrency=int(baseline_concurrency),
+                baseline_delay=float(baseline_delay),
             )
-        with col_b:
-            h_index_max = st.number_input(
-                "h-index max", min_value=0, max_value=1000,
-                value=int(run.get("h_index_max") or DEFAULT_H_INDEX_MAX),
-            )
-        exclude_countries = st.multiselect(
-            "Exclude countries",
-            options=list(COUNTRIES.keys()),
-            default=[
-                name for name, code in COUNTRIES.items()
-                if code in _parse_scientific_domains_json(run.get("exclude_countries_json"))
-            ],
-        )
-        col_c, col_d = st.columns(2)
-        with col_c:
-            baseline_concurrency = st.slider(
-                "Baseline concurrency", min_value=1, max_value=10,
-                value=int(run.get("baseline_concurrency") or 2),
-            )
-        with col_d:
-            baseline_delay = st.slider(
-                "Baseline delay (s)", min_value=1.0, max_value=10.0, step=0.5,
-                value=float(run.get("baseline_delay") or 3.0),
-            )
-        reset_cursor = st.checkbox(
-            "Reset OpenAlex seed cursor (re-scan from the start with new filters)",
-            value=False,
-        )
-        submitted = st.form_submit_button("💾 Save filters", use_container_width=True)
-
-    if submitted:
-        specialties = [s.strip() for s in specialties_raw.split(",") if s.strip()]
-        exclude_codes = [COUNTRIES[name] for name in exclude_countries if name in COUNTRIES]
-        db_storage.set_run_config(
-            disciplines=disciplines,
-            specialties=specialties,
-            exclude_countries=exclude_codes,
-            keyword_tags=keyword_tags.strip(),
-            topic_ids=[] if reset_cursor else None,
-            h_index_min=int(h_index_min),
-            h_index_max=int(h_index_max),
-            baseline_concurrency=int(baseline_concurrency),
-            baseline_delay=float(baseline_delay),
-            reset_cursor=reset_cursor,
-        )
-        st.success("Filters saved. The worker will pick them up on its next cycle.")
-        st.rerun()
+            st.session_state["collection_confirm_start_over"] = False
+            if activated:
+                st.session_state["collection_config_source"] = None
+                st.rerun()
+            st.error("Could not start over. Check the database connection.")
+        if confirm_cols[1].button("Cancel", use_container_width=True):
+            st.session_state["collection_confirm_start_over"] = False
+            st.rerun()
 
     # Recent collected authors
     st.markdown("#### Recently collected")

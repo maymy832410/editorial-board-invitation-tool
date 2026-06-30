@@ -204,6 +204,8 @@ class OpenAlexClient:
                         topic_details.append({
                             "id": topic_id,
                             "name": topic.get("display_name", ""),
+                            "subfield": (topic.get("subfield") or {}).get("display_name", ""),
+                            "field": (topic.get("field") or {}).get("display_name", ""),
                             "works_count": topic.get("works_count", 0),
                             "keyword": keyword
                         })
@@ -216,6 +218,30 @@ class OpenAlexClient:
                 continue
         
         return list(topic_ids), topic_details
+
+    def search_topic_suggestions(self, query: str, limit: int = 12) -> list[dict[str, Any]]:
+        """Return stable OpenAlex topic suggestions for the collection UI."""
+        term = (query or "").strip()
+        if len(term) < 2:
+            return []
+        data = self._make_request(
+            "topics",
+            {"search": term, "per_page": max(1, min(int(limit), 25))},
+        )
+        suggestions = []
+        for topic in data.get("results", []):
+            topic_id = (topic.get("id") or "").rstrip("/").split("/")[-1]
+            name = topic.get("display_name") or ""
+            if not topic_id or not name:
+                continue
+            suggestions.append({
+                "id": topic_id,
+                "name": name,
+                "subfield": (topic.get("subfield") or {}).get("display_name", ""),
+                "field": (topic.get("field") or {}).get("display_name", ""),
+                "works_count": int(topic.get("works_count") or 0),
+            })
+        return suggestions
     
     def build_filter(
         self,

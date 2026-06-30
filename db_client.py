@@ -4,6 +4,7 @@ import os
 import json
 import re
 import secrets
+import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Set, Dict, List, Any
 from urllib.parse import urlparse
@@ -48,6 +49,62 @@ BULK_RECIPIENT_STATUS_SENT = "sent"
 BULK_RECIPIENT_STATUS_FAILED = "failed"
 BULK_RECIPIENT_STATUS_SKIPPED = "skipped"
 EMAIL_SUPPRESSION_SOURCE_UNSUBSCRIBE = "unsubscribe_link"
+
+
+def _normalize_collection_list(values: Optional[List[Any]], *, upper: bool = False) -> List[str]:
+    """Return stable, order-insensitive collection-filter values."""
+    normalized = set()
+    for value in values or []:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            continue
+        normalized.add(text.upper() if upper else text.casefold())
+    return sorted(normalized)
+
+
+def normalize_collection_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Canonicalize all targeting fields used to identify a resumable search."""
+    config = config or {}
+    keyword_tags = _normalize_collection_list(
+        re.split(r"[,\n]", str(config.get("keyword_tags") or ""))
+    )
+    topic_ids = []
+    for value in config.get("topic_ids") or []:
+        topic_id = str(value or "").strip().rstrip("/").split("/")[-1].upper()
+        if topic_id:
+            topic_ids.append(topic_id)
+    return {
+        "domains": _normalize_collection_list(config.get("domains")),
+        "disciplines": _normalize_collection_list(config.get("disciplines")),
+        "specialties": _normalize_collection_list(config.get("specialties")),
+        "exclude_countries": _normalize_collection_list(
+            config.get("exclude_countries"), upper=True
+        ),
+        "keyword_tags": keyword_tags,
+        "topic_ids": sorted(set(topic_ids)),
+        "h_index_min": int(config.get("h_index_min") or 0),
+        "h_index_max": int(config.get("h_index_max") or 0),
+    }
+
+
+def build_collection_search_key(config: Optional[Dict[str, Any]]) -> str:
+    """Build a deterministic fingerprint for resume/start decisions."""
+    payload = json.dumps(
+        normalize_collection_config(config),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _decode_json_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        decoded = json.loads(value or "[]")
+        return decoded if isinstance(decoded, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def _normalize_text(value: Optional[str]) -> str:
@@ -148,6 +205,8 @@ class PostgresStorage:
     INVITATION_TABLE_NAME = "author_invitations"
     PROFILE_TABLE_NAME = "author_profiles"
     COLLECTION_RUNS_TABLE = "collection_runs"
+    COLLECTION_SEARCH_RUNS_TABLE = "collection_search_runs"
+    COLLECTION_RUN_AUTHORS_TABLE = "collection_run_authors"
     HARVESTED_AUTHORS_TABLE = "harvested_authors"
     COLLECTION_DAILY_STATS_TABLE = "collection_daily_stats"
     BULK_EMAIL_JOBS_TABLE = "bulk_email_jobs"
@@ -182,7 +241,7 @@ class PostgresStorage:
 
     def _ensure_tables(self):
         """Create all required tables if they don't exist."""
-        with self._conn.cursor() as cur:
+        with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self.TABLE_NAME} (
                     orcid_id   TEXT PRIMARY KEY,
@@ -506,6 +565,53 @@ class PostgresStorage:
             );
         """)
         cur.execute(f"""
+            ALTER TABLE {self.COLLECTION_RUNS_TABLE}
+            ADD COLUMN IF NOT EXISTS active_search_run_id BIGINT;
+        """)
+        cur.execute(f"""
+            ALTER TABLE {self.COLLECTION_RUNS_TABLE}
+            ADD COLUMN IF NOT EXISTS worker_owner TEXT DEFAULT '';
+        """)
+        cur.execute(f"""
+            ALTER TABLE {self.COLLECTION_RUNS_TABLE}
+            ADD COLUMN IF NOT EXISTS worker_lease_until TIMESTAMPTZ;
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.COLLECTION_SEARCH_RUNS_TABLE} (
+                id                      BIGSERIAL PRIMARY KEY,
+                search_key              TEXT NOT NULL,
+                generation              INTEGER NOT NULL DEFAULT 1,
+                domains_json            TEXT DEFAULT '[]',
+                disciplines_json        TEXT DEFAULT '[]',
+                specialties_json        TEXT DEFAULT '[]',
+                exclude_countries_json  TEXT DEFAULT '[]',
+                keyword_tags            TEXT DEFAULT '',
+                topic_ids_json          TEXT DEFAULT '[]',
+                selected_topic_ids_json TEXT DEFAULT '[]',
+                topic_details_json      TEXT DEFAULT '[]',
+                h_index_min             INTEGER,
+                h_index_max             INTEGER,
+                seed_cursor             TEXT DEFAULT '*',
+                seed_exhausted          BOOLEAN DEFAULT FALSE,
+                emails_found            INTEGER DEFAULT 0,
+                attempts                INTEGER DEFAULT 0,
+                orcid_429               INTEGER DEFAULT 0,
+                openalex_429             INTEGER DEFAULT 0,
+                seeded                  INTEGER DEFAULT 0,
+                created_at              TIMESTAMPTZ DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (search_key, generation)
+            );
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_collection_search_resume
+            ON {self.COLLECTION_SEARCH_RUNS_TABLE} (search_key, generation DESC);
+        """)
+        cur.execute(f"""
+            ALTER TABLE {self.COLLECTION_SEARCH_RUNS_TABLE}
+            ADD COLUMN IF NOT EXISTS selected_topic_ids_json TEXT DEFAULT '[]';
+        """)
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.HARVESTED_AUTHORS_TABLE} (
                 openalex_id     TEXT PRIMARY KEY,
                 orcid_id        TEXT DEFAULT '',
@@ -563,6 +669,117 @@ class PostgresStorage:
                 seeded          INTEGER DEFAULT 0
             );
         """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.COLLECTION_RUN_AUTHORS_TABLE} (
+                search_run_id BIGINT NOT NULL
+                    REFERENCES {self.COLLECTION_SEARCH_RUNS_TABLE}(id) ON DELETE CASCADE,
+                openalex_id TEXT NOT NULL
+                    REFERENCES {self.HARVESTED_AUTHORS_TABLE}(openalex_id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (search_run_id, openalex_id)
+            );
+        """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_collection_run_authors_openalex
+            ON {self.COLLECTION_RUN_AUTHORS_TABLE} (openalex_id, search_run_id);
+        """)
+
+        # One-time additive migration of the legacy singleton checkpoint. This is
+        # intentionally idempotent so frontend and worker may start concurrently.
+        cur.execute(f"SELECT * FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1;")
+        legacy = cur.fetchone()
+        if legacy:
+            legacy = dict(legacy)
+            config = {
+                "domains": _decode_json_list(legacy.get("domains_json")),
+                "disciplines": _decode_json_list(legacy.get("disciplines_json")),
+                "specialties": _decode_json_list(legacy.get("specialties_json")),
+                "exclude_countries": _decode_json_list(legacy.get("exclude_countries_json")),
+                "keyword_tags": legacy.get("keyword_tags") or "",
+                "topic_ids": _decode_json_list(legacy.get("topic_ids_json")),
+                "h_index_min": legacy.get("h_index_min"),
+                "h_index_max": legacy.get("h_index_max"),
+            }
+            search_key = build_collection_search_key(config)
+            cur.execute(
+                f"""
+                INSERT INTO {self.COLLECTION_SEARCH_RUNS_TABLE}
+                    (search_key, generation, domains_json, disciplines_json,
+                     specialties_json, exclude_countries_json, keyword_tags,
+                     topic_ids_json, selected_topic_ids_json, h_index_min, h_index_max, seed_cursor,
+                     seed_exhausted, created_at, updated_at)
+                VALUES (%s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        COALESCE(%s, NOW()), COALESCE(%s, NOW()))
+                ON CONFLICT (search_key, generation) DO NOTHING
+                RETURNING id;
+                """,
+                (
+                    search_key,
+                    legacy.get("domains_json") or "[]",
+                    legacy.get("disciplines_json") or "[]",
+                    legacy.get("specialties_json") or "[]",
+                    legacy.get("exclude_countries_json") or "[]",
+                    legacy.get("keyword_tags") or "",
+                    legacy.get("topic_ids_json") or "[]",
+                    legacy.get("topic_ids_json") or "[]",
+                    legacy.get("h_index_min"),
+                    legacy.get("h_index_max"),
+                    legacy.get("seed_cursor") or "*",
+                    bool(legacy.get("seed_exhausted")),
+                    legacy.get("created_at"),
+                    legacy.get("updated_at"),
+                ),
+            )
+            inserted = cur.fetchone()
+            was_inserted = bool(inserted)
+            if inserted:
+                search_run_id = inserted["id"] if isinstance(inserted, dict) else inserted[0]
+            else:
+                cur.execute(
+                    f"""SELECT id FROM {self.COLLECTION_SEARCH_RUNS_TABLE}
+                        WHERE search_key = %s AND generation = 1;""",
+                    (search_key,),
+                )
+                found = cur.fetchone()
+                search_run_id = (found["id"] if isinstance(found, dict) else found[0]) if found else None
+            if search_run_id:
+                if was_inserted:
+                    cur.execute(
+                        f"""
+                        UPDATE {self.COLLECTION_SEARCH_RUNS_TABLE} s
+                        SET emails_found = d.emails_found,
+                            attempts = d.attempts,
+                            orcid_429 = d.orcid_429,
+                            openalex_429 = d.openalex_429,
+                            seeded = d.seeded
+                        FROM {self.COLLECTION_DAILY_STATS_TABLE} d
+                        WHERE s.id = %s AND d.day = (NOW() AT TIME ZONE 'UTC')::date;
+                        """,
+                        (search_run_id,),
+                    )
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_RUNS_TABLE}
+                    SET active_search_run_id = COALESCE(active_search_run_id, %s)
+                    WHERE id = 1;
+                    """,
+                    (search_run_id,),
+                )
+                cur.execute(
+                    f"SELECT 1 FROM {self.COLLECTION_RUN_AUTHORS_TABLE} WHERE search_run_id = %s LIMIT 1;",
+                    (search_run_id,),
+                )
+                if not cur.fetchone():
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.COLLECTION_RUN_AUTHORS_TABLE} (search_run_id, openalex_id)
+                        SELECT %s, openalex_id
+                        FROM {self.HARVESTED_AUTHORS_TABLE}
+                        WHERE run_id = 1
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (search_run_id,),
+                    )
 
     def _ensure_bulk_email_tables(self, cur):
         """Create tables for durable background bulk email sends."""
@@ -2722,18 +2939,45 @@ class PostgresStorage:
     # ------------------------------------------------------------------
     # Background email-collection service
     # ------------------------------------------------------------------
+    @staticmethod
+    def _collection_config_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        selected_topic_ids = _decode_json_list(row.get("selected_topic_ids_json"))
+        if not selected_topic_ids:
+            selected_topic_ids = _decode_json_list(row.get("topic_ids_json"))
+        return {
+            "domains": _decode_json_list(row.get("domains_json")),
+            "disciplines": _decode_json_list(row.get("disciplines_json")),
+            "specialties": _decode_json_list(row.get("specialties_json")),
+            "exclude_countries": _decode_json_list(row.get("exclude_countries_json")),
+            "keyword_tags": row.get("keyword_tags") or "",
+            "topic_ids": selected_topic_ids,
+            "topic_details": _decode_json_list(row.get("topic_details_json")),
+            "h_index_min": row.get("h_index_min"),
+            "h_index_max": row.get("h_index_max"),
+        }
+
+    @staticmethod
+    def _merge_collection_rows(controller: Dict[str, Any], search: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged = dict(controller or {})
+        if search:
+            merged.update(search)
+            merged["search_run_id"] = search.get("id")
+            merged["controller_id"] = controller.get("id", 1)
+            merged["status"] = controller.get("status") or RUN_STATUS_IDLE
+            for field in (
+                "baseline_concurrency", "baseline_delay", "effective_concurrency",
+                "effective_delay", "last_429_at", "cooldown_until", "stop_until",
+                "run_429_count", "clean_batches", "worker_owner", "worker_lease_until",
+            ):
+                merged[field] = controller.get(field)
+        return merged
+
     def get_or_create_run(self) -> Optional[Dict[str, Any]]:
-        """Return the singleton collection run row, creating it if absent."""
+        """Return the controller merged with its active durable search checkpoint."""
         if not self.available:
             return None
         try:
             with self._get_cursor() as cur:
-                cur.execute(
-                    f"SELECT * FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1;"
-                )
-                row = cur.fetchone()
-                if row:
-                    return dict(row)
                 cur.execute(
                     f"""
                     INSERT INTO {self.COLLECTION_RUNS_TABLE} (id, status)
@@ -2742,11 +2986,54 @@ class PostgresStorage:
                     """,
                     (RUN_STATUS_IDLE,),
                 )
-                cur.execute(
-                    f"SELECT * FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1;"
-                )
-                row = cur.fetchone()
-                return dict(row) if row else None
+                cur.execute(f"SELECT * FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1;")
+                controller = dict(cur.fetchone() or {})
+                search = None
+                active_id = controller.get("active_search_run_id")
+                if active_id:
+                    cur.execute(
+                        f"SELECT * FROM {self.COLLECTION_SEARCH_RUNS_TABLE} WHERE id = %s;",
+                        (active_id,),
+                    )
+                    found = cur.fetchone()
+                    search = dict(found) if found else None
+                if not search:
+                    config = self._collection_config_from_row(controller)
+                    search_key = build_collection_search_key(config)
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.COLLECTION_SEARCH_RUNS_TABLE}
+                            (search_key, generation, domains_json, disciplines_json,
+                             specialties_json, exclude_countries_json, keyword_tags,
+                             topic_ids_json, selected_topic_ids_json, topic_details_json, h_index_min, h_index_max,
+                             seed_cursor, seed_exhausted)
+                        VALUES (%s, 1, %s, %s, %s, %s, %s, %s, %s, '[]', %s, %s, %s, %s)
+                        ON CONFLICT (search_key, generation) DO UPDATE
+                        SET search_key = EXCLUDED.search_key
+                        RETURNING *;
+                        """,
+                        (
+                            search_key,
+                            controller.get("domains_json") or "[]",
+                            controller.get("disciplines_json") or "[]",
+                            controller.get("specialties_json") or "[]",
+                            controller.get("exclude_countries_json") or "[]",
+                            controller.get("keyword_tags") or "",
+                            controller.get("topic_ids_json") or "[]",
+                            controller.get("topic_ids_json") or "[]",
+                            controller.get("h_index_min"),
+                            controller.get("h_index_max"),
+                            controller.get("seed_cursor") or "*",
+                            bool(controller.get("seed_exhausted")),
+                        ),
+                    )
+                    search = dict(cur.fetchone())
+                    cur.execute(
+                        f"UPDATE {self.COLLECTION_RUNS_TABLE} SET active_search_run_id = %s WHERE id = 1;",
+                        (search["id"],),
+                    )
+                    controller["active_search_run_id"] = search["id"]
+                return self._merge_collection_rows(controller, search)
         except Exception as e:
             print(f"PostgreSQL get_or_create_run error: {e}")
             return None
@@ -2756,30 +3043,38 @@ class PostgresStorage:
         return self.get_or_create_run()
 
     def update_run_state(self, **fields: Any) -> bool:
-        """Update arbitrary columns on the singleton collection run row."""
+        """Update controller pacing/status and active-search checkpoint fields."""
         if not self.available or not fields:
             return False
-        allowed = {
-            "status", "seed_cursor", "seed_exhausted", "effective_concurrency",
+        controller_allowed = {
+            "status", "effective_concurrency",
             "effective_delay", "baseline_concurrency", "baseline_delay",
             "last_429_at", "cooldown_until", "stop_until", "run_429_count",
             "clean_batches",
         }
-        updates = {k: v for k, v in fields.items() if k in allowed}
-        if not updates:
+        search_allowed = {"seed_cursor", "seed_exhausted"}
+        controller_updates = {k: v for k, v in fields.items() if k in controller_allowed}
+        search_updates = {k: v for k, v in fields.items() if k in search_allowed}
+        if not controller_updates and not search_updates:
             return False
-        set_clause = ", ".join(f"{key} = %s" for key in updates)
-        values = list(updates.values())
         try:
             with self._get_cursor() as cur:
-                cur.execute(
-                    f"""
-                    UPDATE {self.COLLECTION_RUNS_TABLE}
-                    SET {set_clause}, updated_at = NOW()
-                    WHERE id = 1;
-                    """,
-                    values,
-                )
+                if controller_updates:
+                    set_clause = ", ".join(f"{key} = %s" for key in controller_updates)
+                    cur.execute(
+                        f"UPDATE {self.COLLECTION_RUNS_TABLE} SET {set_clause}, updated_at = NOW() WHERE id = 1;",
+                        list(controller_updates.values()),
+                    )
+                if search_updates:
+                    set_clause = ", ".join(f"{key} = %s" for key in search_updates)
+                    cur.execute(
+                        f"""
+                        UPDATE {self.COLLECTION_SEARCH_RUNS_TABLE}
+                        SET {set_clause}, updated_at = NOW()
+                        WHERE id = (SELECT active_search_run_id FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1);
+                        """,
+                        list(search_updates.values()),
+                    )
             return True
         except Exception as e:
             print(f"PostgreSQL update_run_state error: {e}")
@@ -2788,6 +3083,201 @@ class PostgresStorage:
     def set_run_status(self, status: str) -> bool:
         """Set the collection run status."""
         return self.update_run_state(status=status)
+
+    def get_search_for_config(self, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return the latest generation checkpoint matching all targeting filters."""
+        if not self.available:
+            return None
+        search_key = build_collection_search_key(config)
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT s.*,
+                           (SELECT COUNT(*)
+                            FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                            JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                            WHERE m.search_run_id = s.id AND h.email_status = %s) AS pending_count
+                    FROM {self.COLLECTION_SEARCH_RUNS_TABLE} s
+                    WHERE s.search_key = %s
+                    ORDER BY s.generation DESC
+                    LIMIT 1;
+                    """,
+                    (EMAIL_STATUS_PENDING, search_key),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"PostgreSQL get search for config error: {e}")
+            return None
+
+    def activate_collection_search(
+        self,
+        config: Dict[str, Any],
+        *,
+        topic_details: Optional[List[Dict[str, Any]]] = None,
+        start_over: bool = False,
+        baseline_concurrency: Optional[int] = None,
+        baseline_delay: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically resume an identical checkpoint or create a fresh generation."""
+        if not self.available:
+            return None
+        search_key = build_collection_search_key(config)
+        params = _get_connection_params()
+        if not params:
+            return None
+        conn = None
+        try:
+            conn = psycopg2.connect(**params)
+            conn.autocommit = False
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.COLLECTION_RUNS_TABLE} (id, status)
+                    VALUES (1, %s) ON CONFLICT (id) DO NOTHING;
+                    """,
+                    (RUN_STATUS_IDLE,),
+                )
+                cur.execute(
+                    f"""
+                    SELECT * FROM {self.COLLECTION_SEARCH_RUNS_TABLE}
+                    WHERE search_key = %s
+                    ORDER BY generation DESC
+                    LIMIT 1
+                    FOR UPDATE;
+                    """,
+                    (search_key,),
+                )
+                latest = cur.fetchone()
+                if latest and not start_over:
+                    search = dict(latest)
+                else:
+                    generation = int(latest.get("generation") or 0) + 1 if latest else 1
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.COLLECTION_SEARCH_RUNS_TABLE}
+                            (search_key, generation, domains_json, disciplines_json,
+                             specialties_json, exclude_countries_json, keyword_tags,
+                             topic_ids_json, selected_topic_ids_json, topic_details_json,
+                             h_index_min, h_index_max)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING *;
+                        """,
+                        (
+                            search_key,
+                            generation,
+                            json.dumps(config.get("domains") or []),
+                            json.dumps(config.get("disciplines") or []),
+                            json.dumps(config.get("specialties") or []),
+                            json.dumps(config.get("exclude_countries") or []),
+                            str(config.get("keyword_tags") or "").strip(),
+                            json.dumps(config.get("topic_ids") or []),
+                            json.dumps(config.get("topic_ids") or []),
+                            json.dumps(topic_details or config.get("topic_details") or []),
+                            int(config.get("h_index_min") or 0),
+                            int(config.get("h_index_max") or 0),
+                        ),
+                    )
+                    search = dict(cur.fetchone())
+                concurrency = int(baseline_concurrency or 2)
+                delay = float(baseline_delay or 3.0)
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_RUNS_TABLE}
+                    SET active_search_run_id = %s,
+                        status = %s,
+                        baseline_concurrency = %s,
+                        baseline_delay = %s,
+                        effective_concurrency = %s,
+                        effective_delay = %s,
+                        cooldown_until = NULL,
+                        stop_until = NULL,
+                        clean_batches = 0,
+                        updated_at = NOW()
+                    WHERE id = 1
+                    RETURNING *;
+                    """,
+                    (
+                        search["id"], RUN_STATUS_ACTIVE, concurrency, delay,
+                        concurrency, delay,
+                    ),
+                )
+                controller = dict(cur.fetchone())
+            conn.commit()
+            return self._merge_collection_rows(controller, search)
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"PostgreSQL activate collection search error: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def update_current_search_topics(
+        self,
+        topic_ids: List[str],
+        topic_details: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Persist worker-resolved keyword topics without changing search identity."""
+        if not self.available:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_SEARCH_RUNS_TABLE}
+                    SET topic_ids_json = %s,
+                        updated_at = NOW()
+                    WHERE id = (SELECT active_search_run_id FROM {self.COLLECTION_RUNS_TABLE} WHERE id = 1);
+                    """,
+                    (json.dumps(topic_ids or []),),
+                )
+                return cur.rowcount > 0
+        except Exception as e:
+            print(f"PostgreSQL update current search topics error: {e}")
+            return False
+
+    def acquire_worker_lease(self, owner: str, lease_seconds: int = 120) -> bool:
+        """Acquire or renew the singleton collector lease."""
+        if not self.available or not owner:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_RUNS_TABLE}
+                    SET worker_owner = %s,
+                        worker_lease_until = NOW() + (%s * INTERVAL '1 second'),
+                        updated_at = NOW()
+                    WHERE id = 1
+                      AND (worker_owner = %s OR worker_lease_until IS NULL OR worker_lease_until <= NOW())
+                    RETURNING id;
+                    """,
+                    (owner, max(30, int(lease_seconds)), owner),
+                )
+                return cur.fetchone() is not None
+        except Exception as e:
+            print(f"PostgreSQL acquire worker lease error: {e}")
+            return False
+
+    def release_worker_lease(self, owner: str) -> bool:
+        if not self.available or not owner:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_RUNS_TABLE}
+                    SET worker_owner = '', worker_lease_until = NULL, updated_at = NOW()
+                    WHERE id = 1 AND worker_owner = %s;
+                    """,
+                    (owner,),
+                )
+                return cur.rowcount > 0
+        except Exception:
+            return False
 
     def set_run_config(
         self,
@@ -2937,26 +3427,101 @@ class PostgresStorage:
             print(f"PostgreSQL bulk_upsert_harvested_authors error: {e}")
             return written
 
+    def persist_seed_batch(
+        self,
+        search_run_id: int,
+        authors: List[Dict[str, Any]],
+        *,
+        next_cursor: Optional[str],
+        has_more: bool,
+    ) -> int:
+        """Persist a seed page and atomically checkpoint its membership/cursor."""
+        if not self.available or not search_run_id:
+            return 0
+        self.bulk_upsert_harvested_authors(authors, run_id=int(search_run_id))
+        openalex_ids = sorted({
+            _normalize_openalex_id(author.get("author_id"))
+            for author in authors
+            if _normalize_openalex_id(author.get("author_id"))
+        })
+        params = _get_connection_params()
+        if not params:
+            return 0
+        conn = None
+        try:
+            conn = psycopg2.connect(**params)
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                inserted = 0
+                if openalex_ids:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.COLLECTION_RUN_AUTHORS_TABLE} (search_run_id, openalex_id)
+                        SELECT %s, h.openalex_id
+                        FROM {self.HARVESTED_AUTHORS_TABLE} h
+                        WHERE h.openalex_id = ANY(%s)
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (int(search_run_id), openalex_ids),
+                    )
+                    inserted = int(cur.rowcount or 0)
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_SEARCH_RUNS_TABLE}
+                    SET seed_cursor = %s,
+                        seed_exhausted = %s,
+                        seeded = seeded + %s,
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (next_cursor or "", not bool(has_more and next_cursor), inserted, int(search_run_id)),
+                )
+            conn.commit()
+            return inserted
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"PostgreSQL persist seed batch error: {e}")
+            return 0
+        finally:
+            if conn:
+                conn.close()
+
     def get_pending_harvest(
-        self, limit: int = 50, require_orcid: bool = True
+        self, limit: int = 50, require_orcid: bool = True,
+        search_run_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Return pending harvested authors due for an email lookup."""
+        """Return pending authors belonging to the active search only."""
         if not self.available:
             return []
         safe_limit = max(1, min(int(limit or 50), 1000))
         orcid_clause = "AND orcid_id <> ''" if require_orcid else ""
         try:
             with self._get_cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT * FROM {self.HARVESTED_AUTHORS_TABLE}
-                    WHERE email_status = %s {orcid_clause}
-                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-                    ORDER BY next_retry_at ASC NULLS FIRST, created_at ASC
-                    LIMIT %s;
-                    """,
-                    (EMAIL_STATUS_PENDING, safe_limit),
-                )
+                if search_run_id:
+                    cur.execute(
+                        f"""
+                        SELECT h.* FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                        JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                        WHERE m.search_run_id = %s
+                          AND h.email_status = %s {orcid_clause}
+                          AND (h.next_retry_at IS NULL OR h.next_retry_at <= NOW())
+                        ORDER BY h.next_retry_at ASC NULLS FIRST, h.created_at ASC
+                        LIMIT %s;
+                        """,
+                        (int(search_run_id), EMAIL_STATUS_PENDING, safe_limit),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT * FROM {self.HARVESTED_AUTHORS_TABLE}
+                        WHERE email_status = %s {orcid_clause}
+                          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                        ORDER BY next_retry_at ASC NULLS FIRST, created_at ASC
+                        LIMIT %s;
+                        """,
+                        (EMAIL_STATUS_PENDING, safe_limit),
+                    )
                 return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             print(f"PostgreSQL get_pending_harvest error: {e}")
@@ -3027,6 +3592,29 @@ class PostgresStorage:
             print(f"PostgreSQL count_harvest_by_status error: {e}")
             return counts
 
+    def count_search_harvest_by_status(self, search_run_id: int) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        if not self.available or not search_run_id:
+            return counts
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT h.email_status, COUNT(*) AS cnt
+                    FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                    JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                    WHERE m.search_run_id = %s
+                    GROUP BY h.email_status;
+                    """,
+                    (int(search_run_id),),
+                )
+                for row in cur.fetchall():
+                    counts[row["email_status"]] = int(row["cnt"])
+            return counts
+        except Exception as e:
+            print(f"PostgreSQL count search harvest error: {e}")
+            return counts
+
     def bump_daily_stat(self, field: str, increment: int = 1, day: Optional[Any] = None) -> bool:
         """Increment a counter in collection_daily_stats for the given UTC day."""
         if not self.available:
@@ -3049,6 +3637,28 @@ class PostgresStorage:
             return True
         except Exception as e:
             print(f"PostgreSQL bump_daily_stat error: {e}")
+            return False
+
+    def bump_search_stat(self, search_run_id: int, field: str, increment: int = 1) -> bool:
+        """Increment a metric owned by one durable search generation."""
+        if not self.available or not search_run_id:
+            return False
+        allowed = {"emails_found", "attempts", "orcid_429", "openalex_429", "seeded"}
+        if field not in allowed:
+            return False
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {self.COLLECTION_SEARCH_RUNS_TABLE}
+                    SET {field} = {field} + %s, updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (int(increment), int(search_run_id)),
+                )
+                return cur.rowcount > 0
+        except Exception as e:
+            print(f"PostgreSQL bump search stat error: {e}")
             return False
 
     def get_recent_harvested(
@@ -3095,30 +3705,40 @@ class PostgresStorage:
             "attempts_today": 0,
             "orcid_429_today": 0,
             "hit_rate": 0.0,
+            "search_available": 0,
+            "search_seeded": 0,
         }
         if not self.available:
             return summary
         try:
             summary["run"] = self.get_or_create_run()
-            counts = self.count_harvest_by_status()
+            global_counts = self.count_harvest_by_status()
+            summary["total_collected"] = global_counts.get(EMAIL_STATUS_FOUND, 0)
+            search_run_id = (summary["run"] or {}).get("search_run_id")
+            with self._get_cursor() as cur:
+                if search_run_id:
+                    cur.execute(
+                        f"""
+                        SELECT h.email_status, COUNT(*) AS cnt
+                        FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                        JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                        WHERE m.search_run_id = %s
+                        GROUP BY h.email_status;
+                        """,
+                        (int(search_run_id),),
+                    )
+                    counts = {row["email_status"]: int(row["cnt"]) for row in cur.fetchall()}
+                else:
+                    counts = {}
             summary["status_counts"] = counts
             summary["queue_pending"] = counts.get(EMAIL_STATUS_PENDING, 0)
-            summary["total_collected"] = counts.get(EMAIL_STATUS_FOUND, 0)
-            today = datetime.now(timezone.utc).date()
-            with self._get_cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT emails_found, attempts, orcid_429
-                    FROM {self.COLLECTION_DAILY_STATS_TABLE}
-                    WHERE day = %s;
-                    """,
-                    (today,),
-                )
-                row = cur.fetchone()
-            if row:
-                summary["emails_found_today"] = int(row.get("emails_found", 0) or 0)
-                summary["attempts_today"] = int(row.get("attempts", 0) or 0)
-                summary["orcid_429_today"] = int(row.get("orcid_429", 0) or 0)
+            summary["search_available"] = counts.get(EMAIL_STATUS_FOUND, 0)
+            run = summary["run"] or {}
+            summary["search_seeded"] = int(run.get("seeded") or 0)
+            summary["emails_found_today"] = int(run.get("emails_found") or 0)
+            summary["attempts_today"] = int(run.get("attempts") or 0)
+            summary["orcid_429_today"] = int(run.get("orcid_429") or 0)
+            if run:
                 if summary["attempts_today"] > 0:
                     summary["hit_rate"] = round(
                         summary["emails_found_today"] / summary["attempts_today"], 4

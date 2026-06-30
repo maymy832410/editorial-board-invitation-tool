@@ -16,6 +16,7 @@ State machine (per the agreed 429-safe policy):
 import asyncio
 import random
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -90,31 +91,35 @@ class CollectorWorker:
     def __init__(self) -> None:
         self.storage = get_storage()
         self.openalex = OpenAlexClient()
-        self._topic_cache: Optional[List[str]] = None
+        self._topic_cache: Dict[int, List[str]] = {}
         self.bulk_email_worker: Optional[BulkEmailWorker] = None
+        self.worker_owner = str(uuid.uuid4())
 
     # -- seeding ---------------------------------------------------------
     def _resolve_topic_ids(self, run: Dict[str, Any]) -> List[str]:
         """Resolve OpenAlex topic IDs from stored topic_ids or keyword tags."""
+        search_run_id = int(run.get("search_run_id") or 0)
+        if search_run_id in self._topic_cache:
+            return self._topic_cache[search_run_id]
         cached = _parse_json_list(run.get("topic_ids_json"))
-        if cached:
-            return cached
-
         keyword_tags = (run.get("keyword_tags") or "").strip()
         if not keyword_tags:
-            return []
+            self._topic_cache[search_run_id] = cached
+            return cached
 
         keywords = [k.strip() for k in keyword_tags.replace("\n", ",").split(",") if k.strip()]
         if not keywords:
-            return []
+            return cached
         try:
             topic_ids, _details = self.openalex.search_topics(keywords)
         except Exception as exc:
             _log(f"topic resolution failed: {exc}")
-            return []
-        if topic_ids:
-            self.storage.set_run_config(topic_ids=topic_ids)
-        return topic_ids
+            return cached
+        combined = sorted(set(cached) | set(topic_ids))
+        if combined:
+            self.storage.update_current_search_topics(combined, _details)
+        self._topic_cache[search_run_id] = combined
+        return combined
 
     def _seed_filter_authors(
         self, authors: List[Dict[str, Any]], disciplines: List[str], specialties: List[str]
@@ -147,7 +152,10 @@ class CollectorWorker:
         if run.get("seed_exhausted"):
             return
 
-        counts = self.storage.count_harvest_by_status()
+        search_run_id = int(run.get("search_run_id") or 0)
+        if not search_run_id:
+            return
+        counts = self.storage.count_search_harvest_by_status(search_run_id)
         pending = counts.get(EMAIL_STATUS_PENDING, 0)
         if pending >= COLLECT_SEED_MIN_QUEUE:
             return
@@ -169,6 +177,7 @@ class CollectorWorker:
             )
         except OpenAlexRateLimitError as exc:
             self.storage.bump_daily_stat("openalex_429", 1)
+            self.storage.bump_search_stat(search_run_id, "openalex_429", 1)
             wait = exc.retry_after_seconds or 300
             _log(f"OpenAlex 429 during seed; backing off {wait}s")
             time.sleep(min(wait, 900))
@@ -180,17 +189,19 @@ class CollectorWorker:
 
         results = batch.get("results", [])
         filtered = self._seed_filter_authors(results, disciplines, specialties)
-        if filtered:
-            written = self.storage.bulk_upsert_harvested_authors(filtered, run_id=1)
+        next_cursor = batch.get("next_cursor")
+        written = self.storage.persist_seed_batch(
+            search_run_id,
+            filtered,
+            next_cursor=next_cursor,
+            has_more=bool(batch.get("has_more")),
+        )
+        if written:
             self.storage.bump_daily_stat("seeded", written)
             _log(f"seeded {written} authors (fetched {len(results)}, pending was {pending})")
 
-        next_cursor = batch.get("next_cursor")
         if not batch.get("has_more") or not next_cursor:
-            self.storage.update_run_state(seed_exhausted=True)
             _log("OpenAlex seed cursor exhausted for current filters")
-        else:
-            self.storage.update_run_state(seed_cursor=next_cursor)
 
     # -- email fetching --------------------------------------------------
     def _fetch_cycle(self, run: Dict[str, Any]) -> bool:
@@ -199,7 +210,12 @@ class CollectorWorker:
         delay = float(run.get("effective_delay") or COLLECT_BASELINE_DELAY_SEC)
         limit = max(concurrency, COLLECT_FETCH_BATCH)
 
-        pending = self.storage.get_pending_harvest(limit=limit, require_orcid=True)
+        search_run_id = int(run.get("search_run_id") or 0)
+        pending = self.storage.get_pending_harvest(
+            limit=limit,
+            require_orcid=True,
+            search_run_id=search_run_id,
+        )
         if not pending:
             return False
 
@@ -228,6 +244,7 @@ class CollectorWorker:
             if not openalex_id:
                 continue
             self.storage.bump_daily_stat("attempts", 1)
+            self.storage.bump_search_stat(search_run_id, "attempts", 1)
 
             if result.get("rate_limited"):
                 saw_429 = True
@@ -251,6 +268,7 @@ class CollectorWorker:
                     source="collector",
                 )
                 self.storage.bump_daily_stat("emails_found", 1)
+                self.storage.bump_search_stat(search_run_id, "emails_found", 1)
             elif status == EMAIL_STATUS_ERROR:
                 self.storage.update_harvest_email(
                     openalex_id=openalex_id,
@@ -269,6 +287,7 @@ class CollectorWorker:
 
         if saw_429:
             self.storage.bump_daily_stat("orcid_429", 1)
+            self.storage.bump_search_stat(search_run_id, "orcid_429", 1)
         return saw_429
 
     # -- state machine ---------------------------------------------------
@@ -326,19 +345,26 @@ class CollectorWorker:
     # -- main loop -------------------------------------------------------
     def run_forever(self) -> None:
         _log("worker starting")
-        while True:
-            try:
-                self._tick()
-            except KeyboardInterrupt:
-                _log("worker stopping (KeyboardInterrupt)")
-                return
-            except Exception as exc:  # keep the worker alive on unexpected errors
-                _log(f"unexpected error: {exc}")
-                time.sleep(COLLECT_IDLE_POLL_SEC)
+        try:
+            while True:
+                try:
+                    self._tick()
+                except KeyboardInterrupt:
+                    _log("worker stopping (KeyboardInterrupt)")
+                    return
+                except Exception as exc:  # keep the worker alive on unexpected errors
+                    _log(f"unexpected error: {exc}")
+                    time.sleep(COLLECT_IDLE_POLL_SEC)
+        finally:
+            self.storage.release_worker_lease(self.worker_owner)
 
     def _tick(self) -> None:
         if not self.storage.available:
             _log("database unavailable; retrying")
+            time.sleep(COLLECT_IDLE_POLL_SEC)
+            return
+
+        if not self.storage.acquire_worker_lease(self.worker_owner, lease_seconds=900):
             time.sleep(COLLECT_IDLE_POLL_SEC)
             return
 
