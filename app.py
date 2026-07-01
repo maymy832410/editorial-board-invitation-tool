@@ -28,7 +28,7 @@ from orcid_async import fetch_emails_async
 from openai_email_async import AsyncOpenAIEmailClient
 from progress_manager import StateManager
 from author_filters import author_matches_any_specialty, dedupe_authors
-from bulk_email_jobs import prepare_bulk_recipients
+from bulk_email_jobs import cap_bulk_recipients, prepare_bulk_recipients
 from bulk_email_worker import BulkEmailWorker
 from disciplines import ALL_DISCIPLINES
 from email_sender import EmailSender
@@ -41,7 +41,6 @@ from templates import (
     TEMPLATE_BOARD_MEMBER,
     TEMPLATE_MANAGING_EDITOR,
     TEMPLATE_EDITOR_IN_CHIEF,
-    TEMPLATE_PUBLICATION_RECENT_WORK,
 )
 from pdf_generator import generate_invitation_pdf, PUBLISHER_INFO
 from db_client import get_storage as get_db_storage
@@ -1486,9 +1485,26 @@ def email_dialog(author: dict, filters: dict):
                         cite_score=journal_config.get('cite_score', ''),
                         quartile=journal_config.get('quartile', '')
                     )
-                    st.success(f"Email sent to {to_email}!")
+                    purge_requested = bool(filters.get('suppress_after_send'))
+                    purge_ok = False
+                    if purge_requested and db_storage.available:
+                        purge_ok = bool(db_storage.suppress_recipient(
+                            to_email,
+                            orcid_id=author.get('orcid_id', ''),
+                            profile_key=author.get('profile_key', ''),
+                            reason="Invitation delivered; prevent duplicate outreach",
+                            source="automatic_post_send",
+                        ))
+                        if purge_ok:
+                            _purge_local_suppressed_email(to_email)
+                    if purge_requested and purge_ok:
+                        st.success(f"Email sent to {to_email} and removed from future outreach!")
+                    else:
+                        st.success(f"Email sent to {to_email}!")
                     if not db_ok:
                         st.warning("Sent status could not be saved to the database; it may not persist across sessions.")
+                    if purge_requested and db_storage.available and not purge_ok:
+                        st.warning("The email was sent, but automatic suppression and purge did not complete.")
                     time.sleep(1)
                     st.rerun()
                 else:
@@ -2114,8 +2130,19 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
 
 def render_search_section(filters, ui_scope: str):
     """Render the search and results section."""
-    invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
-    is_author_workflow = invitation_type == INVITATION_TYPE_PUBLICATION and ui_scope == WORKFLOW_AUTHOR
+    if ui_scope == WORKFLOW_AUTHOR:
+        invitation_type = st.selectbox(
+            "Invitation Purpose",
+            options=[INVITATION_TYPE_PUBLICATION, INVITATION_TYPE_EDITORIAL],
+            format_func=_invitation_type_label,
+            key=_scope_key(ui_scope, "invitation_purpose"),
+            help="Choose whether individual and bulk sends invite a publication submission or an editorial role.",
+        )
+        filters['invitation_type'] = invitation_type
+        filters['suppress_after_send'] = True
+    else:
+        invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
+    is_author_workflow = ui_scope == WORKFLOW_AUTHOR
     author_source_mode = AUTHOR_SOURCE_OPENALEX
 
     if is_author_workflow:
@@ -2485,21 +2512,24 @@ def _enqueue_bulk_send(payload: dict) -> None:
     invitation_type = payload.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     selected_template_id = payload.get('selected_bulk_template', TEMPLATE_BOARD_MEMBER)
     template_strategy = payload.get('bulk_template_strategy', 'Use selected template')
-    if invitation_type == INVITATION_TYPE_PUBLICATION:
-        selected_template_id = TEMPLATE_PUBLICATION_RECENT_WORK
-        template_strategy = "Use selected template"
     tracking_journal_name = payload.get('tracking_journal_name', '')
-    journal_filter = tracking_journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
     retracted_names = db_storage.get_retracted_names()
+    payload_batch = payload.get('batch') or []
+    active_bulk_keys = db_storage.get_active_bulk_recipient_keys(payload_batch)
+    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
     batch = prepare_bulk_recipients(
-        payload.get('batch') or [],
-        is_already_sent=lambda orcid_id: db_storage.is_sent(orcid_id, invitation_type, journal_filter),
-        is_suppressed=lambda email, orcid_id: db_storage.is_recipient_suppressed(
-            email,
-            orcid_id=orcid_id,
+        payload_batch,
+        is_already_sent=lambda recipient_id: (
+            recipient_id in sent_invitations
+            or recipient_id in active_bulk_keys["identities"]
+        ),
+        is_suppressed=lambda email, orcid_id: (
+            db_storage.is_recipient_suppressed(email, orcid_id=orcid_id)
+            or (email or '').strip().lower() in active_bulk_keys["emails"]
         ),
         retracted_names=retracted_names,
     )
+    batch = cap_bulk_recipients(batch)
 
     if not batch:
         st.session_state.last_bulk_enqueue_result = "No eligible authors remained for this bulk send."
@@ -2515,7 +2545,10 @@ def _enqueue_bulk_send(payload: dict) -> None:
         scopus_indexed=bool(payload.get('bulk_scopus_indexed', False)),
         attach_pdf=bool(payload.get('bulk_attach_pdf', True)),
         include_publications=bool(payload.get('bulk_include_cached_publications', False)),
-        journal_config=payload.get('journal_config', {}) or {},
+        journal_config={
+            **(payload.get('journal_config', {}) or {}),
+            "suppress_after_send": bool(payload.get('suppress_after_send')),
+        },
     )
     if job_id:
         st.session_state.last_bulk_enqueue_result = f"Queued background bulk email job #{job_id} with {len(batch)} recipients."
@@ -2594,7 +2627,7 @@ def display_results(filters, ui_scope: str):
     if isinstance(confirmed_bulk_payload, dict):
         _enqueue_bulk_send(confirmed_bulk_payload)
 
-    is_author_workflow = invitation_type == INVITATION_TYPE_PUBLICATION and ui_scope == WORKFLOW_AUTHOR
+    is_author_workflow = ui_scope == WORKFLOW_AUTHOR
     author_source_mode = filters.get(
         'author_source_mode',
         st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH),
@@ -3219,13 +3252,21 @@ def display_results(filters, ui_scope: str):
     
     # --- Bulk send controls ---
     filtered_with_email = [a for a in filtered if a.get('email')]
+    active_bulk_keys = (
+        db_storage.get_active_bulk_recipient_keys(filtered)
+        if db_storage.available else {"identities": set(), "emails": set()}
+    )
     eligible_bulk_authors = prepare_bulk_recipients(
         filtered,
-        is_already_sent=lambda recipient_id: recipient_id in sent_invitations,
+        is_already_sent=lambda recipient_id: (
+            recipient_id in sent_invitations
+            or recipient_id in active_bulk_keys["identities"]
+        ),
         is_suppressed=lambda email, orcid_id: (
             (email or '').strip().lower() in suppressed_keys["emails"]
             or (orcid_id or '').strip().lower().replace('https://orcid.org/', '')
                 in suppressed_keys["orcids"]
+            or (email or '').strip().lower() in active_bulk_keys["emails"]
         ),
         retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
     )
@@ -3234,31 +3275,17 @@ def display_results(filters, ui_scope: str):
     bulk_template_names = get_template_names(invitation_type)
     bulk_col1, bulk_col2, bulk_col3 = st.columns([1.4, 1.4, 1.2])
     with bulk_col1:
-        if invitation_type == INVITATION_TYPE_PUBLICATION:
-            selected_bulk_template = TEMPLATE_PUBLICATION_RECENT_WORK
-            st.text_input(
-                "Bulk Template",
-                value=bulk_template_names.get(selected_bulk_template, "Publication Invitation"),
-                disabled=True,
-                key=_scope_key(ui_scope, f"bulk_template_locked_{invitation_type}")
-            )
-        else:
-            selected_bulk_template = st.selectbox(
-                "Bulk Template",
-                options=list(bulk_template_names.keys()),
-                format_func=lambda x: bulk_template_names[x],
-                key=_scope_key(ui_scope, f"bulk_template_select_{invitation_type}")
-            )
+        selected_bulk_template = st.selectbox(
+            "Bulk Template",
+            options=list(bulk_template_names.keys()),
+            format_func=lambda x: bulk_template_names[x],
+            key=_scope_key(ui_scope, f"bulk_template_select_{invitation_type}")
+        )
     with bulk_col2:
         if invitation_type == INVITATION_TYPE_PUBLICATION:
             bulk_template_strategy = "Use selected template"
-            st.text_input(
-                "Template Strategy",
-                value="Fixed HTML template",
-                disabled=True,
-                key=_scope_key(ui_scope, "bulk_publication_template_strategy_locked")
-            )
             bulk_scopus_indexed = False
+            st.caption("Publication template selected for every recipient in this batch.")
         else:
             bulk_template_strategy = "Use selected template"
             bulk_scopus_indexed = st.checkbox(
@@ -3284,20 +3311,21 @@ def display_results(filters, ui_scope: str):
     
     col_count, col_note, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_count:
-        default_bulk_count = min(1000, len(eligible_bulk_authors)) if eligible_bulk_authors else 0
+        eligible_batch_limit = min(1000, len(eligible_bulk_authors))
+        default_bulk_count = eligible_batch_limit
         batch_size = st.number_input(
             "Recipients to queue",
             min_value=0,
-            max_value=len(eligible_bulk_authors),
+            max_value=eligible_batch_limit,
             value=default_bulk_count,
             step=25,
-            key=_scope_key(ui_scope, "bulk_recipient_count"),
-            help="Uses all current filters, not just the visible page."
+            key=_scope_key(ui_scope, f"bulk_recipient_count_{invitation_type}"),
+            help="Uses all current filters, not just the visible page, with a maximum of 1,000 recipients per batch."
         )
     with col_note:
         st.caption(
             f"Eligible: {len(eligible_bulk_authors):,} of {len(filtered_with_email):,} filtered authors with email. "
-            "Already invited and retracted authors are skipped."
+            "Already invited, actively queued, suppressed, and retracted authors are skipped."
         )
 
     with col_bulk:
@@ -3328,6 +3356,7 @@ def display_results(filters, ui_scope: str):
             'bulk_scopus_indexed': bulk_scopus_indexed,
             'bulk_attach_pdf': bulk_attach_pdf,
             'bulk_include_cached_publications': bulk_include_cached_publications,
+            'suppress_after_send': bool(filters.get('suppress_after_send')),
             'journal_config': dict(journal_config),
             'dialog_key': f"{ui_scope}_{current_results_page}_{int(time.time())}",
         }
@@ -3447,6 +3476,7 @@ def display_results(filters, ui_scope: str):
                     st.session_state[pending_dialog_filters_key] = {
                         'publisher': filters.get('publisher', 'brevo'),
                         'invitation_type': invitation_type,
+                        'suppress_after_send': bool(filters.get('suppress_after_send')),
                     }
                     st.rerun()
             else:
@@ -3976,7 +4006,7 @@ def main():
     )
 
     if active_view == views[0]:
-        st.caption("Publication-submission invitations with scientific-domain targeting.")
+        st.caption("Publication-submission or editorial-role invitations with scientific-domain targeting.")
         author_filters = dict(shared_filters)
         author_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_AUTHOR)
         render_search_section(author_filters, WORKFLOW_AUTHOR)

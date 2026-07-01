@@ -3,6 +3,14 @@
 from typing import Callable, Iterable, Optional
 
 
+MAX_BULK_RECIPIENTS = 1000
+
+
+def cap_bulk_recipients(authors: Iterable[dict], limit: int = MAX_BULK_RECIPIENTS) -> list[dict]:
+    """Apply the hard per-job recipient cap after preserving filter order."""
+    return list(authors)[:max(0, min(int(limit), MAX_BULK_RECIPIENTS))]
+
+
 def prepare_bulk_recipients(
     authors: Iterable[dict],
     is_already_sent: Callable[[str], bool],

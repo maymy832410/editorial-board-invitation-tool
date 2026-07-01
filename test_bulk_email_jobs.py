@@ -1,9 +1,18 @@
 import unittest
 
-from bulk_email_jobs import prepare_bulk_recipients
+from bulk_email_jobs import MAX_BULK_RECIPIENTS, cap_bulk_recipients, prepare_bulk_recipients
 
 
 class BulkEmailJobTests(unittest.TestCase):
+    def test_bulk_recipient_cap_is_1000(self):
+        authors = [{"orcid_id": str(index)} for index in range(1200)]
+
+        capped = cap_bulk_recipients(authors)
+
+        self.assertEqual(MAX_BULK_RECIPIENTS, 1000)
+        self.assertEqual(len(capped), 1000)
+        self.assertEqual(capped[-1]["orcid_id"], "999")
+
     def test_prepare_bulk_recipients_skips_invalid_duplicate_sent_and_retracted(self):
         authors = [
             {"name": "Ready One", "orcid_id": "0000-0001", "email": "one@example.com"},

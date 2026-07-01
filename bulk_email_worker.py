@@ -77,6 +77,7 @@ class BulkEmailWorker:
                 BULK_RECIPIENT_STATUS_SENT,
                 provider_response=provider_response,
             )
+            self._suppress_after_success(job, recipient)
             print(
                 f"[bulk-email] sent recipient {recipient_id} "
                 f"job={recipient.get('job_id')} provider_response={provider_response}",
@@ -234,6 +235,28 @@ class BulkEmailWorker:
             if not saved:
                 print("Bulk email sent, but sent status could not be saved", flush=True)
         return message
+
+    def _suppress_after_success(self, job: Dict[str, Any], recipient: Dict[str, Any]) -> None:
+        """Opt-in v1 cleanup after delivery; cleanup failure must never resend email."""
+        journal_config = _parse_json(job.get("journal_config_json"), {})
+        if not journal_config.get("suppress_after_send"):
+            return
+        email = recipient.get("email") or ""
+        if not email:
+            return
+        result = self.storage.suppress_recipient(
+            email=email,
+            orcid_id=recipient.get("orcid_id") or "",
+            profile_key=recipient.get("profile_key") or "",
+            reason="Invitation delivered; prevent duplicate outreach",
+            source="automatic_post_send",
+        )
+        if not result:
+            print(
+                f"[bulk-email] sent recipient {recipient.get('id')}, "
+                "but automatic suppression and purge failed",
+                flush=True,
+            )
 
     def _build_unsubscribe_url(self, email: str, orcid_id: str = "", profile_key: str = "") -> str:
         """Create or reuse an unsubscribe token URL for one recipient."""

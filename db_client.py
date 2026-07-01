@@ -15,7 +15,6 @@ import psycopg2.extras
 
 INVITATION_TYPE_EDITORIAL = "editorial"
 INVITATION_TYPE_PUBLICATION = "publication"
-TEMPLATE_PUBLICATION_RECENT_WORK = "publication_recent_work"
 OPENALEX_MATCH_STATUS_UNKNOWN = "unknown"
 OPENALEX_MATCH_STATUS_MATCHED = "matched"
 OPENALEX_MATCH_STATUS_PENDING_MANUAL = "pending_manual"
@@ -2526,10 +2525,6 @@ class PostgresStorage:
         publisher_id = _normalize_text(publisher_id)
         if not publisher_id:
             return None
-        if invitation_type == INVITATION_TYPE_PUBLICATION:
-            template_id = TEMPLATE_PUBLICATION_RECENT_WORK
-            template_strategy = "Use selected template"
-
         cleaned: List[Dict[str, Any]] = []
         seen_keys: Set[str] = set()
         for recipient in recipients:
@@ -2612,6 +2607,50 @@ class PostgresStorage:
         except Exception as e:
             print(f"PostgreSQL create bulk email job error: {e}")
             return None
+
+    def get_active_bulk_recipient_keys(self, recipients: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        """Return active queue identities and emails for a recipient collection."""
+        result: Dict[str, Set[str]] = {"identities": set(), "emails": set()}
+        if not self.available or not recipients:
+            return result
+        identities = {
+            _normalize_orcid(recipient.get("orcid_id"))
+            or f"email:{_normalize_email(recipient.get('email'))}"
+            for recipient in recipients
+            if _normalize_orcid(recipient.get("orcid_id")) or _normalize_email(recipient.get("email"))
+        }
+        emails = {
+            _normalize_email(recipient.get("email"))
+            for recipient in recipients
+            if _normalize_email(recipient.get("email"))
+        }
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT orcid_id, LOWER(email) AS email
+                    FROM {self.BULK_EMAIL_RECIPIENTS_TABLE}
+                    WHERE status IN (%s, %s)
+                      AND (orcid_id = ANY(%s) OR LOWER(email) = ANY(%s));
+                    """,
+                    (
+                        BULK_RECIPIENT_STATUS_PENDING,
+                        BULK_RECIPIENT_STATUS_SENDING,
+                        sorted(identities) or [""],
+                        sorted(emails) or [""],
+                    ),
+                )
+                for row in cur.fetchall():
+                    identity = _normalize_text(row.get("orcid_id"))
+                    email = _normalize_email(row.get("email"))
+                    if identity:
+                        result["identities"].add(identity)
+                    if email:
+                        result["emails"].add(email)
+            return result
+        except Exception as e:
+            print(f"PostgreSQL active bulk recipient lookup error: {e}")
+            return result
 
     def _refresh_bulk_job_counts(self, job_id: int) -> bool:
         """Recompute cached counters and finish completed jobs."""
