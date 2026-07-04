@@ -422,6 +422,7 @@ def _map_database_email_row_to_author(row: dict) -> dict:
     }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _load_author_source_rows_from_db(limit: int) -> list[dict]:
     """Load Author Invitation candidates from author_profiles (ORCID + email only)."""
     if not db_storage.available:
@@ -449,12 +450,14 @@ def _load_author_source_rows_from_db(limit: int) -> list[dict]:
     return [row for row in mapped_rows if row.get('orcid_id') and row.get('email')]
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _search_database_email_rows(
     query: str,
     source: str,
     limit: int,
     require_email: bool,
     hide_suppressed: bool,
+    countries: tuple[str, ...] = (),
 ) -> list[dict]:
     """Search stored database recipients and map them into author rows."""
     if not db_storage.available:
@@ -465,6 +468,7 @@ def _search_database_email_rows(
         limit=limit,
         require_email=require_email,
         hide_suppressed=hide_suppressed,
+        countries=list(countries),
     )
     return [_map_database_email_row_to_author(row) for row in rows]
 
@@ -840,6 +844,7 @@ def load_search_batch(target_batch_index, jump_size=None, reset=False):
         batch_payload = client.fetch_author_batch(
             h_index_min=search_filters.get('h_index_min'),
             h_index_max=search_filters.get('h_index_max'),
+            include_country_codes=search_filters.get('include_country_codes'),
             exclude_country_codes=search_filters.get('exclude_country_codes'),
             topic_ids=search_filters.get('topic_ids'),
             require_orcid=search_filters.get('require_orcid', True),
@@ -1898,6 +1903,14 @@ def render_sidebar():
                 key="h_max"
             )
         
+        countries_to_include = st.multiselect(
+            "Include Countries",
+            options=list(COUNTRIES.keys()),
+            default=search_params.get('include_countries', []),
+            key="include_countries",
+            help="Show authors from any selected country; leave empty for all countries"
+        )
+
         countries_to_exclude = st.multiselect(
             "Exclude Countries",
             options=list(COUNTRIES.keys()),
@@ -2032,6 +2045,7 @@ def render_sidebar():
             'keyword_tags': keyword_tags,
             'h_min': h_min,
             'h_max': h_max,
+            'include_countries': countries_to_include,
             'exclude_countries': countries_to_exclude,
             'disciplines': selected_disciplines,
             'max_results': max_results,
@@ -2105,6 +2119,9 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
         limit=0,
         require_email=db_require_email,
         hide_suppressed=db_hide_suppressed,
+        countries=tuple(
+            sorted(COUNTRIES[name] for name in filters.get('include_countries', []) if name in COUNTRIES)
+        ),
     )
     if db_hide_sent:
         db_source_results = [
@@ -2226,7 +2243,11 @@ def render_search_section(filters, ui_scope: str):
 def run_search(filters, ui_scope: str):
     """Execute the author search with keyword-based topic filtering."""
     
-    exclude_country_codes = [COUNTRIES[c] for c in filters['exclude_countries']] if filters['exclude_countries'] else None
+    include_country_codes = [COUNTRIES[c] for c in filters.get('include_countries', []) if c in COUNTRIES]
+    exclude_country_codes = [
+        COUNTRIES[c] for c in filters['exclude_countries']
+        if c in COUNTRIES and c not in set(filters.get('include_countries', []))
+    ] or None
     
     client = OpenAlexClient()
     
@@ -2256,6 +2277,8 @@ def run_search(filters, ui_scope: str):
     
     # Show search info
     search_info = f"H-index: {filters['h_min']}-{filters['h_max']}"
+    if filters.get('include_countries'):
+        search_info += f" | Including: {', '.join(filters['include_countries'])}"
     if filters['exclude_countries']:
         search_info += f" | Excluding: {', '.join(filters['exclude_countries'])}"
     if keywords:
@@ -2267,6 +2290,7 @@ def run_search(filters, ui_scope: str):
         total_count = client.get_total_count(
             h_index_min=filters['h_min'],
             h_index_max=filters['h_max'],
+            include_country_codes=include_country_codes or None,
             exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=True
@@ -2284,6 +2308,7 @@ def run_search(filters, ui_scope: str):
         'filters': {
             'h_index_min': filters['h_min'],
             'h_index_max': filters['h_max'],
+            'include_country_codes': include_country_codes or None,
             'exclude_country_codes': exclude_country_codes,
             'topic_ids': topic_ids,
             'require_orcid': True,
@@ -2309,6 +2334,7 @@ def run_search(filters, ui_scope: str):
         'keyword_tags': keyword_tags,
         'h_index_min': filters['h_min'],
         'h_index_max': filters['h_max'],
+        'include_countries': filters.get('include_countries', []),
         'exclude_countries': filters['exclude_countries'],
         'disciplines': filters.get('disciplines', []),
         'author_source_mode': filters.get('author_source_mode', st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH)),

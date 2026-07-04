@@ -339,6 +339,18 @@ class PostgresStorage:
                 CREATE INDEX IF NOT EXISTS idx_author_profiles_cooldown
                 ON {self.PROFILE_TABLE_NAME} (cooldown_until);
             """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_author_profiles_updated
+                ON {self.PROFILE_TABLE_NAME} (updated_at DESC);
+            """)
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_profiles_name_trgm
+                    ON {self.PROFILE_TABLE_NAME} USING GIN (LOWER(author_name) gin_trgm_ops);
+                """)
+            except Exception as exc:
+                print(f"PostgreSQL profile search index unavailable: {exc}")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS retracted_authors (
                     id              SERIAL PRIMARY KEY,
@@ -658,6 +670,22 @@ class PostgresStorage:
             CREATE INDEX IF NOT EXISTS idx_harvested_next_retry
             ON {self.HARVESTED_AUTHORS_TABLE} (next_retry_at);
         """)
+        cur.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_harvested_status_updated
+            ON {self.HARVESTED_AUTHORS_TABLE} (email_status, updated_at DESC);
+        """)
+        try:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_harvested_name_trgm
+                ON {self.HARVESTED_AUTHORS_TABLE} USING GIN (LOWER(author_name) gin_trgm_ops);
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_harvested_specialty_trgm
+                ON {self.HARVESTED_AUTHORS_TABLE} USING GIN (LOWER(specialty) gin_trgm_ops);
+            """)
+        except Exception as exc:
+            print(f"PostgreSQL harvested search indexes unavailable: {exc}")
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.COLLECTION_DAILY_STATS_TABLE} (
                 day             DATE PRIMARY KEY,
@@ -1567,6 +1595,7 @@ class PostgresStorage:
         limit: int = 0,
         require_email: bool = True,
         hide_suppressed: bool = True,
+        countries: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Search email-bearing recipient records across profile and harvested tables."""
         if not self.available:
@@ -1577,6 +1606,7 @@ class PostgresStorage:
         normalized_source = (source or "all").strip().lower()
         if normalized_source not in {"all", "profiles", "harvested"}:
             normalized_source = "all"
+        countries = sorted({str(value).strip().upper() for value in countries or [] if str(value).strip()})
 
         terms = [term.strip().lower() for term in re.split(r"\s+", query or "") if term.strip()]
         like_terms = [f"%{term}%" for term in terms]
@@ -1612,6 +1642,13 @@ class PostgresStorage:
                         "source",
                     ]
                     profile_params = [bool(require_email), *_term_params(profile_columns), bool(hide_suppressed)]
+                    profile_country_sql = ""
+                    if countries:
+                        profile_country_sql = f""" AND EXISTS (
+                            SELECT 1 FROM {self.HARVESTED_AUTHORS_TABLE} hc
+                            WHERE hc.orcid_id = p.orcid_id AND hc.country = ANY(%s)
+                        )"""
+                        profile_params.append(countries)
                     if requested_limit > 0:
                         profile_params.append(requested_limit)
                     cur.execute(
@@ -1656,6 +1693,7 @@ class PostgresStorage:
                                     )
                               )
                           )
+                          {profile_country_sql}
                         ORDER BY updated_at DESC
                         {limit_clause};
                         """,
@@ -1681,6 +1719,10 @@ class PostgresStorage:
                     ]
                     harvested_limit_clause = " LIMIT %s" if requested_limit > 0 else ""
                     harvested_params = [bool(require_email), *_term_params(harvested_columns), bool(hide_suppressed)]
+                    harvested_country_sql = ""
+                    if countries:
+                        harvested_country_sql = " AND country = ANY(%s)"
+                        harvested_params.append(countries)
                     if requested_limit > 0:
                         harvested_params.append(remaining)
                     cur.execute(
@@ -1724,6 +1766,7 @@ class PostgresStorage:
                                     )
                               )
                           )
+                          {harvested_country_sql}
                         ORDER BY updated_at DESC
                         {harvested_limit_clause};
                         """,
