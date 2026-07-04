@@ -27,14 +27,6 @@ class AuthorFilterTests(unittest.TestCase):
 
         self.assertFalse(author_matches_any_specialty(author, ["IoT", "Privacy"]))
 
-    def test_specialty_matching_is_case_insensitive_and_partial(self):
-        author = {"specialty": "Clinical Oncology", "all_topics": []}
-        self.assertTrue(author_matches_any_specialty(author, ["oncology"]))
-
-    def test_specialty_matching_uses_subfield_and_research_areas(self):
-        author = {"subfield": "Machine Learning", "research_areas": "Neural Networks"}
-        self.assertTrue(author_matches_any_specialty(author, ["neural"]))
-
     def test_dedupe_prefers_orcid(self):
         authors = [
             {"name": "First", "orcid_id": "0000-0001", "email": "one@example.com"},

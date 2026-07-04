@@ -1637,9 +1637,6 @@ class PostgresStorage:
         specialties: Optional[List[str]] = None,
         countries: Optional[List[str]] = None,
         exclude_countries: Optional[List[str]] = None,
-        hide_sent: bool = False,
-        invitation_type: str = INVITATION_TYPE_EDITORIAL,
-        journal_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Search email-bearing recipient records across profile and harvested tables."""
         if not self.available:
@@ -1652,7 +1649,6 @@ class PostgresStorage:
             normalized_source = "all"
         disciplines = [value.strip() for value in (disciplines or []) if value and value.strip()]
         specialties = [value.strip() for value in (specialties or []) if value and value.strip()]
-        specialty_patterns = [f"%{value}%" for value in specialties]
         countries = [value.strip() for value in (countries or []) if value and value.strip()]
         exclude_countries = [value.strip() for value in (exclude_countries or []) if value and value.strip() and value.strip() not in countries]
 
@@ -1695,8 +1691,7 @@ class PostgresStorage:
                         profile_taxonomy_sql += " AND scientific_domain = ANY(%s)"
                         profile_params.append(disciplines)
                     if specialties:
-                        profile_taxonomy_sql += " AND (scientific_domain ILIKE ANY(%s) OR scientific_domains_json ILIKE ANY(%s))"
-                        profile_params.extend([specialty_patterns, specialty_patterns])
+                        profile_taxonomy_sql += " AND FALSE"
                     if countries:
                         profile_taxonomy_sql += f""" AND EXISTS (
                             SELECT 1 FROM {self.HARVESTED_AUTHORS_TABLE} hc
@@ -1709,20 +1704,12 @@ class PostgresStorage:
                             WHERE hc.orcid_id = p.orcid_id AND hc.country = ANY(%s)
                         )"""
                         profile_params.append(exclude_countries)
-                    if hide_sent:
-                        profile_taxonomy_sql += f""" AND NOT EXISTS (
-                            SELECT 1 FROM {self.INVITATION_TABLE_NAME} ai
-                            WHERE ai.orcid_id=p.orcid_id AND ai.invitation_type=%s
-                              AND (%s='' OR ai.journal_name=%s)
-                        )"""
-                        profile_params.extend([invitation_type, journal_name, journal_name])
                     if requested_limit > 0:
                         profile_params.append(requested_limit)
                     cur.execute(
                         f"""
                         SELECT
                             'profiles' AS source_table,
-                            COUNT(*) OVER() AS source_total,
                             profile_key,
                             orcid_id,
                             openalex_id,
@@ -1796,31 +1783,20 @@ class PostgresStorage:
                         harvested_taxonomy_sql += " AND discipline = ANY(%s)"
                         harvested_params.append(disciplines)
                     if specialties:
-                        harvested_taxonomy_sql += """ AND (
-                            specialty ILIKE ANY(%s) OR subfield ILIKE ANY(%s)
-                            OR research_areas ILIKE ANY(%s) OR all_topics_json ILIKE ANY(%s)
-                        )"""
-                        harvested_params.extend([specialty_patterns] * 4)
+                        harvested_taxonomy_sql += " AND specialty = ANY(%s)"
+                        harvested_params.append(specialties)
                     if countries:
                         harvested_taxonomy_sql += " AND country = ANY(%s)"
                         harvested_params.append(countries)
                     if exclude_countries:
                         harvested_taxonomy_sql += " AND NOT (country = ANY(%s))"
                         harvested_params.append(exclude_countries)
-                    if hide_sent:
-                        harvested_taxonomy_sql += f""" AND NOT EXISTS (
-                            SELECT 1 FROM {self.INVITATION_TABLE_NAME} ai
-                            WHERE ai.orcid_id=h.orcid_id AND ai.invitation_type=%s
-                              AND (%s='' OR ai.journal_name=%s)
-                        )"""
-                        harvested_params.extend([invitation_type, journal_name, journal_name])
                     if requested_limit > 0:
                         harvested_params.append(remaining)
                     cur.execute(
                         f"""
                         SELECT
                             'harvested' AS source_table,
-                            COUNT(*) OVER() AS source_total,
                             '' AS profile_key,
                             orcid_id,
                             openalex_id,
@@ -1882,9 +1858,6 @@ class PostgresStorage:
         specialties: Optional[List[str]] = None,
         countries: Optional[List[str]] = None,
         exclude_countries: Optional[List[str]] = None,
-        hide_sent: bool = False,
-        invitation_type: str = INVITATION_TYPE_EDITORIAL,
-        journal_name: str = "",
     ) -> Dict[str, Any]:
         """Return one bounded recipient page using an opaque offset cursor."""
         size = max(1, min(int(page_size or 100), 1000))
@@ -1896,9 +1869,8 @@ class PostgresStorage:
         normalized_source = (source or "all").strip().lower()
         sources = [normalized_source] if normalized_source in {"profiles", "harvested"} else ["profiles", "harvested"]
         rows: List[Dict[str, Any]] = []
-        source_totals: Dict[str, int] = {}
         for current_source in sources:
-            source_rows = self.search_database_email_recipients(
+            rows.extend(self.search_database_email_recipients(
                 query=query,
                 source=current_source,
                 limit=needed,
@@ -1908,13 +1880,7 @@ class PostgresStorage:
                 specialties=specialties,
                 countries=countries,
                 exclude_countries=exclude_countries,
-                hide_sent=hide_sent,
-                invitation_type=invitation_type,
-                journal_name=journal_name,
-            )
-            if source_rows:
-                source_totals[current_source] = int(source_rows[0].get("source_total") or len(source_rows))
-            rows.extend(source_rows)
+            ))
         rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
         deduped: List[Dict[str, Any]] = []
         seen: Set[str] = set()
@@ -1925,113 +1891,14 @@ class PostgresStorage:
             seen.add(identity)
             deduped.append(row)
         page_rows = deduped[offset:offset + size]
-        total_count = self.count_database_email_recipients(
-            query=query, source=source, require_email=require_email,
-            hide_suppressed=hide_suppressed, disciplines=disciplines,
-            specialties=specialties, countries=countries,
-            exclude_countries=exclude_countries, hide_sent=hide_sent,
-            invitation_type=invitation_type, journal_name=journal_name,
-        )
-        has_next = offset + size < total_count
-        total_pages = (total_count + size - 1) // size if total_count else 0
-        page_number = (offset // size) + 1 if total_count else 0
+        has_next = len(deduped) > offset + size
         return {
             "rows": page_rows,
             "cursor": str(offset),
             "next_cursor": str(offset + size) if has_next else "",
             "previous_cursor": str(max(0, offset - size)) if offset > 0 else "",
             "has_next": has_next,
-            "has_previous": offset > 0,
-            "total_count": total_count,
-            "page": page_number,
-            "page_size": size,
-            "total_pages": total_pages,
         }
-
-    def count_database_email_recipients(
-        self, query: str = "", source: str = "all", require_email: bool = True,
-        hide_suppressed: bool = True, disciplines: Optional[List[str]] = None,
-        specialties: Optional[List[str]] = None, countries: Optional[List[str]] = None,
-        exclude_countries: Optional[List[str]] = None, hide_sent: bool = False,
-        invitation_type: str = INVITATION_TYPE_EDITORIAL, journal_name: str = "",
-    ) -> int:
-        """Count distinct recipients after applying the same server-side filters as paging."""
-        terms = [term.casefold() for term in re.split(r"\s+", query or "") if term.strip()]
-        disciplines = [v.strip() for v in disciplines or [] if v and v.strip()]
-        patterns = [f"%{v.strip()}%" for v in specialties or [] if v and v.strip()]
-        countries = [v.strip() for v in countries or [] if v and v.strip()]
-        excluded = [v.strip() for v in exclude_countries or [] if v and v.strip() and v.strip() not in countries]
-        normalized_source = source if source in {"all", "profiles", "harvested"} else "all"
-
-        def term_sql(alias: str, columns: List[str], params: list) -> str:
-            clauses = []
-            for term in terms:
-                clauses.append("(" + " OR ".join(f"LOWER(COALESCE({alias}.{col},'')) LIKE %s" for col in columns) + ")")
-                params.extend([f"%{term}%"] * len(columns))
-            return " AND ".join(clauses) or "TRUE"
-
-        selects, params = [], []
-        if normalized_source in {"all", "profiles"}:
-            p: list = [bool(require_email)]
-            conditions = ["(%s=FALSE OR COALESCE(p.email,'')<>'')"]
-            conditions.append(term_sql("p", ["profile_key", "orcid_id", "openalex_id", "author_name", "email", "scientific_domain", "scientific_domains_json"], p))
-            if hide_suppressed:
-                conditions.append(f"NOT EXISTS (SELECT 1 FROM {self.EMAIL_SUPPRESSIONS_TABLE} s WHERE s.is_suppressed AND (s.email_lower=p.email_lower OR (s.orcid_id<>'' AND s.orcid_id=p.orcid_id) OR (s.profile_key<>'' AND s.profile_key=p.profile_key)))")
-            if disciplines: conditions.append("p.scientific_domain=ANY(%s)"); p.append(disciplines)
-            if patterns: conditions.append("(p.scientific_domain ILIKE ANY(%s) OR p.scientific_domains_json ILIKE ANY(%s))"); p.extend([patterns, patterns])
-            if countries: conditions.append(f"EXISTS (SELECT 1 FROM {self.HARVESTED_AUTHORS_TABLE} hc WHERE hc.orcid_id=p.orcid_id AND hc.country=ANY(%s))"); p.append(countries)
-            if excluded: conditions.append(f"NOT EXISTS (SELECT 1 FROM {self.HARVESTED_AUTHORS_TABLE} hc WHERE hc.orcid_id=p.orcid_id AND hc.country=ANY(%s))"); p.append(excluded)
-            if hide_sent:
-                conditions.append(f"NOT EXISTS (SELECT 1 FROM {self.INVITATION_TABLE_NAME} ai WHERE ai.orcid_id=p.orcid_id AND ai.invitation_type=%s AND (%s='' OR ai.journal_name=%s))")
-                p.extend([invitation_type, journal_name, journal_name])
-            selects.append(f"SELECT COALESCE(NULLIF(p.orcid_id,''),'email:'||LOWER(p.email)) identity FROM {self.PROFILE_TABLE_NAME} p WHERE " + " AND ".join(conditions)); params.extend(p)
-        if normalized_source in {"all", "harvested"}:
-            p = [bool(require_email)]
-            conditions = ["(%s=FALSE OR COALESCE(h.email,'')<>'')"]
-            conditions.append(term_sql("h", ["openalex_id", "orcid_id", "author_name", "email", "all_emails", "institution", "country", "discipline", "specialty", "subfield", "research_areas", "all_topics_json"], p))
-            if hide_suppressed:
-                conditions.append(f"NOT EXISTS (SELECT 1 FROM {self.EMAIL_SUPPRESSIONS_TABLE} s WHERE s.is_suppressed AND (s.email_lower=LOWER(h.email) OR (s.orcid_id<>'' AND s.orcid_id=h.orcid_id)))")
-            if disciplines: conditions.append("h.discipline=ANY(%s)"); p.append(disciplines)
-            if patterns: conditions.append("(h.specialty ILIKE ANY(%s) OR h.subfield ILIKE ANY(%s) OR h.research_areas ILIKE ANY(%s) OR h.all_topics_json ILIKE ANY(%s))"); p.extend([patterns] * 4)
-            if countries: conditions.append("h.country=ANY(%s)"); p.append(countries)
-            if excluded: conditions.append("NOT (h.country=ANY(%s))"); p.append(excluded)
-            if hide_sent:
-                conditions.append(f"NOT EXISTS (SELECT 1 FROM {self.INVITATION_TABLE_NAME} ai WHERE ai.orcid_id=h.orcid_id AND ai.invitation_type=%s AND (%s='' OR ai.journal_name=%s))")
-                p.extend([invitation_type, journal_name, journal_name])
-            selects.append(f"SELECT COALESCE(NULLIF(h.orcid_id,''),'email:'||LOWER(h.email)) identity FROM {self.HARVESTED_AUTHORS_TABLE} h WHERE " + " AND ".join(conditions)); params.extend(p)
-        try:
-            with self._get_cursor() as cur:
-                cur.execute("SELECT COUNT(*) AS cnt FROM (" + " UNION ".join(selects) + ") recipients", params)
-                return int((cur.fetchone() or {}).get("cnt") or 0)
-        except Exception as e:
-            print(f"PostgreSQL recipient count error: {e}")
-            return 0
-
-    def get_database_specialty_facets(self, source: str = "all", limit: int = 2000) -> List[str]:
-        """Return database-wide specialty/topic labels for filter controls."""
-        if not self.available:
-            return []
-        normalized = source if source in {"all", "profiles", "harvested"} else "all"
-        selects = []
-        if normalized in {"all", "harvested"}:
-            selects.extend([
-                f"SELECT specialty AS label FROM {self.HARVESTED_AUTHORS_TABLE} WHERE COALESCE(specialty,'')<>''",
-                f"SELECT subfield AS label FROM {self.HARVESTED_AUTHORS_TABLE} WHERE COALESCE(subfield,'')<>''",
-                f"SELECT jsonb_array_elements_text(CASE WHEN all_topics_json ~ '^\\s*\\[' THEN all_topics_json::jsonb ELSE '[]'::jsonb END) AS label FROM {self.HARVESTED_AUTHORS_TABLE}",
-            ])
-        if normalized in {"all", "profiles"}:
-            selects.append(f"SELECT jsonb_array_elements_text(CASE WHEN scientific_domains_json ~ '^\\s*\\[' THEN scientific_domains_json::jsonb ELSE '[]'::jsonb END) AS label FROM {self.PROFILE_TABLE_NAME}")
-        try:
-            with self._get_cursor() as cur:
-                cur.execute(
-                    "SELECT DISTINCT TRIM(label) AS label FROM (" + " UNION ALL ".join(selects) +
-                    ") facets WHERE COALESCE(TRIM(label),'')<>'' ORDER BY label LIMIT %s",
-                    (max(1, min(int(limit), 5000)),),
-                )
-                return [row["label"] for row in cur.fetchall()]
-        except Exception as e:
-            print(f"PostgreSQL specialty facets error: {e}")
-            return []
 
     def get_invitation_counts(self, orcid_ids: List[str]) -> Dict[str, int]:
         """Get invitation counts for a list of ORCID IDs."""

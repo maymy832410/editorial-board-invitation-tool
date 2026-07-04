@@ -15,14 +15,6 @@ class FakeStorage:
         self.calls.append({"source": source, "limit": limit, **kwargs})
         return list(self.rows_by_source.get(source, []))[:limit]
 
-    def count_database_email_recipients(self, source="all", **kwargs):
-        sources = [source] if source in {"profiles", "harvested"} else ["profiles", "harvested"]
-        identities = set()
-        for current_source in sources:
-            for row in self.rows_by_source.get(current_source, []):
-                identities.add(row.get("orcid_id") or f"email:{row.get('email', '').lower()}")
-        return len(identities)
-
 
 class DatabaseEmailPaginationTests(unittest.TestCase):
     def test_combined_sources_are_sorted_deduped_and_paged(self):
@@ -42,9 +34,6 @@ class DatabaseEmailPaginationTests(unittest.TestCase):
 
         self.assertEqual([row["orcid_id"] for row in first["rows"]], ["1", "3"])
         self.assertTrue(first["has_next"])
-        self.assertEqual(first["page"], 1)
-        self.assertEqual(first["page_size"], 2)
-        self.assertGreaterEqual(first["total_count"], 3)
         self.assertEqual([row["orcid_id"] for row in second["rows"]], ["2"])
         self.assertEqual(second["previous_cursor"], "0")
 
