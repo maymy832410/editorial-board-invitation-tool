@@ -247,6 +247,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
+        include_country_codes: Optional[list[str]] = None,
         exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True
@@ -260,9 +261,14 @@ class OpenAlexClient:
         if h_index_max is not None:
             filters.append(f"summary_stats.h_index:<{h_index_max + 1}")
         
-        if exclude_country_codes:
+        included = sorted({str(code).strip().upper() for code in include_country_codes or [] if str(code).strip()})
+        excluded = sorted({str(code).strip().upper() for code in exclude_country_codes or [] if str(code).strip()} - set(included))
+        if included:
+            filters.append(f"last_known_institutions.country_code:{'|'.join(included)}")
+
+        if excluded:
             # Negate each country code with ! and join with pipe (OR negation)
-            negated = "|".join(f"!{code}" for code in exclude_country_codes)
+            negated = "|".join(f"!{code}" for code in excluded)
             filters.append(f"last_known_institutions.country_code:{negated}")
         
         if topic_ids:
@@ -279,6 +285,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
+        include_country_codes: Optional[list[str]] = None,
         exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True,
@@ -302,6 +309,7 @@ class OpenAlexClient:
         filter_str = self.build_filter(
             h_index_min=h_index_min,
             h_index_max=h_index_max,
+            include_country_codes=include_country_codes,
             exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=require_orcid
@@ -341,6 +349,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
+        include_country_codes: Optional[list[str]] = None,
         exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True,
@@ -352,22 +361,29 @@ class OpenAlexClient:
         filter_str = self.build_filter(
             h_index_min=h_index_min,
             h_index_max=h_index_max,
+            include_country_codes=include_country_codes,
             exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=require_orcid,
         )
 
-        params = {
-            "filter": filter_str,
-            "select": "id,display_name,orcid,summary_stats,last_known_institutions,works_count,cited_by_count,topics",
-            "per_page": min(max(batch_size, 1), 200),
-            "cursor": cursor or "*",
-        }
-
-        data = self._make_request("authors", params)
-        results = data.get("results", [])
+        requested = min(max(int(batch_size), 1), 250)
+        results: list[dict] = []
+        next_cursor = cursor or "*"
+        while next_cursor and len(results) < requested:
+            params = {
+                "filter": filter_str,
+                "select": "id,display_name,orcid,summary_stats,last_known_institutions,works_count,cited_by_count,topics",
+                "per_page": min(200, requested - len(results)),
+                "cursor": next_cursor,
+            }
+            data = self._make_request("authors", params)
+            page_results = data.get("results", [])
+            results.extend(page_results)
+            next_cursor = data.get("meta", {}).get("next_cursor")
+            if not page_results:
+                break
         parsed_results = [self._parse_author(author) for author in results]
-        next_cursor = data.get("meta", {}).get("next_cursor")
         start_index = batch_index * batch_size
         end_index = start_index + len(parsed_results)
 
@@ -525,6 +541,7 @@ class OpenAlexClient:
         self,
         h_index_min: Optional[int] = None,
         h_index_max: Optional[int] = None,
+        include_country_codes: Optional[list[str]] = None,
         exclude_country_codes: Optional[list[str]] = None,
         topic_ids: Optional[list[str]] = None,
         require_orcid: bool = True
@@ -533,6 +550,7 @@ class OpenAlexClient:
         filter_str = self.build_filter(
             h_index_min=h_index_min,
             h_index_max=h_index_max,
+            include_country_codes=include_country_codes,
             exclude_country_codes=exclude_country_codes,
             topic_ids=topic_ids,
             require_orcid=require_orcid
