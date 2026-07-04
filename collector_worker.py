@@ -365,8 +365,7 @@ class CollectorWorker:
             time.sleep(COLLECT_IDLE_POLL_SEC)
             return
 
-        # Keep deploy failover short; every tick renews this singleton lease.
-        if not self.storage.acquire_worker_lease(self.worker_owner, lease_seconds=120):
+        if not self.storage.acquire_worker_lease(self.worker_owner, lease_seconds=900):
             time.sleep(COLLECT_IDLE_POLL_SEC)
             return
 
