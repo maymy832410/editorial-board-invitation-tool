@@ -510,7 +510,7 @@ def _cached_database_email_page(snapshot_json: str, cursor: str = "") -> dict:
     page = db_storage.search_database_email_recipients_page(
         query=snapshot.get("query", ""),
         source=snapshot.get("source", "all"),
-        page_size=100,
+        page_size=25,
         cursor=cursor,
         require_email=bool(snapshot.get("require_email", True)),
         hide_suppressed=bool(snapshot.get("hide_suppressed", True)),
@@ -518,11 +518,19 @@ def _cached_database_email_page(snapshot_json: str, cursor: str = "") -> dict:
         specialties=snapshot.get("specialties") or [],
         countries=snapshot.get("countries") or [],
         exclude_countries=snapshot.get("exclude_countries") or [],
+        hide_sent=bool(snapshot.get("hide_sent")),
+        invitation_type=snapshot.get("invitation_type") or INVITATION_TYPE_EDITORIAL,
+        journal_name=snapshot.get("journal_name") or "",
     )
     return {
         **page,
         "rows": [_map_database_email_row_to_author(row) for row in page.get("rows", [])],
     }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_database_specialty_facets(source: str) -> list[str]:
+    return db_storage.get_database_specialty_facets(source=source)
 
 
 def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict]) -> list[dict]:
@@ -2141,26 +2149,28 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
     with st.form(_scope_key(ui_scope, "database_email_search_form")):
         db_search_cols = st.columns([2.2, 1.1, 1, 1])
         with db_search_cols[0]:
-            db_search_query = st.text_input("Search database emails", placeholder="Name, email, affiliation, ORCID...").strip()
+            db_search_query = st.text_input("Search database emails", placeholder="Name, email, affiliation, ORCID...", key=_scope_key(ui_scope, "db_query")).strip()
         with db_search_cols[1]:
-            db_search_source = st.selectbox("Database source", options=["all", "profiles", "harvested"], format_func=_database_email_source_label)
+            db_search_source = st.selectbox("Database source", options=["all", "profiles", "harvested"], format_func=_database_email_source_label, key=_scope_key(ui_scope, "db_source"))
         with db_search_cols[2]:
-            db_require_email = st.checkbox("With email", value=True)
-            db_hide_suppressed = st.checkbox("Hide suppressed", value=True)
+            db_require_email = st.checkbox("With email", value=True, key=_scope_key(ui_scope, "db_require_email"))
+            db_hide_suppressed = st.checkbox("Hide suppressed", value=True, key=_scope_key(ui_scope, "db_hide_suppressed"))
         with db_search_cols[3]:
-            db_hide_sent = st.checkbox("Hide sent", value=True)
+            db_hide_sent = st.checkbox("Hide sent", value=True, key=_scope_key(ui_scope, "db_hide_sent"))
         taxonomy_cols = st.columns(3)
-        specialty_text = taxonomy_cols[0].text_input("Specialties", placeholder="Comma-separated, optional")
+        specialty_text = taxonomy_cols[0].text_input("Specialties", placeholder="Comma-separated, optional", key=_scope_key(ui_scope, "db_specialties"))
         db_countries = taxonomy_cols[1].multiselect(
             "Include Countries",
             options=list(COUNTRIES.keys()),
             default=list(filters.get("include_countries") or []),
             help="Match any selected country; leave empty for all countries.",
+            key=_scope_key(ui_scope, "db_include_countries"),
         )
         db_exclude_countries = taxonomy_cols[2].multiselect(
             "Exclude Countries",
             options=list(COUNTRIES.keys()),
             default=list(filters.get("exclude_countries") or []),
+            key=_scope_key(ui_scope, "db_exclude_countries"),
         )
         search_submitted = st.form_submit_button("Search / Load", type="primary", use_container_width=True)
 
@@ -2171,7 +2181,10 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
             "require_email": db_require_email,
             "hide_suppressed": db_hide_suppressed,
             "hide_sent": db_hide_sent,
+            "invitation_type": invitation_type,
+            "journal_name": tracking_journal_name,
             "disciplines": list(filters.get("disciplines") or []),
+            "form_specialties": [value.strip() for value in specialty_text.split(",") if value.strip()],
             "specialties": [value.strip() for value in specialty_text.split(",") if value.strip()],
             "countries": [COUNTRIES[value] for value in db_countries],
             "exclude_countries": [
@@ -2183,6 +2196,17 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
 
     snapshot = search_state.get("snapshot") or {}
     page = search_state.get("page") or {}
+    if snapshot:
+        live_specialties = list(st.session_state.get(_scope_key(ui_scope, "specialty_filter_multi"), []) or [])
+        live_text = (st.session_state.get(_scope_key(ui_scope, "specialty_filter_search"), "") or "").strip()
+        if live_text:
+            live_specialties.append(live_text)
+        effective_specialties = list(dict.fromkeys((snapshot.get("form_specialties") or []) + live_specialties))
+        if effective_specialties != (snapshot.get("specialties") or []):
+            snapshot = {**snapshot, "specialties": effective_specialties}
+            search_state = {"snapshot": snapshot, "page": _search_database_email_page(snapshot)}
+            st.session_state[state_key] = search_state
+            page = search_state["page"]
     nav_cols = st.columns(4)
     if nav_cols[0].button("← Previous", disabled=not page.get("previous_cursor"), key=_scope_key(ui_scope, "db_previous")):
         search_state["page"] = _search_database_email_page(snapshot, page.get("previous_cursor", ""))
@@ -2192,27 +2216,28 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
         st.rerun()
     if nav_cols[2].button("Refresh", disabled=not bool(snapshot), key=_scope_key(ui_scope, "db_refresh")):
         _cached_database_email_page.clear()
+        _cached_database_specialty_facets.clear()
         search_state["page"] = _search_database_email_page(snapshot, page.get("cursor", ""))
         st.rerun()
     if nav_cols[3].button("Clear Search", disabled=not bool(snapshot), key=_scope_key(ui_scope, "db_clear")):
         st.session_state[state_key] = {"snapshot": None, "page": None}
+        st.session_state[_scope_key(ui_scope, "specialty_filter_multi")] = []
+        st.session_state[_scope_key(ui_scope, "specialty_filter_search")] = ""
         st.rerun()
 
     db_source_results = list(page.get("rows") or [])
-    if snapshot.get("hide_sent"):
-        sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
-        db_source_results = [
-            row for row in db_source_results
-            if _recipient_tracking_id(row) not in sent_invitations
-        ]
 
     db_search_active = bool(snapshot)
     timing = f" Last query: {int(page.get('elapsed_ms'))} ms." if page.get("elapsed_ms") is not None else ""
-    st.caption(f"Database results load only after Search / Load and are paged 100 rows at a time.{timing}")
+    st.caption(
+        f"Database matches: {int(page.get('total_count') or 0):,} | "
+        f"Page {int(page.get('page') or 0):,} of {int(page.get('total_pages') or 0):,}.{timing}"
+    )
 
     panel_state.update({
         'results': db_source_results,
-        'total': len(db_source_results),
+        'total': int(page.get('total_count') or len(db_source_results)),
+        'server_paginated': True,
         'active': db_search_active,
         'query': snapshot.get("query", ""),
         'snapshot': snapshot,
@@ -2981,6 +3006,8 @@ def display_results(filters, ui_scope: str):
         elif r.get('specialty'):
             all_specialties.add(r['specialty'])
         all_author_domains.update(_extract_author_domains(r))
+    if db_search_active:
+        all_specialties.update(_cached_database_specialty_facets((db_panel.get('snapshot') or {}).get('source', 'all')))
     
     # Filter options - Row 1: Discipline and Specialty filters
     col_f1, col_f2 = st.columns(2)
@@ -3070,13 +3097,16 @@ def display_results(filters, ui_scope: str):
     if selected_disciplines:
         filtered = [r for r in filtered if r.get('discipline') in selected_disciplines]
     
-    # Apply specialty filter
+    # Apply specialty filter. Typing also filters immediately; selections use OR.
+    effective_specialties = list(selected_specialties)
+    if specialty_search_text:
+        effective_specialties.append(specialty_search_text)
     matched_before_other_filters = len(filtered)
-    if selected_specialties:
-        filtered = [r for r in filtered if author_matches_any_specialty(r, selected_specialties)]
+    if effective_specialties:
+        filtered = [r for r in filtered if author_matches_any_specialty(r, effective_specialties)]
         matched_before_other_filters = len(filtered)
     st.caption(
-        f"Selected specialties: {len(selected_specialties):,} | "
+        f"Active specialty terms: {len(effective_specialties):,} | "
         f"Matched before other filters: {matched_before_other_filters:,}"
     )
     
@@ -3511,7 +3541,7 @@ def display_results(filters, ui_scope: str):
                 **database_snapshot,
                 "post_text": active_search_query,
                 "post_disciplines": list(selected_disciplines),
-                "post_specialties": list(selected_specialties),
+                "post_specialties": list(effective_specialties),
                 "excluded_countries": list(excluded_codes),
             }
             with st.spinner("Resolving up to 1,000 eligible recipients..."):

@@ -9,15 +9,18 @@ def _clean_label(value: object) -> str:
 
 
 def author_matches_any_specialty(author: dict, selected_specialties: Iterable[str]) -> bool:
-    """Return whether an author matches any selected specialty label."""
-    selected = {_clean_label(value) for value in selected_specialties if _clean_label(value)}
+    """Case-insensitive partial match across every specialty-bearing field."""
+    selected = {_clean_label(value).casefold() for value in selected_specialties if _clean_label(value)}
     if not selected:
         return True
 
-    author_labels = {_clean_label(author.get("specialty"))}
-    author_labels.update(_clean_label(topic) for topic in (author.get("all_topics") or []))
+    author_labels = {
+        _clean_label(author.get(field)).casefold()
+        for field in ("specialty", "subfield", "research_areas", "scientific_domain")
+    }
+    author_labels.update(_clean_label(topic).casefold() for topic in (author.get("all_topics") or []))
     author_labels.discard("")
-    return bool(author_labels.intersection(selected))
+    return any(term in label for term in selected for label in author_labels)
 
 
 def _dedupe_key(author: dict) -> str:
