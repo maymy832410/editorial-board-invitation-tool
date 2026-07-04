@@ -2703,6 +2703,7 @@ def _load_database_bulk_candidates(snapshot: dict, invitation_type: str, journal
             disciplines=page_snapshot.get("disciplines") or [],
             specialties=page_snapshot.get("specialties") or [],
             countries=page_snapshot.get("countries") or [],
+            exclude_countries=page_snapshot.get("exclude_countries") or [],
         )
         rows.extend(_map_database_email_row_to_author(row) for row in page.get("rows", []))
         if not page.get("has_next"):
@@ -2852,7 +2853,8 @@ def display_results(filters, ui_scope: str):
         openalex_count = len(openalex_results)
         st.caption(
             f"Source counts: OpenAlex={openalex_count:,}, "
-            f"DatabaseLoaded={db_count:,}, Displayed={len(results):,}."
+            f"DatabaseMatches={db_source_total:,}, DatabaseLoaded={db_count:,}, "
+            f"Displayed={len(results):,}."
         )
 
         missing_domain_rows = [
