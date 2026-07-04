@@ -47,15 +47,6 @@ BULK_RECIPIENT_STATUS_SENDING = "sending"
 BULK_RECIPIENT_STATUS_SENT = "sent"
 BULK_RECIPIENT_STATUS_FAILED = "failed"
 BULK_RECIPIENT_STATUS_SKIPPED = "skipped"
-LOOKUP_JOB_STATUS_QUEUED = "queued"
-LOOKUP_JOB_STATUS_RUNNING = "running"
-LOOKUP_JOB_STATUS_COMPLETED = "completed"
-LOOKUP_JOB_STATUS_CANCELLED = "cancelled"
-LOOKUP_RECIPIENT_STATUS_PENDING = "pending"
-LOOKUP_RECIPIENT_STATUS_RUNNING = "running"
-LOOKUP_RECIPIENT_STATUS_FOUND = "found"
-LOOKUP_RECIPIENT_STATUS_NOT_FOUND = "not_found"
-LOOKUP_RECIPIENT_STATUS_FAILED = "failed"
 EMAIL_SUPPRESSION_SOURCE_UNSUBSCRIBE = "unsubscribe_link"
 
 
@@ -221,8 +212,6 @@ class PostgresStorage:
     BULK_EMAIL_RECIPIENTS_TABLE = "bulk_email_recipients"
     JOURNAL_PRESETS_TABLE = "journal_presets"
     EMAIL_SUPPRESSIONS_TABLE = "email_suppressions"
-    EMAIL_LOOKUP_JOBS_TABLE = "email_lookup_jobs"
-    EMAIL_LOOKUP_RECIPIENTS_TABLE = "email_lookup_recipients"
 
     def __init__(self):
         self.available = False
@@ -394,30 +383,7 @@ class PostgresStorage:
             """)
             self._ensure_collection_tables(cur)
             self._ensure_bulk_email_tables(cur)
-            self._ensure_email_lookup_tables(cur)
             self._ensure_journal_preset_tables(cur)
-
-    def _ensure_email_lookup_tables(self, cur):
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self.EMAIL_LOOKUP_JOBS_TABLE} (
-                id BIGSERIAL PRIMARY KEY, status TEXT NOT NULL DEFAULT 'queued',
-                use_tavily BOOLEAN DEFAULT FALSE, use_openai_web BOOLEAN DEFAULT FALSE,
-                total_count INTEGER DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW(), completed_at TIMESTAMPTZ,
-                error_message TEXT DEFAULT ''
-            );
-        """)
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} (
-                id BIGSERIAL PRIMARY KEY, job_id BIGINT NOT NULL REFERENCES {self.EMAIL_LOOKUP_JOBS_TABLE}(id) ON DELETE CASCADE,
-                orcid_id TEXT NOT NULL, openalex_id TEXT DEFAULT '', author_name TEXT DEFAULT '',
-                institution TEXT DEFAULT '', country TEXT DEFAULT '', discipline TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'pending', email TEXT DEFAULT '', email_source TEXT DEFAULT '',
-                attempts INTEGER DEFAULT 0, error_message TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(job_id, orcid_id)
-            );
-        """)
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_lookup_recipients_claim ON {self.EMAIL_LOOKUP_RECIPIENTS_TABLE}(status, id);")
 
     def _ensure_journal_preset_tables(self, cur):
         """Create tables for saved journal invitation presets."""
@@ -693,10 +659,6 @@ class PostgresStorage:
             ON {self.HARVESTED_AUTHORS_TABLE} (next_retry_at);
         """)
         cur.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_harvested_status_updated
-            ON {self.HARVESTED_AUTHORS_TABLE} (email_status, updated_at DESC);
-        """)
-        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.COLLECTION_DAILY_STATS_TABLE} (
                 day             DATE PRIMARY KEY,
                 emails_found    INTEGER DEFAULT 0,
@@ -879,34 +841,6 @@ class PostgresStorage:
             CREATE INDEX IF NOT EXISTS idx_bulk_recipients_job_status
             ON {self.BULK_EMAIL_RECIPIENTS_TABLE} (job_id, status, id);
         """)
-        cur.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_bulk_recipients_status_email
-            ON {self.BULK_EMAIL_RECIPIENTS_TABLE} (status, LOWER(email));
-        """)
-        cur.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_bulk_recipients_status_orcid
-            ON {self.BULK_EMAIL_RECIPIENTS_TABLE} (status, orcid_id);
-        """)
-        cur.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_author_profiles_updated
-            ON {self.PROFILE_TABLE_NAME} (updated_at DESC);
-        """)
-        try:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_profiles_name_trgm
-                ON {self.PROFILE_TABLE_NAME} USING GIN (LOWER(author_name) gin_trgm_ops);
-            """)
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_harvested_name_trgm
-                ON {self.HARVESTED_AUTHORS_TABLE} USING GIN (LOWER(author_name) gin_trgm_ops);
-            """)
-            cur.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_harvested_specialty_trgm
-                ON {self.HARVESTED_AUTHORS_TABLE} USING GIN (LOWER(specialty) gin_trgm_ops);
-            """)
-        except Exception as exc:
-            print(f"PostgreSQL trigram indexes unavailable: {exc}")
         cur.execute(f"""
             ALTER TABLE {self.BULK_EMAIL_JOBS_TABLE}
             ADD COLUMN IF NOT EXISTS last_provider_response TEXT DEFAULT '';
@@ -1633,10 +1567,6 @@ class PostgresStorage:
         limit: int = 0,
         require_email: bool = True,
         hide_suppressed: bool = True,
-        disciplines: Optional[List[str]] = None,
-        specialties: Optional[List[str]] = None,
-        countries: Optional[List[str]] = None,
-        exclude_countries: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Search email-bearing recipient records across profile and harvested tables."""
         if not self.available:
@@ -1647,10 +1577,6 @@ class PostgresStorage:
         normalized_source = (source or "all").strip().lower()
         if normalized_source not in {"all", "profiles", "harvested"}:
             normalized_source = "all"
-        disciplines = [value.strip() for value in (disciplines or []) if value and value.strip()]
-        specialties = [value.strip() for value in (specialties or []) if value and value.strip()]
-        countries = [value.strip() for value in (countries or []) if value and value.strip()]
-        exclude_countries = [value.strip() for value in (exclude_countries or []) if value and value.strip() and value.strip() not in countries]
 
         terms = [term.strip().lower() for term in re.split(r"\s+", query or "") if term.strip()]
         like_terms = [f"%{term}%" for term in terms]
@@ -1686,24 +1612,6 @@ class PostgresStorage:
                         "source",
                     ]
                     profile_params = [bool(require_email), *_term_params(profile_columns), bool(hide_suppressed)]
-                    profile_taxonomy_sql = ""
-                    if disciplines:
-                        profile_taxonomy_sql += " AND scientific_domain = ANY(%s)"
-                        profile_params.append(disciplines)
-                    if specialties:
-                        profile_taxonomy_sql += " AND FALSE"
-                    if countries:
-                        profile_taxonomy_sql += f""" AND EXISTS (
-                            SELECT 1 FROM {self.HARVESTED_AUTHORS_TABLE} hc
-                            WHERE hc.orcid_id = p.orcid_id AND hc.country = ANY(%s)
-                        )"""
-                        profile_params.append(countries)
-                    if exclude_countries:
-                        profile_taxonomy_sql += f""" AND NOT EXISTS (
-                            SELECT 1 FROM {self.HARVESTED_AUTHORS_TABLE} hc
-                            WHERE hc.orcid_id = p.orcid_id AND hc.country = ANY(%s)
-                        )"""
-                        profile_params.append(exclude_countries)
                     if requested_limit > 0:
                         profile_params.append(requested_limit)
                     cur.execute(
@@ -1717,11 +1625,7 @@ class PostgresStorage:
                             email,
                             '' AS all_emails,
                             '' AS institution,
-                            COALESCE((
-                                SELECT hc.country FROM {self.HARVESTED_AUTHORS_TABLE} hc
-                                WHERE hc.orcid_id = p.orcid_id AND COALESCE(hc.country, '') <> ''
-                                ORDER BY hc.updated_at DESC LIMIT 1
-                            ), '') AS country,
+                            '' AS country,
                             scientific_domain AS discipline,
                             '' AS specialty,
                             '' AS subfield,
@@ -1752,7 +1656,6 @@ class PostgresStorage:
                                     )
                               )
                           )
-                          {profile_taxonomy_sql}
                         ORDER BY updated_at DESC
                         {limit_clause};
                         """,
@@ -1778,19 +1681,6 @@ class PostgresStorage:
                     ]
                     harvested_limit_clause = " LIMIT %s" if requested_limit > 0 else ""
                     harvested_params = [bool(require_email), *_term_params(harvested_columns), bool(hide_suppressed)]
-                    harvested_taxonomy_sql = ""
-                    if disciplines:
-                        harvested_taxonomy_sql += " AND discipline = ANY(%s)"
-                        harvested_params.append(disciplines)
-                    if specialties:
-                        harvested_taxonomy_sql += " AND specialty = ANY(%s)"
-                        harvested_params.append(specialties)
-                    if countries:
-                        harvested_taxonomy_sql += " AND country = ANY(%s)"
-                        harvested_params.append(countries)
-                    if exclude_countries:
-                        harvested_taxonomy_sql += " AND NOT (country = ANY(%s))"
-                        harvested_params.append(exclude_countries)
                     if requested_limit > 0:
                         harvested_params.append(remaining)
                     cur.execute(
@@ -1834,7 +1724,6 @@ class PostgresStorage:
                                     )
                               )
                           )
-                          {harvested_taxonomy_sql}
                         ORDER BY updated_at DESC
                         {harvested_limit_clause};
                         """,
@@ -1845,60 +1734,6 @@ class PostgresStorage:
         except Exception as e:
             print(f"PostgreSQL search database email recipients error: {e}")
             return []
-
-    def search_database_email_recipients_page(
-        self,
-        query: str = "",
-        source: str = "all",
-        page_size: int = 100,
-        cursor: str = "",
-        require_email: bool = True,
-        hide_suppressed: bool = True,
-        disciplines: Optional[List[str]] = None,
-        specialties: Optional[List[str]] = None,
-        countries: Optional[List[str]] = None,
-        exclude_countries: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """Return one bounded recipient page using an opaque offset cursor."""
-        size = max(1, min(int(page_size or 100), 1000))
-        try:
-            offset = max(0, int(cursor or 0))
-        except (TypeError, ValueError):
-            offset = 0
-        needed = offset + size + 1
-        normalized_source = (source or "all").strip().lower()
-        sources = [normalized_source] if normalized_source in {"profiles", "harvested"} else ["profiles", "harvested"]
-        rows: List[Dict[str, Any]] = []
-        for current_source in sources:
-            rows.extend(self.search_database_email_recipients(
-                query=query,
-                source=current_source,
-                limit=needed,
-                require_email=require_email,
-                hide_suppressed=hide_suppressed,
-                disciplines=disciplines,
-                specialties=specialties,
-                countries=countries,
-                exclude_countries=exclude_countries,
-            ))
-        rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
-        deduped: List[Dict[str, Any]] = []
-        seen: Set[str] = set()
-        for row in rows:
-            identity = _normalize_orcid(row.get("orcid_id")) or f"email:{_normalize_email(row.get('email'))}"
-            if identity in seen:
-                continue
-            seen.add(identity)
-            deduped.append(row)
-        page_rows = deduped[offset:offset + size]
-        has_next = len(deduped) > offset + size
-        return {
-            "rows": page_rows,
-            "cursor": str(offset),
-            "next_cursor": str(offset + size) if has_next else "",
-            "previous_cursor": str(max(0, offset - size)) if offset > 0 else "",
-            "has_next": has_next,
-        }
 
     def get_invitation_counts(self, orcid_ids: List[str]) -> Dict[str, int]:
         """Get invitation counts for a list of ORCID IDs."""
@@ -3997,91 +3832,6 @@ class PostgresStorage:
         except Exception as e:
             print(f"PostgreSQL get_collection_summary error: {e}")
             return summary
-
-    def enqueue_email_lookup(self, authors: List[Dict[str, Any]], use_tavily: bool = False, use_openai_web: bool = False) -> int:
-        recipients = { _normalize_orcid(a.get("orcid_id")): a for a in authors if _normalize_orcid(a.get("orcid_id")) and not _normalize_email(a.get("email")) }
-        if not self.available or not recipients:
-            return 0
-        with self._get_cursor() as cur:
-            cur.execute(f"INSERT INTO {self.EMAIL_LOOKUP_JOBS_TABLE}(use_tavily,use_openai_web,total_count) VALUES (%s,%s,%s) RETURNING id", (use_tavily, use_openai_web, len(recipients)))
-            job_id = int(cur.fetchone()["id"])
-            psycopg2.extras.execute_values(cur, f"""INSERT INTO {self.EMAIL_LOOKUP_RECIPIENTS_TABLE}
-                (job_id,orcid_id,openalex_id,author_name,institution,country,discipline) VALUES %s ON CONFLICT DO NOTHING""", [(
-                job_id, oid, a.get("author_id") or a.get("openalex_id") or "", a.get("name") or "",
-                a.get("institution") or "", a.get("country") or "", a.get("discipline") or ""
-            ) for oid, a in recipients.items()])
-            return job_id
-
-    def claim_email_lookup_batch(self, limit: int = 20) -> List[Dict[str, Any]]:
-        if not self.available:
-            return []
-        with self._get_cursor() as cur:
-            cur.execute(f"""WITH picked AS (
-                SELECT r.id FROM {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} r
-                JOIN {self.EMAIL_LOOKUP_JOBS_TABLE} j ON j.id=r.job_id
-                WHERE r.status=%s AND j.status IN (%s,%s)
-                  AND r.job_id = (SELECT MIN(r2.job_id) FROM {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} r2
-                    JOIN {self.EMAIL_LOOKUP_JOBS_TABLE} j2 ON j2.id=r2.job_id
-                    WHERE r2.status='pending' AND j2.status IN ('queued','running'))
-                ORDER BY r.id
-                FOR UPDATE SKIP LOCKED LIMIT %s
-            ) UPDATE {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} r SET status=%s, attempts=attempts+1, updated_at=NOW()
-              FROM picked WHERE r.id=picked.id RETURNING r.*""", (
-                LOOKUP_RECIPIENT_STATUS_PENDING, LOOKUP_JOB_STATUS_QUEUED, LOOKUP_JOB_STATUS_RUNNING,
-                max(1, min(int(limit), 100)), LOOKUP_RECIPIENT_STATUS_RUNNING))
-            rows = [dict(row) for row in cur.fetchall()]
-            if rows:
-                job_ids = sorted({row["job_id"] for row in rows})
-                cur.execute(f"UPDATE {self.EMAIL_LOOKUP_JOBS_TABLE} SET status=%s,updated_at=NOW() WHERE id=ANY(%s)", (LOOKUP_JOB_STATUS_RUNNING, job_ids))
-                cur.execute(f"SELECT id,use_tavily,use_openai_web FROM {self.EMAIL_LOOKUP_JOBS_TABLE} WHERE id=ANY(%s)", (job_ids,))
-                options = {row["id"]: {
-                    "use_tavily": row["use_tavily"], "use_openai_web": row["use_openai_web"]
-                } for row in cur.fetchall()}
-                for row in rows:
-                    row.update(options.get(row["job_id"], {}))
-            return rows
-
-    def finish_email_lookup_recipient(self, recipient_id: int, email: str = "", source: str = "", error: str = "") -> None:
-        with self._get_cursor() as cur:
-            cur.execute(f"SELECT attempts FROM {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} WHERE id=%s", (recipient_id,))
-            current = cur.fetchone() or {}
-            retry = bool(error) and int(current.get("attempts") or 0) < 2
-            status = LOOKUP_RECIPIENT_STATUS_PENDING if retry else (
-                LOOKUP_RECIPIENT_STATUS_FOUND if _normalize_email(email) else
-                (LOOKUP_RECIPIENT_STATUS_FAILED if error else LOOKUP_RECIPIENT_STATUS_NOT_FOUND)
-            )
-            cur.execute(f"UPDATE {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} SET status=%s,email=%s,email_source=%s,error_message=%s,updated_at=NOW() WHERE id=%s RETURNING job_id", (status, _normalize_email(email), source, error[:1000], recipient_id))
-            row = cur.fetchone()
-            if not row: return
-            job_id = row["job_id"]
-            cur.execute(f"""UPDATE {self.EMAIL_LOOKUP_JOBS_TABLE} j SET status=CASE WHEN j.status=%s THEN %s WHEN NOT EXISTS(
-                SELECT 1 FROM {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} r WHERE r.job_id=j.id AND r.status IN (%s,%s)
-              ) THEN %s ELSE j.status END, completed_at=CASE WHEN NOT EXISTS(
-                SELECT 1 FROM {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} r WHERE r.job_id=j.id AND r.status IN (%s,%s)
-              ) THEN NOW() ELSE completed_at END, updated_at=NOW() WHERE id=%s""", (
-                LOOKUP_JOB_STATUS_CANCELLED, LOOKUP_JOB_STATUS_CANCELLED,
-                LOOKUP_RECIPIENT_STATUS_PENDING, LOOKUP_RECIPIENT_STATUS_RUNNING, LOOKUP_JOB_STATUS_COMPLETED,
-                LOOKUP_RECIPIENT_STATUS_PENDING, LOOKUP_RECIPIENT_STATUS_RUNNING, job_id))
-
-    def get_email_lookup_job(self, job_id: int) -> Dict[str, Any]:
-        if not self.available or not job_id: return {}
-        with self._get_cursor() as cur:
-            cur.execute(f"""SELECT j.*, COUNT(*) FILTER(WHERE r.status NOT IN ('pending','running')) processed_count,
-                COUNT(*) FILTER(WHERE r.status=%s) found_count,
-                COUNT(*) FILTER(WHERE r.status=%s) failed_count
-                FROM {self.EMAIL_LOOKUP_JOBS_TABLE} j LEFT JOIN {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} r ON r.job_id=j.id
-                WHERE j.id=%s GROUP BY j.id""", (LOOKUP_RECIPIENT_STATUS_FOUND, LOOKUP_RECIPIENT_STATUS_FAILED, job_id))
-            row=cur.fetchone(); result=dict(row) if row else {}
-            if result:
-                cur.execute(f"SELECT orcid_id,email,email_source,status FROM {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} WHERE job_id=%s AND email<>''", (job_id,))
-                result["results"]=[dict(r) for r in cur.fetchall()]
-            return result
-
-    def cancel_email_lookup_job(self, job_id: int) -> bool:
-        with self._get_cursor() as cur:
-            cur.execute(f"UPDATE {self.EMAIL_LOOKUP_JOBS_TABLE} SET status=%s,updated_at=NOW() WHERE id=%s AND status IN (%s,%s)", (LOOKUP_JOB_STATUS_CANCELLED, job_id, LOOKUP_JOB_STATUS_QUEUED, LOOKUP_JOB_STATUS_RUNNING))
-            cur.execute(f"UPDATE {self.EMAIL_LOOKUP_RECIPIENTS_TABLE} SET status=%s,updated_at=NOW() WHERE job_id=%s AND status=%s", (LOOKUP_RECIPIENT_STATUS_FAILED, job_id, LOOKUP_RECIPIENT_STATUS_PENDING))
-            return cur.rowcount >= 0
 
 
 # Singleton instance

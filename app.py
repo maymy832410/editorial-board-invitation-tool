@@ -89,31 +89,6 @@ def _openalex_topic_options(searchterm: str):
         options.append((label, topic))
     return options
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _cached_retracted_names() -> set[str]:
-    """Cache display-only retraction labels; send-time checks remain live."""
-    return db_storage.get_retracted_names() if db_storage.available else set()
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_openalex_topics(keywords: tuple[str, ...]):
-    return OpenAlexClient().search_topics(list(keywords), max_per_keyword=3, max_total=25)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_openalex_count(filters_json: str) -> int:
-    params = json.loads(filters_json)
-    return OpenAlexClient().get_total_count(**params)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_openalex_batch(filters_json: str, cursor: str, batch_size: int, batch_index: int) -> dict:
-    params = json.loads(filters_json)
-    return OpenAlexClient().fetch_author_batch(
-        **params, cursor=cursor, batch_size=batch_size, batch_index=batch_index
-    )
-
 # Initialize state manager
 state_mgr = StateManager()
 
@@ -494,37 +469,6 @@ def _search_database_email_rows(
     return [_map_database_email_row_to_author(row) for row in rows]
 
 
-def _search_database_email_page(snapshot: dict, cursor: str = "") -> dict:
-    """Load and map one explicit database-search page."""
-    if not db_storage.available:
-        return {"rows": [], "cursor": "", "next_cursor": "", "previous_cursor": "", "has_next": False}
-    started_at = time.perf_counter()
-    page = _cached_database_email_page(json.dumps(snapshot, sort_keys=True), cursor)
-    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-    return {**page, "elapsed_ms": elapsed_ms}
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _cached_database_email_page(snapshot_json: str, cursor: str = "") -> dict:
-    snapshot = json.loads(snapshot_json)
-    page = db_storage.search_database_email_recipients_page(
-        query=snapshot.get("query", ""),
-        source=snapshot.get("source", "all"),
-        page_size=100,
-        cursor=cursor,
-        require_email=bool(snapshot.get("require_email", True)),
-        hide_suppressed=bool(snapshot.get("hide_suppressed", True)),
-        disciplines=snapshot.get("disciplines") or [],
-        specialties=snapshot.get("specialties") or [],
-        countries=snapshot.get("countries") or [],
-        exclude_countries=snapshot.get("exclude_countries") or [],
-    )
-    return {
-        **page,
-        "rows": [_map_database_email_row_to_author(row) for row in page.get("rows", [])],
-    }
-
-
 def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict]) -> list[dict]:
     """Merge OpenAlex and DB rows by ORCID with deterministic field precedence."""
     merged_rows: list[dict] = []
@@ -834,9 +778,7 @@ def load_search_batch(target_batch_index, jump_size=None, reset=False):
     if not search_filters:
         return False
 
-    current_jump_size = int(search_state.get('jump_size', 100) or 100)
-    if current_jump_size not in (100, 250):
-        current_jump_size = 100
+    current_jump_size = int(search_state.get('jump_size', 250) or 250)
     if jump_size is not None:
         jump_size = int(jump_size)
     else:
@@ -886,6 +828,7 @@ def load_search_batch(target_batch_index, jump_size=None, reset=False):
         save_state()
         return True
 
+    client = OpenAlexClient()
     cursor = start_cursor
     current_payload = None
 
@@ -894,17 +837,15 @@ def load_search_batch(target_batch_index, jump_size=None, reset=False):
         if remaining <= 0:
             break
 
-        batch_filters = {
-            "h_index_min": search_filters.get('h_index_min'),
-            "h_index_max": search_filters.get('h_index_max'),
-            "include_country_codes": search_filters.get('include_country_codes'),
-            "exclude_country_codes": search_filters.get('exclude_country_codes'),
-            "topic_ids": search_filters.get('topic_ids'),
-            "require_orcid": search_filters.get('require_orcid', True),
-        }
-        batch_payload = _cached_openalex_batch(
-            json.dumps(batch_filters, sort_keys=True), cursor,
-            min(jump_size, remaining), batch_index,
+        batch_payload = client.fetch_author_batch(
+            h_index_min=search_filters.get('h_index_min'),
+            h_index_max=search_filters.get('h_index_max'),
+            exclude_country_codes=search_filters.get('exclude_country_codes'),
+            topic_ids=search_filters.get('topic_ids'),
+            require_orcid=search_filters.get('require_orcid', True),
+            cursor=cursor,
+            batch_size=min(jump_size, remaining),
+            batch_index=batch_index,
         )
 
         if batch_index == target_batch_index:
@@ -922,10 +863,6 @@ def load_search_batch(target_batch_index, jump_size=None, reset=False):
         return False
 
     _set_current_batch(search_state, current_payload, start_cursor)
-    search_state['batch_cache'] = {
-        key: value for key, value in search_state.get('batch_cache', {}).items()
-        if abs(int(key) - target_batch_index) <= 1
-    }
     save_state()
     return True
 
@@ -1961,14 +1898,6 @@ def render_sidebar():
                 key="h_max"
             )
         
-        countries_to_include = st.multiselect(
-            "Include Countries",
-            options=list(COUNTRIES.keys()),
-            default=search_params.get('include_countries', []),
-            key="include_countries",
-            help="Show authors from any of these countries; leave empty for all countries"
-        )
-
         countries_to_exclude = st.multiselect(
             "Exclude Countries",
             options=list(COUNTRIES.keys()),
@@ -1996,8 +1925,8 @@ def render_sidebar():
 
         jump_size = st.selectbox(
             "Jump Size",
-            options=[100, 250],
-            index=[100, 250].index(search_params.get('jump_size', 100) if search_params.get('jump_size', 100) in [100, 250] else 100),
+            options=[250, 500, 1000],
+            index=[250, 500, 1000].index(search_params.get('jump_size', 250)),
             key="jump_size",
             help="Load and navigate OpenAlex results in batches of this size"
         )
@@ -2103,7 +2032,6 @@ def render_sidebar():
             'keyword_tags': keyword_tags,
             'h_min': h_min,
             'h_max': h_max,
-            'include_countries': countries_to_include,
             'exclude_countries': countries_to_exclude,
             'disciplines': selected_disciplines,
             'max_results': max_results,
@@ -2121,8 +2049,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
     journal_config = st.session_state.app_state.get('journal_config', {})
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_PUBLICATION)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
-    state_key = _scope_key(ui_scope, "database_search_state")
-    search_state = st.session_state.setdefault(state_key, {"snapshot": None, "page": None})
+    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
     panel_state = {
         'results': [],
         'total': 0,
@@ -2138,84 +2065,65 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
         st.warning("Database email search requires PostgreSQL.")
         return panel_state
 
-    with st.form(_scope_key(ui_scope, "database_email_search_form")):
-        db_search_cols = st.columns([2.2, 1.1, 1, 1])
-        with db_search_cols[0]:
-            db_search_query = st.text_input("Search database emails", placeholder="Name, email, affiliation, ORCID...").strip()
-        with db_search_cols[1]:
-            db_search_source = st.selectbox("Database source", options=["all", "profiles", "harvested"], format_func=_database_email_source_label)
-        with db_search_cols[2]:
-            db_require_email = st.checkbox("With email", value=True)
-            db_hide_suppressed = st.checkbox("Hide suppressed", value=True)
-        with db_search_cols[3]:
-            db_hide_sent = st.checkbox("Hide sent", value=True)
-        taxonomy_cols = st.columns(3)
-        specialty_text = taxonomy_cols[0].text_input("Specialties", placeholder="Comma-separated, optional")
-        db_countries = taxonomy_cols[1].multiselect(
-            "Include Countries",
-            options=list(COUNTRIES.keys()),
-            default=list(filters.get("include_countries") or []),
-            help="Match any selected country; leave empty for all countries.",
+    db_search_cols = st.columns([2.4, 1.2, 1, 1, 1])
+    with db_search_cols[0]:
+        db_search_query = st.text_input(
+            "Search database emails",
+            placeholder="Name, email, affiliation, ORCID, country, specialty...",
+            key=_scope_key(ui_scope, "database_email_search_query"),
+        ).strip()
+    with db_search_cols[1]:
+        db_search_source = st.selectbox(
+            "Database source",
+            options=["all", "profiles", "harvested"],
+            format_func=_database_email_source_label,
+            key=_scope_key(ui_scope, "database_email_search_source"),
         )
-        db_exclude_countries = taxonomy_cols[2].multiselect(
-            "Exclude Countries",
-            options=list(COUNTRIES.keys()),
-            default=list(filters.get("exclude_countries") or []),
+    with db_search_cols[2]:
+        db_require_email = st.checkbox(
+            "With email",
+            value=True,
+            key=_scope_key(ui_scope, "database_email_require_email"),
         )
-        search_submitted = st.form_submit_button("Search / Load", type="primary", use_container_width=True)
+    with db_search_cols[3]:
+        db_hide_suppressed = st.checkbox(
+            "Hide suppressed",
+            value=True,
+            key=_scope_key(ui_scope, "database_email_hide_suppressed"),
+        )
+    with db_search_cols[4]:
+        db_hide_sent = st.checkbox(
+            "Hide sent",
+            value=True,
+            key=_scope_key(ui_scope, "database_email_hide_sent"),
+        )
+    st.caption("Database email search is uncapped and returns all matching stored email records.")
 
-    if search_submitted:
-        snapshot = {
-            "query": db_search_query,
-            "source": db_search_source,
-            "require_email": db_require_email,
-            "hide_suppressed": db_hide_suppressed,
-            "hide_sent": db_hide_sent,
-            "disciplines": list(filters.get("disciplines") or []),
-            "specialties": [value.strip() for value in specialty_text.split(",") if value.strip()],
-            "countries": [COUNTRIES[value] for value in db_countries],
-            "exclude_countries": [
-                COUNTRIES[value] for value in db_exclude_countries if value not in set(db_countries)
-            ],
-        }
-        search_state = {"snapshot": snapshot, "page": _search_database_email_page(snapshot)}
-        st.session_state[state_key] = search_state
-
-    snapshot = search_state.get("snapshot") or {}
-    page = search_state.get("page") or {}
-    nav_cols = st.columns(4)
-    if nav_cols[0].button("← Previous", disabled=not page.get("previous_cursor"), key=_scope_key(ui_scope, "db_previous")):
-        search_state["page"] = _search_database_email_page(snapshot, page.get("previous_cursor", ""))
-        st.rerun()
-    if nav_cols[1].button("Next →", disabled=not page.get("has_next"), key=_scope_key(ui_scope, "db_next")):
-        search_state["page"] = _search_database_email_page(snapshot, page.get("next_cursor", ""))
-        st.rerun()
-    if nav_cols[2].button("Refresh", disabled=not bool(snapshot), key=_scope_key(ui_scope, "db_refresh")):
-        _cached_database_email_page.clear()
-        search_state["page"] = _search_database_email_page(snapshot, page.get("cursor", ""))
-        st.rerun()
-    if nav_cols[3].button("Clear Search", disabled=not bool(snapshot), key=_scope_key(ui_scope, "db_clear")):
-        st.session_state[state_key] = {"snapshot": None, "page": None}
-        st.rerun()
-
-    db_source_results = list(page.get("rows") or [])
-    if snapshot.get("hide_sent"):
-        sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
+    db_source_results = _search_database_email_rows(
+        query=db_search_query,
+        source=db_search_source,
+        limit=0,
+        require_email=db_require_email,
+        hide_suppressed=db_hide_suppressed,
+    )
+    if db_hide_sent:
         db_source_results = [
             row for row in db_source_results
             if _recipient_tracking_id(row) not in sent_invitations
         ]
 
-    db_search_active = bool(snapshot)
-    timing = f" Last query: {int(page.get('elapsed_ms'))} ms." if page.get("elapsed_ms") is not None else ""
-    st.caption(f"Database results load only after Search / Load and are paged 100 rows at a time.{timing}")
+    db_search_active = (
+        author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}
+        or bool(db_search_query)
+    )
+    if author_source_mode == AUTHOR_SOURCE_OPENALEX and not db_search_query:
+        st.caption("Tip: type here to show database recipients below, or switch Author Source to Database Emails.")
 
     panel_state.update({
         'results': db_source_results,
         'total': len(db_source_results),
         'active': db_search_active,
-        'query': snapshot.get("query", ""),
-        'snapshot': snapshot,
+        'query': db_search_query,
     })
     return panel_state
 
@@ -2318,11 +2226,7 @@ def render_search_section(filters, ui_scope: str):
 def run_search(filters, ui_scope: str):
     """Execute the author search with keyword-based topic filtering."""
     
-    include_country_codes = [COUNTRIES[c] for c in filters.get('include_countries', [])]
-    exclude_country_codes = [
-        COUNTRIES[c] for c in filters.get('exclude_countries', [])
-        if c not in set(filters.get('include_countries', []))
-    ]
+    exclude_country_codes = [COUNTRIES[c] for c in filters['exclude_countries']] if filters['exclude_countries'] else None
     
     client = OpenAlexClient()
     
@@ -2335,7 +2239,7 @@ def run_search(filters, ui_scope: str):
     # Step 1: Search for topics if keywords provided
     if keywords:
         with st.spinner(f"Searching topics for: {', '.join(keywords)}..."):
-            topic_ids, topic_details = _cached_openalex_topics(tuple(keywords))
+            topic_ids, topic_details = client.search_topics(keywords, max_per_keyword=3, max_total=25)
         
         if topic_ids:
             msg = f"Found {len(topic_ids)} matching topics"
@@ -2352,8 +2256,6 @@ def run_search(filters, ui_scope: str):
     
     # Show search info
     search_info = f"H-index: {filters['h_min']}-{filters['h_max']}"
-    if filters.get('include_countries'):
-        search_info += f" | Including: {', '.join(filters['include_countries'])}"
     if filters['exclude_countries']:
         search_info += f" | Excluding: {', '.join(filters['exclude_countries'])}"
     if keywords:
@@ -2362,13 +2264,13 @@ def run_search(filters, ui_scope: str):
     
     # Step 2: Get total count with topic filter
     with st.spinner("Counting matching authors..."):
-        count_filters = {
-            "h_index_min": filters['h_min'], "h_index_max": filters['h_max'],
-            "include_country_codes": include_country_codes or None,
-            "exclude_country_codes": exclude_country_codes or None,
-            "topic_ids": topic_ids, "require_orcid": True,
-        }
-        total_count = _cached_openalex_count(json.dumps(count_filters, sort_keys=True))
+        total_count = client.get_total_count(
+            h_index_min=filters['h_min'],
+            h_index_max=filters['h_max'],
+            exclude_country_codes=exclude_country_codes,
+            topic_ids=topic_ids,
+            require_orcid=True
+        )
     
     if total_count == 0:
         st.warning("No authors found. Try adjusting filters or keywords.")
@@ -2382,7 +2284,6 @@ def run_search(filters, ui_scope: str):
         'filters': {
             'h_index_min': filters['h_min'],
             'h_index_max': filters['h_max'],
-            'include_country_codes': include_country_codes or None,
             'exclude_country_codes': exclude_country_codes,
             'topic_ids': topic_ids,
             'require_orcid': True,
@@ -2408,7 +2309,6 @@ def run_search(filters, ui_scope: str):
         'keyword_tags': keyword_tags,
         'h_index_min': filters['h_min'],
         'h_index_max': filters['h_max'],
-        'include_countries': filters.get('include_countries', []),
         'exclude_countries': filters['exclude_countries'],
         'disciplines': filters.get('disciplines', []),
         'author_source_mode': filters.get('author_source_mode', st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH)),
@@ -2652,66 +2552,9 @@ def _enqueue_bulk_send(payload: dict) -> None:
     )
     if job_id:
         st.session_state.last_bulk_enqueue_result = f"Queued background bulk email job #{job_id} with {len(batch)} recipients."
-        ui_scope = payload.get("ui_scope")
-        if ui_scope:
-            st.session_state.pop(_scope_key(ui_scope, "bulk_job_status_cache"), None)
     else:
         st.session_state.last_bulk_enqueue_result = "Could not queue the background bulk email job."
     st.rerun()
-
-
-def _load_database_bulk_candidates(snapshot: dict, invitation_type: str, journal_name: str) -> list[dict]:
-    """Resolve up to 1,000 eligible database recipients only on bulk action."""
-    if not snapshot or not db_storage.available:
-        return []
-    rows: list[dict] = []
-    cursor = ""
-    for _ in range(5):
-        page_snapshot = dict(snapshot)
-        page = db_storage.search_database_email_recipients_page(
-            query=page_snapshot.get("query", ""),
-            source=page_snapshot.get("source", "all"),
-            page_size=1000,
-            cursor=cursor,
-            require_email=True,
-            hide_suppressed=True,
-            disciplines=page_snapshot.get("disciplines") or [],
-            specialties=page_snapshot.get("specialties") or [],
-            countries=page_snapshot.get("countries") or [],
-        )
-        rows.extend(_map_database_email_row_to_author(row) for row in page.get("rows", []))
-        if not page.get("has_next"):
-            break
-        cursor = page.get("next_cursor", "")
-    post_text = (snapshot.get("post_text") or "").strip().lower()
-    post_disciplines = set(snapshot.get("post_disciplines") or [])
-    post_specialties = snapshot.get("post_specialties") or []
-    excluded_countries = set(snapshot.get("excluded_countries") or [])
-    if post_text:
-        rows = [row for row in rows if post_text in " ".join(str(row.get(field, "")) for field in (
-            "name", "email", "institution", "country", "orcid_id", "discipline", "specialty", "research_areas"
-        )).lower()]
-    if post_disciplines:
-        rows = [row for row in rows if row.get("discipline") in post_disciplines]
-    if post_specialties:
-        rows = [row for row in rows if author_matches_any_specialty(row, post_specialties)]
-    if excluded_countries:
-        rows = [row for row in rows if row.get("country") not in excluded_countries]
-    sent = get_sent_invitations(invitation_type, journal_name)
-    active = db_storage.get_active_bulk_recipient_keys(rows)
-    suppressed = db_storage.get_suppressed_recipient_keys(rows)
-    retracted = db_storage.get_retracted_names()
-    eligible = prepare_bulk_recipients(
-        rows,
-        is_already_sent=lambda identity: identity in sent or identity in active["identities"],
-        is_suppressed=lambda email, orcid_id: (
-            (email or "").strip().lower() in suppressed["emails"]
-            or (email or "").strip().lower() in active["emails"]
-            or (orcid_id or "").strip().lower().replace("https://orcid.org/", "") in suppressed["orcids"]
-        ),
-        retracted_names=retracted,
-    )
-    return cap_bulk_recipients(eligible)
 
 
 def _render_bulk_job_status(ui_scope: str) -> None:
@@ -2727,15 +2570,7 @@ def _render_bulk_job_status(ui_scope: str) -> None:
         else:
             st.warning(message)
 
-    cache_key = _scope_key(ui_scope, "bulk_job_status_cache")
-    cached = st.session_state.get(cache_key) or {}
-    if not cached or time.time() - float(cached.get("loaded_at", 0)) > 15:
-        cached = {
-            "loaded_at": time.time(),
-            "jobs": db_storage.get_recent_bulk_email_jobs(limit=5),
-        }
-        st.session_state[cache_key] = cached
-    jobs = cached.get("jobs") or []
+    jobs = db_storage.get_recent_bulk_email_jobs(limit=5)
     if not jobs:
         st.caption("No background bulk send jobs yet.")
         return
@@ -2768,11 +2603,9 @@ def _render_bulk_job_status(ui_scope: str) -> None:
             if status in {BULK_JOB_STATUS_QUEUED, BULK_JOB_STATUS_RUNNING}:
                 if st.button("Cancel", key=_scope_key(ui_scope, f"cancel_bulk_job_{job.get('id')}")):
                     db_storage.cancel_bulk_email_job(int(job.get('id')))
-                    st.session_state.pop(cache_key, None)
                     st.rerun()
 
     if st.button("Refresh Bulk Progress", key=_scope_key(ui_scope, "refresh_bulk_jobs")):
-        st.session_state.pop(cache_key, None)
         st.rerun()
 
 
@@ -2864,13 +2697,11 @@ def display_results(filters, ui_scope: str):
     )
 
     if show_openalex_batch_controls:
-        current_jump_size = int(search_state.get('jump_size', 100) or 100)
-        if current_jump_size not in (100, 250):
-            current_jump_size = 100
+        current_jump_size = int(search_state.get('jump_size', 250) or 250)
         selected_jump_size = st.selectbox(
             "Batch Jump Size",
-            options=[100, 250],
-            index=[100, 250].index(current_jump_size),
+            options=[250, 500, 1000],
+            index=[250, 500, 1000].index(current_jump_size),
             key=_scope_key(ui_scope, "batch_jump_size_control"),
             help="Reload OpenAlex result batches using the selected jump size"
         )
@@ -2958,7 +2789,7 @@ def display_results(filters, ui_scope: str):
     _render_bulk_job_status(ui_scope)
     
     # Get retracted author names from DB (lowercased set for fast matching)
-    retracted_names = _cached_retracted_names()
+    retracted_names = db_storage.get_retracted_names() if db_storage.available else set()
     
     # Tag each author with retraction and sent status
     for r in filtered:
@@ -3082,7 +2913,6 @@ def display_results(filters, ui_scope: str):
     
     # Country exclusion post-filter (supplements API-level exclusion)
     all_countries = sorted({r.get('country') for r in results if r.get('country')})
-    excluded_codes: set[str] = set()
     if all_countries:
         # Reverse-map codes to names for display
         code_to_name = {v: k for k, v in COUNTRIES.items()}
@@ -3225,7 +3055,7 @@ def display_results(filters, ui_scope: str):
     st.divider()
     col_btn1, col_btn2 = st.columns([2, 1])
     with col_btn1:
-        fetch_btn_label = f"Queue Email Lookup for {without_email} Authors" if without_email > 0 else "All Filtered Authors Have Emails"
+        fetch_btn_label = f"Fetch Emails for {without_email} Filtered Authors" if without_email > 0 else "All Filtered Authors Have Emails"
         fetch_emails_clicked = st.button(
             fetch_btn_label,
             type="primary" if without_email > 0 else "secondary",
@@ -3235,7 +3065,7 @@ def display_results(filters, ui_scope: str):
         )
     with col_btn2:
         stop_clicked = st.button(
-            "Cancel Lookup",
+            "Stop Fetching",
             use_container_width=True,
             key=_scope_key(ui_scope, "stop_fetching")
         )
@@ -3250,39 +3080,11 @@ def display_results(filters, ui_scope: str):
                 f"Enable **Tavily search** or **OpenAI web search** in sidebar for more results."
             )
     
-    lookup_job_key = _scope_key(ui_scope, "email_lookup_job_id")
-    lookup_job_id = int(st.session_state.get(lookup_job_key) or 0)
-    if stop_clicked and lookup_job_id and db_storage.available:
-        db_storage.cancel_email_lookup_job(lookup_job_id)
+    if stop_clicked:
+        st.session_state.stop_fetching = True
+    
     if fetch_emails_clicked:
-        if not db_storage.available:
-            st.error("PostgreSQL is required for background email lookup.")
-        else:
-            lookup_job_id = db_storage.enqueue_email_lookup(
-                filtered, use_tavily=bool(filters.get('use_tavily')),
-                use_openai_web=bool(filters.get('use_openai_web')),
-            )
-            if lookup_job_id:
-                st.session_state[lookup_job_key] = lookup_job_id
-                st.success(f"Email lookup job #{lookup_job_id} queued. You can keep using the app.")
-    if lookup_job_id and db_storage.available:
-        lookup = db_storage.get_email_lookup_job(lookup_job_id)
-        if lookup:
-            result_by_orcid = {row['orcid_id']: row for row in lookup.get('results', [])}
-            changed = False
-            for author in st.session_state.app_state.get('search_results', []):
-                found = result_by_orcid.get((author.get('orcid_id') or '').replace('https://orcid.org/', ''))
-                if found and found.get('email') and author.get('email') != found['email']:
-                    author['email'] = found['email']; author['email_source'] = found.get('email_source') or 'background'
-                    changed = True
-            if changed:
-                _sync_current_batch_cache(); save_state()
-            st.caption(
-                f"Lookup job #{lookup_job_id}: {lookup.get('status')} | "
-                f"found {int(lookup.get('found_count') or 0)}/{int(lookup.get('total_count') or 0)}"
-            )
-            if st.button("Refresh Email Lookup", key=_scope_key(ui_scope, "refresh_email_lookup")):
-                st.rerun()
+        run_email_fetch_filtered(filters, ui_scope)
     
     # Summary metrics
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -3329,6 +3131,37 @@ def display_results(filters, ui_scope: str):
                 in suppressed_keys["orcids"]
             or (row.get('profile_key') or '').strip() in suppressed_keys["profile_keys"]
         )
+    
+    # Prepare dataframe for export
+    df_data = []
+    for r in filtered:
+        orcid_id = r.get('orcid_id', '')
+        invited_count = int(invitation_counts.get(orcid_id, 0))
+        source_origin = r.get('source_origin', AUTHOR_SOURCE_OPENALEX)
+        status = ''
+        if result_is_suppressed(r):
+            status = 'SUPPRESSED'
+        elif r.get('is_retracted'):
+            status = '🚫 RETRACTED'
+        elif _recipient_tracking_id(r) in sent_invitations:
+            status = f"✅ SENT {_invitation_type_label(invitation_type).upper()}"
+        df_data.append({
+            'Name': r.get('name', ''),
+            'H-Index': r.get('h_index', ''),
+            'Specialty': r.get('specialty', '') or '',
+            'Discipline': r.get('discipline', ''),
+            'Email': r.get('email', '') or '',
+            'All_Emails': r.get('all_emails', '') or r.get('email', '') or '',
+            'Source': _author_source_label(source_origin),
+            'Institution': r.get('institution', ''),
+            'Country': r.get('country', ''),
+            'Invited_Count': invited_count,
+            'Status': status,
+            'orcid_id': orcid_id,
+            'all_topics': r.get('all_topics', [])
+        })
+    
+    df = pd.DataFrame(df_data)
     
     # Custom CSS for row highlighting
     st.markdown("""
@@ -3419,13 +3252,21 @@ def display_results(filters, ui_scope: str):
     
     # --- Bulk send controls ---
     filtered_with_email = [a for a in filtered if a.get('email')]
+    active_bulk_keys = (
+        db_storage.get_active_bulk_recipient_keys(filtered)
+        if db_storage.available else {"identities": set(), "emails": set()}
+    )
     eligible_bulk_authors = prepare_bulk_recipients(
         filtered,
-        is_already_sent=lambda recipient_id: recipient_id in sent_invitations,
+        is_already_sent=lambda recipient_id: (
+            recipient_id in sent_invitations
+            or recipient_id in active_bulk_keys["identities"]
+        ),
         is_suppressed=lambda email, orcid_id: (
             (email or '').strip().lower() in suppressed_keys["emails"]
             or (orcid_id or '').strip().lower().replace('https://orcid.org/', '')
                 in suppressed_keys["orcids"]
+            or (email or '').strip().lower() in active_bulk_keys["emails"]
         ),
         retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
     )
@@ -3470,8 +3311,7 @@ def display_results(filters, ui_scope: str):
     
     col_count, col_note, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_count:
-        database_snapshot = db_panel.get("snapshot") or {}
-        eligible_batch_limit = 1000 if database_snapshot else min(1000, len(eligible_bulk_authors))
+        eligible_batch_limit = min(1000, len(eligible_bulk_authors))
         default_bulk_count = eligible_batch_limit
         batch_size = st.number_input(
             "Recipients to queue",
@@ -3485,7 +3325,7 @@ def display_results(filters, ui_scope: str):
     with col_note:
         st.caption(
             f"Eligible: {len(eligible_bulk_authors):,} of {len(filtered_with_email):,} filtered authors with email. "
-            "Already invited, suppressed, and retracted authors are skipped here; active jobs are rechecked at confirmation."
+            "Already invited, actively queued, suppressed, and retracted authors are skipped."
         )
 
     with col_bulk:
@@ -3506,26 +3346,8 @@ def display_results(filters, ui_scope: str):
         st.warning("Background bulk sending is disabled because PostgreSQL is not connected.")
 
     if bulk_send_clicked and batch_size > 0:
-        if database_snapshot:
-            database_snapshot = {
-                **database_snapshot,
-                "post_text": active_search_query,
-                "post_disciplines": list(selected_disciplines),
-                "post_specialties": list(selected_specialties),
-                "excluded_countries": list(excluded_codes),
-            }
-            with st.spinner("Resolving up to 1,000 eligible recipients..."):
-                bulk_candidates = _load_database_bulk_candidates(
-                    database_snapshot, invitation_type, tracking_journal_name
-                )
-        else:
-            bulk_candidates = eligible_bulk_authors
-        selected_candidates = bulk_candidates[:int(batch_size)]
-        if not selected_candidates:
-            st.warning("No eligible recipients remain after the live bulk safety checks.")
-            return
         st.session_state[pending_bulk_dialog_key] = {
-            'batch': [dict(author) for author in selected_candidates],
+            'batch': [dict(author) for author in eligible_bulk_authors[:int(batch_size)]],
             'invitation_type': invitation_type,
             'tracking_journal_name': tracking_journal_name,
             'publisher_id': selected_bulk_publisher_id,
@@ -3537,7 +3359,6 @@ def display_results(filters, ui_scope: str):
             'suppress_after_send': bool(filters.get('suppress_after_send')),
             'journal_config': dict(journal_config),
             'dialog_key': f"{ui_scope}_{current_results_page}_{int(time.time())}",
-            'ui_scope': ui_scope,
         }
         st.rerun()
 
@@ -3561,10 +3382,10 @@ def display_results(filters, ui_scope: str):
         is_notified = tracking_id in sent_invitations
         is_retracted = author.get('is_retracted', False)
         has_email = bool(author.get('email'))
-        is_suppressed = (
-            (author.get('email') or '').strip().lower() in suppressed_keys["emails"]
-            or (orcid_id or '').strip().lower().replace('https://orcid.org/', '') in suppressed_keys["orcids"]
-            or (author.get('profile_key') or '').strip() in suppressed_keys["profile_keys"]
+        is_suppressed = is_recipient_suppressed(
+            author.get('email', ''),
+            orcid_id,
+            author.get('profile_key', ''),
         )
         
         cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
@@ -3668,41 +3489,30 @@ def display_results(filters, ui_scope: str):
     
     st.divider()
     
-    export_key = _scope_key(ui_scope, "prepared_exports")
-    if st.button("Prepare CSV Export", use_container_width=True, key=_scope_key(ui_scope, "prepare_export")):
-        export_rows = []
-        for row in filtered:
-            orcid_id = row.get('orcid_id', '')
-            status = 'SUPPRESSED' if result_is_suppressed(row) else (
-                'RETRACTED' if row.get('is_retracted') else (
-                    f"SENT {_invitation_type_label(invitation_type).upper()}"
-                    if _recipient_tracking_id(row) in sent_invitations else ''
-                )
-            )
-            export_rows.append({
-                'Name': row.get('name', ''), 'H-Index': row.get('h_index', ''),
-                'Specialty': row.get('specialty', '') or '', 'Discipline': row.get('discipline', ''),
-                'Email': row.get('email', '') or '',
-                'All_Emails': row.get('all_emails', '') or row.get('email', '') or '',
-                'Source': _author_source_label(row.get('source_origin', AUTHOR_SOURCE_OPENALEX)),
-                'Institution': row.get('institution', ''), 'Country': row.get('country', ''),
-                'Invited_Count': int(invitation_counts.get(orcid_id, 0)), 'Status': status,
-            })
-        export_df = pd.DataFrame(export_rows)
-        with_email_df = export_df[export_df['Email'] != ''] if not export_df.empty else export_df
-        st.session_state[export_key] = {
-            'all': export_df.to_csv(index=False),
-            'with_email': with_email_df.to_csv(index=False),
-            'with_email_count': len(with_email_df),
-        }
-    prepared = st.session_state.get(export_key)
-    if prepared:
-        col1, col2 = st.columns(2)
-        col1.download_button("Export CSV", prepared['all'], "authors.csv", "text/csv", use_container_width=True)
-        col2.download_button(
-            f"Export With Email ({prepared['with_email_count']})", prepared['with_email'],
-            "authors_with_email.csv", "text/csv", use_container_width=True,
+    # Export buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        csv = df.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
+        st.download_button(
+            "Export CSV",
+            data=csv,
+            file_name="authors.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=_scope_key(ui_scope, "export_csv")
         )
+    with col2:
+        df_with_email = df[df['Email'] != '']
+        if not df_with_email.empty:
+            csv_email = df_with_email.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
+            st.download_button(
+                f"Export With Email ({len(df_with_email)})",
+                data=csv_email,
+                file_name="authors_with_email.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=_scope_key(ui_scope, "export_with_email_csv")
+            )
 
 
 def render_invitation_section(filters):

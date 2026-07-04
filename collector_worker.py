@@ -55,7 +55,6 @@ from openalex_client import (
 )
 from orcid_async import fetch_emails_async
 from bulk_email_worker import BulkEmailWorker
-from openai_email_async import AsyncOpenAIEmailClient
 
 
 def _utcnow() -> datetime:
@@ -373,10 +372,6 @@ class CollectorWorker:
             time.sleep(COLLECT_CYCLE_PAUSE_SEC)
             return
 
-        if self._process_email_lookup_once():
-            time.sleep(COLLECT_CYCLE_PAUSE_SEC)
-            return
-
         run = self.storage.get_active_run()
         if not run:
             time.sleep(COLLECT_IDLE_POLL_SEC)
@@ -438,55 +433,6 @@ class CollectorWorker:
             _log(f"bulk email worker unavailable: {exc}")
             self.bulk_email_worker = None
             return False
-
-    def _process_email_lookup_once(self) -> bool:
-        rows = self.storage.claim_email_lookup_batch(limit=COLLECT_FETCH_BATCH)
-        if not rows:
-            return False
-        authors = [{
-            "orcid_id": row.get("orcid_id"), "openalex_id": row.get("openalex_id"),
-            "name": row.get("author_name"), "institution": row.get("institution"),
-            "country": row.get("country"), "discipline": row.get("discipline"),
-        } for row in rows]
-        try:
-            results = asyncio.run(fetch_emails_async(
-                authors, max_concurrent=COLLECT_BASELINE_CONCURRENCY,
-                delay_between_batches=COLLECT_BASELINE_DELAY_SEC,
-            ))
-            by_orcid = {str(item.get("orcid_id") or "").replace("https://orcid.org/", ""): item for item in results}
-            missing = []
-            for row, author in zip(rows, authors):
-                result = by_orcid.get(row.get("orcid_id")) or {}
-                if not result.get("email") and (row.get("use_tavily") or row.get("use_openai_web")):
-                    missing.append(author)
-            web_by_orcid = {}
-            if missing:
-                async def fetch_web():
-                    async with AsyncOpenAIEmailClient(max_concurrent=3, delay_between_requests=0.5) as client:
-                        return await client.fetch_emails_batch(
-                            missing,
-                            use_tavily=bool(rows[0].get("use_tavily")),
-                            use_openai_web=bool(rows[0].get("use_openai_web")),
-                        )
-                web_results = asyncio.run(fetch_web())
-                web_by_orcid = {str(item.get("orcid_id") or "").replace("https://orcid.org/", ""): item for item in web_results}
-            for row in rows:
-                result = by_orcid.get(row.get("orcid_id")) or {}
-                web = web_by_orcid.get(row.get("orcid_id")) or {}
-                email = result.get("email") or web.get("email") or ""
-                source = "orcid" if result.get("email") else (web.get("email_source") or web.get("source") or "")
-                if email:
-                    self.storage.upsert_author_profile(
-                        orcid_id=row.get("orcid_id") or "", author_name=row.get("author_name") or "",
-                        email=email, openalex_id=row.get("openalex_id") or "",
-                        scientific_domain=row.get("discipline") or "", source=source or "lookup_job",
-                    )
-                self.storage.finish_email_lookup_recipient(row["id"], email=email, source=source)
-        except Exception as exc:
-            _log(f"email lookup batch failed: {exc}")
-            for row in rows:
-                self.storage.finish_email_lookup_recipient(row["id"], error=str(exc))
-        return True
 
 
 def main() -> None:
