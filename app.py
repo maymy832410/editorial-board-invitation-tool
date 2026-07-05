@@ -993,13 +993,23 @@ def _import_retraction_csv(uploaded_file):
         st.error(f"Import failed: {e}")
 
 
+@st.cache_resource(ttl=60, show_spinner=False)
+def _cached_db_sent_invitations(invitation_type: str, journal_filter: str | None) -> set:
+    return db_storage.get_all_sent(invitation_type, journal_filter) if db_storage.available else set()
+
+
+@st.cache_resource(ttl=60, show_spinner=False)
+def _cached_retracted_names() -> set:
+    return db_storage.get_retracted_names() if db_storage.available else set()
+
+
 def get_sent_invitations(
     invitation_type: str = INVITATION_TYPE_EDITORIAL,
     journal_name: str = ""
 ) -> set:
     """Get sent ORCID IDs for the selected invitation type, merged with local state."""
     journal_filter = journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
-    db_sent = db_storage.get_all_sent(invitation_type, journal_filter) if db_storage.available else set()
+    db_sent = _cached_db_sent_invitations(invitation_type, journal_filter)
 
     local_sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(local_sent, list):
@@ -2063,7 +2073,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
     journal_config = st.session_state.app_state.get('journal_config', {})
     invitation_type = filters.get('invitation_type', INVITATION_TYPE_PUBLICATION)
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
-    sent_invitations = get_sent_invitations(invitation_type, tracking_journal_name)
+    state_key = _scope_key(ui_scope, "submitted_database_search")
     panel_state = {
         'results': [],
         'total': 0,
@@ -2079,68 +2089,61 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
         st.warning("Database email search requires PostgreSQL.")
         return panel_state
 
-    db_search_cols = st.columns([2.4, 1.2, 1, 1, 1])
-    with db_search_cols[0]:
-        db_search_query = st.text_input(
-            "Search database emails",
-            placeholder="Name, email, affiliation, ORCID, country, specialty...",
-            key=_scope_key(ui_scope, "database_email_search_query"),
-        ).strip()
-    with db_search_cols[1]:
-        db_search_source = st.selectbox(
-            "Database source",
-            options=["all", "profiles", "harvested"],
-            format_func=_database_email_source_label,
-            key=_scope_key(ui_scope, "database_email_search_source"),
-        )
-    with db_search_cols[2]:
-        db_require_email = st.checkbox(
-            "With email",
-            value=True,
-            key=_scope_key(ui_scope, "database_email_require_email"),
-        )
-    with db_search_cols[3]:
-        db_hide_suppressed = st.checkbox(
-            "Hide suppressed",
-            value=True,
-            key=_scope_key(ui_scope, "database_email_hide_suppressed"),
-        )
-    with db_search_cols[4]:
-        db_hide_sent = st.checkbox(
-            "Hide sent",
-            value=True,
-            key=_scope_key(ui_scope, "database_email_hide_sent"),
-        )
+    with st.form(_scope_key(ui_scope, "database_search_form")):
+        db_search_cols = st.columns([2.4, 1.2, 1, 1, 1])
+        with db_search_cols[0]:
+            db_search_query = st.text_input(
+                "Search database emails",
+                placeholder="Name, email, affiliation, ORCID, country, specialty...",
+                key=_scope_key(ui_scope, "database_email_search_query"),
+            ).strip()
+        with db_search_cols[1]:
+            db_search_source = st.selectbox(
+                "Database source", options=["all", "profiles", "harvested"],
+                format_func=_database_email_source_label,
+                key=_scope_key(ui_scope, "database_email_search_source"),
+            )
+        with db_search_cols[2]:
+            db_require_email = st.checkbox("With email", value=True, key=_scope_key(ui_scope, "database_email_require_email"))
+        with db_search_cols[3]:
+            db_hide_suppressed = st.checkbox("Hide suppressed", value=True, key=_scope_key(ui_scope, "database_email_hide_suppressed"))
+        with db_search_cols[4]:
+            db_hide_sent = st.checkbox("Hide sent", value=True, key=_scope_key(ui_scope, "database_email_hide_sent"))
+        submitted = st.form_submit_button("Search / Load & Apply Filters", type="primary", use_container_width=True)
     st.caption("Database email search is uncapped and returns all matching stored email records.")
 
-    db_source_results = _search_database_email_rows(
-        query=db_search_query,
-        source=db_search_source,
-        limit=0,
-        require_email=db_require_email,
-        hide_suppressed=db_hide_suppressed,
-        countries=tuple(
-            sorted(COUNTRIES[name] for name in filters.get('include_countries', []) if name in COUNTRIES)
-        ),
-    )
-    if db_hide_sent:
-        db_source_results = [
-            row for row in db_source_results
-            if _recipient_tracking_id(row) not in sent_invitations
-        ]
+    if submitted:
+        snapshot = {
+            "query": db_search_query, "source": db_search_source,
+            "require_email": db_require_email, "hide_suppressed": db_hide_suppressed,
+            "hide_sent": db_hide_sent,
+            "countries": tuple(sorted(COUNTRIES[name] for name in filters.get('include_countries', []) if name in COUNTRIES)),
+        }
+        rows = _search_database_email_rows(
+            query=snapshot["query"], source=snapshot["source"], limit=0,
+            require_email=snapshot["require_email"], hide_suppressed=snapshot["hide_suppressed"],
+            countries=snapshot["countries"],
+        )
+        if snapshot["hide_sent"]:
+            sent = get_sent_invitations(invitation_type, tracking_journal_name)
+            rows = [row for row in rows if _recipient_tracking_id(row) not in sent]
+        st.session_state[state_key] = {"snapshot": snapshot, "results": rows}
+        st.session_state[_scope_key(ui_scope, "results_page")] = 0
 
-    db_search_active = (
-        author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}
-        or bool(db_search_query)
-    )
-    if author_source_mode == AUTHOR_SOURCE_OPENALEX and not db_search_query:
+    stored = st.session_state.get(state_key) or {}
+    snapshot = stored.get("snapshot") or {}
+    db_source_results = stored.get("results") or []
+    db_search_active = bool(snapshot)
+    if not db_search_active:
         st.caption("Tip: type here to show database recipients below, or switch Author Source to Database Emails.")
+    else:
+        st.caption(f"Applied database results: {len(db_source_results):,}. Draft changes wait for Search / Load.")
 
     panel_state.update({
         'results': db_source_results,
         'total': len(db_source_results),
         'active': db_search_active,
-        'query': db_search_query,
+        'query': snapshot.get("query", ""),
     })
     return panel_state
 
@@ -2197,7 +2200,7 @@ def render_search_section(filters, ui_scope: str):
         st.caption(f"Searching for: **{search_query}**")
 
     if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
-        search_button_label = "Load Database Authors"
+        search_button_label = "Use Search / Load Above"
     elif is_author_workflow and author_source_mode == AUTHOR_SOURCE_BOTH:
         search_button_label = "Search OpenAlex + Merge DB"
     else:
@@ -2211,7 +2214,8 @@ def render_search_section(filters, ui_scope: str):
             search_button_label,
             type="primary",
             use_container_width=True,
-            key=_scope_key(ui_scope, "search_openalex")
+            key=_scope_key(ui_scope, "search_openalex"),
+            disabled=is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE,
         )
     
     with col2:
@@ -2225,16 +2229,7 @@ def render_search_section(filters, ui_scope: str):
     
     # Handle search
     if search_clicked:
-        if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
-            st.session_state.app_state['search_pagination'] = {'active': False}
-            st.session_state.app_state['search_results'] = []
-            st.session_state.app_state['processed_orcids'] = set()
-            st.session_state[_scope_key(ui_scope, "filtered_authors")] = []
-            st.session_state[_scope_key(ui_scope, "results_page")] = 0
-            save_state()
-            st.success("Loaded database-source author candidates.")
-        else:
-            run_search(filters, ui_scope)
+        run_search(filters, ui_scope)
     
     # Display results (returns filtered list for email fetching)
     display_results(filters, ui_scope)
@@ -2815,7 +2810,7 @@ def display_results(filters, ui_scope: str):
     _render_bulk_job_status(ui_scope)
     
     # Get retracted author names from DB (lowercased set for fast matching)
-    retracted_names = db_storage.get_retracted_names() if db_storage.available else set()
+    retracted_names = _cached_retracted_names()
     
     # Tag each author with retraction and sent status
     for r in filtered:
@@ -3278,24 +3273,6 @@ def display_results(filters, ui_scope: str):
     
     # --- Bulk send controls ---
     filtered_with_email = [a for a in filtered if a.get('email')]
-    active_bulk_keys = (
-        db_storage.get_active_bulk_recipient_keys(filtered)
-        if db_storage.available else {"identities": set(), "emails": set()}
-    )
-    eligible_bulk_authors = prepare_bulk_recipients(
-        filtered,
-        is_already_sent=lambda recipient_id: (
-            recipient_id in sent_invitations
-            or recipient_id in active_bulk_keys["identities"]
-        ),
-        is_suppressed=lambda email, orcid_id: (
-            (email or '').strip().lower() in suppressed_keys["emails"]
-            or (orcid_id or '').strip().lower().replace('https://orcid.org/', '')
-                in suppressed_keys["orcids"]
-            or (email or '').strip().lower() in active_bulk_keys["emails"]
-        ),
-        retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
-    )
 
     st.markdown(f"**Bulk Send Settings ({_invitation_type_label(invitation_type)})**")
     bulk_template_names = get_template_names(invitation_type)
@@ -3337,7 +3314,7 @@ def display_results(filters, ui_scope: str):
     
     col_count, col_note, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_count:
-        eligible_batch_limit = min(1000, len(eligible_bulk_authors))
+        eligible_batch_limit = min(1000, len(filtered_with_email))
         default_bulk_count = eligible_batch_limit
         batch_size = st.number_input(
             "Recipients to queue",
@@ -3350,8 +3327,8 @@ def display_results(filters, ui_scope: str):
         )
     with col_note:
         st.caption(
-            f"Eligible: {len(eligible_bulk_authors):,} of {len(filtered_with_email):,} filtered authors with email. "
-            "Already invited, actively queued, suppressed, and retracted authors are skipped."
+            f"Candidates with email: {len(filtered_with_email):,}. "
+            "Live sent, queued, suppression, and retraction checks run when Bulk is clicked."
         )
 
     with col_bulk:
@@ -3372,6 +3349,17 @@ def display_results(filters, ui_scope: str):
         st.warning("Background bulk sending is disabled because PostgreSQL is not connected.")
 
     if bulk_send_clicked and batch_size > 0:
+        active_bulk_keys = db_storage.get_active_bulk_recipient_keys(filtered) if db_storage.available else {"identities": set(), "emails": set()}
+        eligible_bulk_authors = prepare_bulk_recipients(
+            filtered,
+            is_already_sent=lambda recipient_id: recipient_id in sent_invitations or recipient_id in active_bulk_keys["identities"],
+            is_suppressed=lambda email, orcid_id: (
+                (email or '').strip().lower() in suppressed_keys["emails"]
+                or (orcid_id or '').strip().lower().replace('https://orcid.org/', '') in suppressed_keys["orcids"]
+                or (email or '').strip().lower() in active_bulk_keys["emails"]
+            ),
+            retracted_names={a.get('name', '').lower() for a in filtered if a.get('is_retracted')},
+        )
         st.session_state[pending_bulk_dialog_key] = {
             'batch': [dict(author) for author in eligible_bulk_authors[:int(batch_size)]],
             'invitation_type': invitation_type,
@@ -3515,30 +3503,24 @@ def display_results(filters, ui_scope: str):
     
     st.divider()
     
-    # Export buttons
-    col1, col2 = st.columns(2)
-    with col1:
-        csv = df.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
-        st.download_button(
-            "Export CSV",
-            data=csv,
-            file_name="authors.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key=_scope_key(ui_scope, "export_csv")
-        )
-    with col2:
+    export_key = _scope_key(ui_scope, "prepared_exports")
+    export_signature = tuple(_recipient_tracking_id(row) for row in filtered)
+    if st.button("Prepare CSV Exports", key=_scope_key(ui_scope, "prepare_exports"), use_container_width=True):
         df_with_email = df[df['Email'] != '']
-        if not df_with_email.empty:
-            csv_email = df_with_email.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False)
-            st.download_button(
-                f"Export With Email ({len(df_with_email)})",
-                data=csv_email,
-                file_name="authors_with_email.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key=_scope_key(ui_scope, "export_with_email_csv")
-            )
+        st.session_state[export_key] = {
+            "all": df.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False),
+            "email": df_with_email.drop(columns=['orcid_id', 'all_topics']).to_csv(index=False),
+            "email_count": len(df_with_email),
+            "signature": export_signature,
+        }
+    prepared = st.session_state.get(export_key)
+    if prepared and prepared.get("signature") == export_signature:
+        col1, col2 = st.columns(2)
+        col1.download_button("Export CSV", prepared["all"], "authors.csv", "text/csv", use_container_width=True)
+        col2.download_button(
+            f"Export With Email ({prepared['email_count']})", prepared["email"],
+            "authors_with_email.csv", "text/csv", use_container_width=True,
+        )
 
 
 def render_invitation_section(filters):
