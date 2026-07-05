@@ -28,6 +28,16 @@ class BulkEmailWorkerCleanupTests(unittest.TestCase):
 
         self.assertEqual(worker.storage.calls, [])
 
+    def test_cleanup_explicitly_disabled(self):
+        worker = self.make_worker()
+
+        worker._suppress_after_success(
+            {"journal_config_json": '{"suppress_after_send": false}'},
+            {"id": 1, "email": "person@example.com", "orcid_id": "0000-0001"},
+        )
+
+        self.assertEqual(worker.storage.calls, [])
+
     def test_cleanup_suppresses_delivered_recipient_for_v1_job(self):
         worker = self.make_worker()
 

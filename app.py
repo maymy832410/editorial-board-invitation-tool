@@ -1416,6 +1416,16 @@ def email_dialog(author: dict, filters: dict):
     col1, col2 = st.columns(2)
     with col1:
         attach_pdf = st.checkbox("Attach PDF invitation letter", value=True, key=f"dialog_pdf_{author_key}_{invitation_type}")
+
+    suppress_after_send = st.checkbox(
+        "Suppress and purge author after successful delivery",
+        value=False,
+        key=f"dialog_suppress_after_send_{invitation_type}_{author_key}",
+        help=(
+            "When enabled, successful delivery removes this author from mailing-source records and blocks future "
+            "outreach. Unsubscribe requests remain active regardless of this setting."
+        ),
+    )
     
     # Preview PDF
     if attach_pdf:
@@ -1511,7 +1521,7 @@ def email_dialog(author: dict, filters: dict):
                         cite_score=journal_config.get('cite_score', ''),
                         quartile=journal_config.get('quartile', '')
                     )
-                    purge_requested = bool(filters.get('suppress_after_send'))
+                    purge_requested = suppress_after_send
                     purge_ok = False
                     if purge_requested and db_storage.available:
                         purge_ok = bool(db_storage.suppress_recipient(
@@ -1529,8 +1539,11 @@ def email_dialog(author: dict, filters: dict):
                         st.success(f"Email sent to {to_email}!")
                     if not db_ok:
                         st.warning("Sent status could not be saved to the database; it may not persist across sessions.")
-                    if purge_requested and db_storage.available and not purge_ok:
-                        st.warning("The email was sent, but automatic suppression and purge did not complete.")
+                    if purge_requested and not purge_ok:
+                        if db_storage.available:
+                            st.warning("The email was sent, but automatic suppression and purge did not complete.")
+                        else:
+                            st.warning("The email was sent, but automatic suppression and purge requires PostgreSQL.")
                     time.sleep(1)
                     st.rerun()
                 else:
@@ -1573,10 +1586,15 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
         f"Publisher: {_publisher_display_label(publisher_id)} | "
         f"PDF attachment: {'Yes' if bulk_attach_pdf else 'No'}"
     )
-    if bool(payload.get('suppress_after_send', True)):
+    if bool(payload.get('suppress_after_send', False)):
         st.info(
             "After each successful delivery, that recipient will be suppressed and purged from future outreach. "
             "Failed and pending recipients will remain available."
+        )
+    else:
+        st.info(
+            "Automatic suppress-and-purge is off. Successfully delivered recipients will remain in author records; "
+            "unsubscribe and manual suppression remain available."
         )
 
     col_cancel, col_confirm = st.columns(2)
@@ -2176,7 +2194,6 @@ def render_search_section(filters, ui_scope: str):
             help="Choose whether individual and bulk sends invite a publication submission or an editorial role.",
         )
         filters['invitation_type'] = invitation_type
-        filters['suppress_after_send'] = True
     else:
         invitation_type = filters.get('invitation_type', INVITATION_TYPE_EDITORIAL)
     is_author_workflow = ui_scope == WORKFLOW_AUTHOR
@@ -3337,6 +3354,17 @@ def display_results(filters, ui_scope: str):
             )
         else:
             bulk_include_cached_publications = False
+
+    bulk_suppress_after_send = st.checkbox(
+        "Suppress and purge authors after successful delivery",
+        value=False,
+        key=_scope_key(ui_scope, f"bulk_suppress_after_send_{invitation_type}"),
+        help=(
+            "Applies only to recipients successfully delivered in this batch. Failed and pending recipients remain. "
+            "Unsubscribe requests remain active regardless of this setting."
+        ),
+    )
+    filters['suppress_after_send'] = bulk_suppress_after_send
     
     col_count, col_note, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_count:
@@ -3655,6 +3683,16 @@ def render_invitation_section(filters):
     with col_opt2:
         if attach_pdf:
             st.caption("PDF will include publisher letterhead")
+
+    suppress_after_send = st.checkbox(
+        "Suppress and purge author after successful delivery",
+        value=False,
+        key=f"main_suppress_after_send_{author_key}",
+        help=(
+            "When enabled, successful delivery removes this author from mailing-source records and blocks future "
+            "outreach. Unsubscribe requests remain active regardless of this setting."
+        ),
+    )
     
     # Preview PDF
     if attach_pdf:
@@ -3746,9 +3784,28 @@ def render_invitation_section(filters):
                         email=to_email,
                         publisher=publisher_id
                     )
-                    st.success(f"Email sent to {to_email}!")
+                    purge_ok = False
+                    if suppress_after_send and db_storage.available:
+                        purge_ok = bool(db_storage.suppress_recipient(
+                            to_email,
+                            orcid_id=selected.get('orcid_id', ''),
+                            profile_key=selected.get('profile_key', ''),
+                            reason="Invitation delivered; prevent duplicate outreach",
+                            source="automatic_post_send",
+                        ))
+                        if purge_ok:
+                            _purge_local_suppressed_email(to_email)
+                    if suppress_after_send and purge_ok:
+                        st.success(f"Email sent to {to_email} and removed from future outreach!")
+                    else:
+                        st.success(f"Email sent to {to_email}!")
                     if not db_ok:
                         st.warning("Sent status could not be saved to the database; it may not persist across sessions.")
+                    if suppress_after_send and not purge_ok:
+                        if db_storage.available:
+                            st.warning("The email was sent, but automatic suppression and purge did not complete.")
+                        else:
+                            st.warning("The email was sent, but automatic suppression and purge requires PostgreSQL.")
                     if to_email != selected.get('email'):
                         st.info("Note: Email was sent to a different address; author is still marked as notified.")
                     st.rerun()

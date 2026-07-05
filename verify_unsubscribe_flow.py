@@ -69,6 +69,26 @@ def check_app_contract() -> None:
     _assert("st.stop()" in invalid_token_branch, "invalid tokens must stop before mutation")
     _assert("Manual Unsubscribe" in source, "admin manual unsubscribe tool should exist")
     _assert('source="manual_admin"' in source, "manual unsubscribe should use the shared suppression path")
+    _assert(
+        source.count("Suppress and purge author after successful delivery") >= 2,
+        "every Streamlit single-send surface should expose optional cleanup",
+    )
+    _assert(
+        "Suppress and purge authors after successful delivery" in source,
+        "Streamlit bulk sending should expose optional cleanup",
+    )
+    _assert(
+        "filters['suppress_after_send'] = True" not in source,
+        "automatic cleanup must not be forced on",
+    )
+    _assert(
+        "payload.get('suppress_after_send', False)" in source,
+        "missing batch cleanup preferences should default off",
+    )
+    _assert(
+        source.count("unsubscribe_url=_build_unsubscribe_url") >= 2,
+        "single-send paths should include unsubscribe links independently of cleanup",
+    )
 
 
 def main() -> None:
