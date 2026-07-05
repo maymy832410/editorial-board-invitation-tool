@@ -4,6 +4,7 @@ A unified tool for finding academic authors and sending editorial board invitati
 """
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -239,7 +240,7 @@ def _publisher_display_label(publisher_id: str) -> str:
     name = email_sender.get_publisher_name(publisher_id)
     email = email_sender.get_publisher_email(publisher_id)
     if name and email:
-        return f"{name} <{email}>"
+        return f"{name} — {email}"
     return name or email or publisher_id or "Unknown publisher"
 
 
@@ -1567,8 +1568,8 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
         f"The worker will send them in the background, so the browser can be closed."
     )
     st.caption(
-        f"Sample recipient: {sample_author.get('name', 'Author')} "
-        f"<{sample_author.get('email', '')}> | Template: {template_name} | "
+        f"Sample recipient: {sample_author.get('name', 'Author')} — "
+        f"{sample_author.get('email', '')} | Template: {template_name} | "
         f"Publisher: {_publisher_display_label(publisher_id)} | "
         f"PDF attachment: {'Yes' if bulk_attach_pdf else 'No'}"
     )
@@ -4036,8 +4037,8 @@ def main():
     """, unsafe_allow_html=True)
 
     db_ok = bool(db_storage.available)
-    journal = st.session_state.app_state.get('journal_config', {}).get('name') or "No journal selected"
-    publisher = _publisher_display_label(st.session_state.app_state.get('publisher', 'brevo'))
+    journal = html.escape(st.session_state.app_state.get('journal_config', {}).get('name') or "No journal selected")
+    publisher = html.escape(_publisher_display_label(st.session_state.app_state.get('publisher', 'brevo')))
     active_jobs = []
     if db_ok:
         active_jobs = [job for job in db_storage.get_recent_bulk_email_jobs(limit=25)
