@@ -1562,6 +1562,11 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
         f"Publisher: {_publisher_display_label(publisher_id)} | "
         f"PDF attachment: {'Yes' if bulk_attach_pdf else 'No'}"
     )
+    if bool(payload.get('suppress_after_send', True)):
+        st.info(
+            "After each successful delivery, that recipient will be suppressed and purged from future outreach. "
+            "Failed and pending recipients will remain available."
+        )
 
     col_cancel, col_confirm = st.columns(2)
     with col_cancel:
@@ -1583,7 +1588,7 @@ def render_sidebar():
     """Render the sidebar with all configuration options."""
     
     with st.sidebar:
-        st.title("Configuration")
+        st.title("Settings")
         
         # Database Status Indicator
         db_status = db_storage.get_status()
@@ -2151,6 +2156,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
 def render_search_section(filters, ui_scope: str):
     """Render the search and results section."""
     if ui_scope == WORKFLOW_AUTHOR:
+        st.subheader("1. Invitation Purpose")
         invitation_type = st.selectbox(
             "Invitation Purpose",
             options=[INVITATION_TYPE_PUBLICATION, INVITATION_TYPE_EDITORIAL],
@@ -2183,7 +2189,7 @@ def render_search_section(filters, ui_scope: str):
         filters['database_email_panel'] = render_database_email_search_panel(filters, ui_scope, author_source_mode)
         st.divider()
 
-    st.header("Search Authors")
+    st.header("2. Filters")
     st.caption(f"Active workflow: {_invitation_type_label(invitation_type)}")
     if is_author_workflow:
         st.caption(f"Source mode: {_author_source_label(author_source_mode)}")
@@ -2807,7 +2813,9 @@ def display_results(filters, ui_scope: str):
             _sync_current_batch_cache()
         save_state()
     
-    _render_bulk_job_status(ui_scope)
+    if st.session_state.get('last_bulk_enqueue_result'):
+        message = st.session_state.pop('last_bulk_enqueue_result')
+        st.toast(message, icon="✅" if message.startswith("Queued") else "⚠️")
     
     # Get retracted author names from DB (lowercased set for fast matching)
     retracted_names = _cached_retracted_names()
@@ -3126,7 +3134,7 @@ def display_results(filters, ui_scope: str):
     st.divider()
 
     # Results table with Send buttons
-    st.subheader(f"Authors ({len(filtered)})")
+    st.subheader(f"3. Results ({len(filtered):,})")
 
     if not filtered:
         st.info(empty_results_message or "No authors match the current filters.")
@@ -3274,7 +3282,8 @@ def display_results(filters, ui_scope: str):
     # --- Bulk send controls ---
     filtered_with_email = [a for a in filtered if a.get('email')]
 
-    st.markdown(f"**Bulk Send Settings ({_invitation_type_label(invitation_type)})**")
+    st.subheader("4. Review & Queue")
+    st.caption(f"Bulk settings for {_invitation_type_label(invitation_type)}")
     bulk_template_names = get_template_names(invitation_type)
     bulk_col1, bulk_col2, bulk_col3 = st.columns([1.4, 1.4, 1.2])
     with bulk_col1:
@@ -3993,18 +4002,56 @@ def render_collection_panel():
 
 def main():
     """Main app entry point."""
-    
-    st.title("Editorial And Author Invitation Tool")
-    st.caption("Find academic authors and send separate author or editorial invitations")
+
+    st.markdown("""
+    <style>
+      .block-container {max-width: 1480px; padding-top: 1.25rem; padding-bottom: 5rem;}
+      [data-testid="stSidebar"] {border-right: 1px solid #e5e7eb;}
+      .app-header {padding: 1rem 1.25rem; border: 1px solid #e5e7eb; border-radius: 14px;
+        background: #fff; margin-bottom: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.03);}
+      .app-title {font-size: 1.45rem; font-weight: 700; color: #111827; margin: 0;}
+      .app-subtitle {color: #6b7280; margin-top: .2rem;}
+      .workflow-steps {display:flex; gap:.5rem; margin:.5rem 0 1rem; flex-wrap:wrap;}
+      .workflow-step {border:1px solid #d1d5db; border-radius:999px; padding:.35rem .75rem;
+        color:#374151; background:#f9fafb; font-size:.86rem;}
+      div[data-testid="stMetric"] {border:1px solid #e5e7eb; border-radius:12px; padding:.65rem; background:#fff;}
+      div[data-testid="stForm"] {border:1px solid #e5e7eb; border-radius:14px; padding:1rem; background:#fff;}
+    </style>
+    """, unsafe_allow_html=True)
+
+    db_ok = bool(db_storage.available)
+    journal = st.session_state.app_state.get('journal_config', {}).get('name') or "No journal selected"
+    publisher = _publisher_display_label(st.session_state.app_state.get('publisher', 'brevo'))
+    active_jobs = []
+    if db_ok:
+        active_jobs = [job for job in db_storage.get_recent_bulk_email_jobs(limit=25)
+                       if job.get('status') in {BULK_JOB_STATUS_QUEUED, BULK_JOB_STATUS_RUNNING}]
+    head_main, head_jobs = st.columns([5, 1])
+    with head_main:
+        st.markdown(
+            f'<div class="app-header"><div class="app-title">Author Outreach</div>'
+            f'<div class="app-subtitle">{journal} &nbsp;·&nbsp; {publisher} &nbsp;·&nbsp; '
+            f'{"Database connected" if db_ok else "Database offline"}</div></div>',
+            unsafe_allow_html=True,
+        )
+    with head_jobs:
+        with st.popover(f"Jobs ({len(active_jobs)})", use_container_width=True):
+            if not active_jobs:
+                st.caption("No active background jobs.")
+            for job in active_jobs[:5]:
+                total = int(job.get('total_count') or 0)
+                done = int(job.get('sent_count') or 0) + int(job.get('failed_count') or 0) + int(job.get('skipped_count') or 0)
+                st.progress(done / total if total else 0, text=f"Job #{job.get('id')} · {done}/{total}")
+                if job.get('last_error'):
+                    st.caption(job.get('last_error'))
+                if st.button("Cancel", key=f"header_cancel_job_{job.get('id')}", use_container_width=True):
+                    db_storage.cancel_bulk_email_job(int(job.get('id')))
+                    st.rerun()
     
     # Render sidebar and get filters
     shared_filters = render_sidebar()
 
-    views = [
-        _workflow_label(WORKFLOW_AUTHOR),
-        _workflow_label(WORKFLOW_EDITORIAL),
-        "📥 Collection",
-    ]
+    views = ["Author Outreach", "Jobs", "Collection", "Settings"]
     active_view = st.radio(
         "Workspace",
         options=views,
@@ -4013,18 +4060,24 @@ def main():
         label_visibility="collapsed",
     )
 
-    if active_view == views[0]:
-        st.caption("Publication-submission or editorial-role invitations with scientific-domain targeting.")
+    if active_view == "Author Outreach":
+        st.markdown(
+            '<div class="workflow-steps"><span class="workflow-step">1 · Purpose</span>'
+            '<span class="workflow-step">2 · Filters</span><span class="workflow-step">3 · Results</span>'
+            '<span class="workflow-step">4 · Review & Queue</span></div>', unsafe_allow_html=True,
+        )
         author_filters = dict(shared_filters)
         author_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_AUTHOR)
         render_search_section(author_filters, WORKFLOW_AUTHOR)
-    elif active_view == views[1]:
-        st.caption("Editorial board-role invitations with editorial templates.")
-        editorial_filters = dict(shared_filters)
-        editorial_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_EDITORIAL)
-        render_search_section(editorial_filters, WORKFLOW_EDITORIAL)
-    else:
+    elif active_view == "Jobs":
+        st.header("Background Jobs")
+        st.caption("Monitor active sends, review completed work, and cancel queued jobs.")
+        _render_bulk_job_status("jobs_workspace")
+    elif active_view == "Collection":
         render_collection_panel()
+    else:
+        st.header("Settings")
+        st.info("Journal presets, publisher credentials, imports, suppression tools, and advanced configuration are available in the Settings sidebar.")
 
 
 if __name__ == "__main__":
