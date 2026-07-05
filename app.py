@@ -447,6 +447,10 @@ def _load_author_source_rows_from_db(limit: int) -> list[dict]:
             break
 
     mapped_rows = [_map_db_profile_row_to_author(row) for row in rows]
+    country_map = db_storage.get_author_countries([row.get('orcid_id', '') for row in mapped_rows])
+    for row in mapped_rows:
+        if not row.get('country'):
+            row['country'] = country_map.get(row.get('orcid_id', ''), '')
     return [row for row in mapped_rows if row.get('orcid_id') and row.get('email')]
 
 
@@ -470,7 +474,13 @@ def _search_database_email_rows(
         hide_suppressed=hide_suppressed,
         countries=list(countries),
     )
-    return [_map_database_email_row_to_author(row) for row in rows]
+    mapped_rows = [_map_database_email_row_to_author(row) for row in rows]
+    missing = [row.get('orcid_id', '') for row in mapped_rows if row.get('orcid_id') and not row.get('country')]
+    country_map = db_storage.get_author_countries(missing)
+    for row in mapped_rows:
+        if not row.get('country'):
+            row['country'] = country_map.get(row.get('orcid_id', ''), '')
+    return mapped_rows
 
 
 def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict]) -> list[dict]:
@@ -2940,31 +2950,37 @@ def display_results(filters, ui_scope: str):
         f"Matched before other filters: {matched_before_other_filters:,}"
     )
     
-    # Country exclusion post-filter (supplements API-level exclusion)
+    # Country post-filters. Inclusion wins if a code is selected in both lists.
     all_countries = sorted({r.get('country') for r in results if r.get('country')})
     if all_countries:
-        # Reverse-map codes to names for display
         code_to_name = {v: k for k, v in COUNTRIES.items()}
         country_options = [f"{code_to_name.get(c, c)} ({c})" for c in all_countries]
-        excluded_display = st.multiselect(
-            "Exclude Countries (post-filter)",
-            options=country_options,
-            default=[],
-            key=_scope_key(ui_scope, "exclude_countries_postfilter"),
-            help="Exclude authors from these countries in the results below"
-        )
-        if excluded_display:
-            excluded_codes = {opt.split("(")[-1].rstrip(")") for opt in excluded_display}
+        country_col1, country_col2 = st.columns(2)
+        with country_col1:
+            included_display = st.multiselect(
+                "Include Countries (post-filter)", options=country_options, default=[],
+                key=_scope_key(ui_scope, "include_countries_postfilter"),
+                help="Show authors from any selected country. Leave empty to include all."
+            )
+        with country_col2:
+            excluded_display = st.multiselect(
+                "Exclude Countries (post-filter)", options=country_options, default=[],
+                key=_scope_key(ui_scope, "exclude_countries_postfilter"),
+                help="Hide authors from these countries. Inclusion takes priority."
+            )
+        included_codes = {opt.split("(")[-1].rstrip(")") for opt in included_display}
+        excluded_codes = {
+            opt.split("(")[-1].rstrip(")") for opt in excluded_display
+            if opt.split("(")[-1].rstrip(")") not in included_codes
+        }
+        if included_codes:
+            filtered = [r for r in filtered if r.get('country') in included_codes]
+        if excluded_codes:
             filtered = [r for r in filtered if r.get('country') not in excluded_codes]
     else:
-        st.multiselect(
-            "Exclude Countries (post-filter)",
-            options=[],
-            default=[],
-            key=_scope_key(ui_scope, "exclude_countries_postfilter"),
-            help="Exclude authors from these countries in the results below",
-            disabled=True,
-        )
+        empty_country1, empty_country2 = st.columns(2)
+        empty_country1.multiselect("Include Countries (post-filter)", [], key=_scope_key(ui_scope, "include_countries_postfilter"), disabled=True)
+        empty_country2.multiselect("Exclude Countries (post-filter)", [], key=_scope_key(ui_scope, "exclude_countries_postfilter"), disabled=True)
         st.caption("Load or search authors to populate country filter options.")
 
     # Scientific-domain targeting filters (for example Computer Science, Biology).

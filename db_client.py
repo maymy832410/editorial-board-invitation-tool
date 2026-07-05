@@ -1572,6 +1572,27 @@ class PostgresStorage:
         if not self.available:
             return 0
 
+    def get_author_countries(self, orcid_ids: List[str]) -> Dict[str, str]:
+        """Return the latest known country per ORCID in one indexed query."""
+        cleaned = sorted({(value or "").strip() for value in orcid_ids if (value or "").strip()})
+        if not self.available or not cleaned:
+            return {}
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT ON (orcid_id) orcid_id, country
+                    FROM {self.HARVESTED_AUTHORS_TABLE}
+                    WHERE orcid_id = ANY(%s) AND COALESCE(country, '') <> ''
+                    ORDER BY orcid_id, updated_at DESC;
+                    """,
+                    (cleaned,),
+                )
+                return {row["orcid_id"]: row["country"] for row in cur.fetchall()}
+        except Exception as e:
+            print(f"PostgreSQL author country lookup error: {e}")
+            return {}
+
         try:
             with self._get_cursor() as cur:
                 cur.execute(
