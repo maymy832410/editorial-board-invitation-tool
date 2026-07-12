@@ -516,6 +516,7 @@ class OpenAlexClient:
         
         return {
             "author_id": author.get("id"),
+            "openalex_id": author.get("id"),
             "name": author.get("display_name"),
             "orcid_id": orcid_id,
             "orcid_url": orcid_url,
@@ -528,6 +529,7 @@ class OpenAlexClient:
             "specialty": specialty,
             "subfield": subfield,
             "all_topics": all_topics,
+            "_topics": topics,
             "research_areas": ", ".join(top_topics) if top_topics else None,
         }
     

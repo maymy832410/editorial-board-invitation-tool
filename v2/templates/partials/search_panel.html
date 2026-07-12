@@ -49,7 +49,7 @@
         <div class="search-row">
             <div class="search-field">
                 <label>Keyword Tags</label>
-                <textarea id="keywords" class="form-input" rows="2"
+                <textarea id="keywords" name="keywords" class="form-input" rows="2"
                           placeholder="One keyword per line, e.g.&#10;machine learning&#10;deep learning&#10;neural networks"></textarea>
             </div>
             <div class="search-actions">
@@ -66,26 +66,26 @@
         <div class="filter-row">
             <div class="filter-group">
                 <label>H-Index Min</label>
-                <input type="number" id="h-index-min" value="{{ h_index_min }}" min="0" max="500" class="form-input form-input-sm">
+                <input type="number" id="h-index-min" name="h_index_min" value="{{ h_index_min }}" min="0" max="500" class="form-input form-input-sm">
             </div>
             <div class="filter-group">
                 <label>H-Index Max</label>
-                <input type="number" id="h-index-max" value="{{ h_index_max }}" min="0" max="500" class="form-input form-input-sm">
+                <input type="number" id="h-index-max" name="h_index_max" value="{{ h_index_max }}" min="0" max="500" class="form-input form-input-sm">
             </div>
             <div class="filter-group">
                 <label>Max Results</label>
-                <input type="number" id="max-results" value="{{ max_results }}" min="10" max="100000" class="form-input form-input-sm">
+                <input type="number" id="max-results" name="max_results" value="{{ max_results }}" min="10" max="100000" class="form-input form-input-sm">
             </div>
             <div class="filter-group">
                 <label>Jump Size</label>
-                <input type="number" id="jump-size" value="{{ jump_size }}" min="100" max="1000" class="form-input form-input-sm">
+                <input type="number" id="jump-size" name="jump_size" value="{{ jump_size }}" min="100" max="1000" class="form-input form-input-sm">
             </div>
         </div>
 
         <div class="filter-row">
             <div class="filter-group filter-wide">
                 <label>Exclude Countries</label>
-                <select id="countries-exclude" class="form-input form-input-sm" multiple size="3">
+                <select id="countries-exclude" name="countries_exclude" class="form-input form-input-sm" multiple size="3">
                     {% for country in countries %}
                     <option value="{{ country }}">{{ country }}</option>
                     {% endfor %}
@@ -93,7 +93,7 @@
             </div>
             <div class="filter-group filter-wide">
                 <label>Disciplines</label>
-                <select id="disciplines-select" class="form-input form-input-sm" multiple size="3">
+                <select id="disciplines-select" name="disciplines" class="form-input form-input-sm" multiple size="3">
                     {% for discipline in disciplines %}
                     <option value="{{ discipline }}">{{ discipline }}</option>
                     {% endfor %}

@@ -19,6 +19,9 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 # Add parent directory to path so we can reuse existing modules.
 # Use append (not insert at 0) to avoid shadowing the v2 app module.
 PARENT_DIR = Path(__file__).parent.parent
+V2_DIR = Path(__file__).parent
+if str(V2_DIR) not in sys.path:
+    sys.path.append(str(V2_DIR))
 if str(PARENT_DIR) not in sys.path:
     sys.path.append(str(PARENT_DIR))
 
@@ -158,6 +161,60 @@ def render_template(name: str, context: dict) -> HTMLResponse:
     return HTMLResponse(content=template.render(context))
 
 
+def _form_values(form, name: str) -> list[str]:
+    """Read repeated or comma-separated form values from an HTMX form."""
+    values: list[str] = []
+    if hasattr(form, "getlist"):
+        raw_values = form.getlist(name)
+    else:
+        raw = form.get(name, [])
+        raw_values = raw if isinstance(raw, list) else [raw]
+    for raw in raw_values:
+        for part in str(raw or "").split(","):
+            value = part.strip()
+            if value:
+                values.append(value)
+    return values
+
+
+def _country_codes(values: list[str]) -> list[str]:
+    """Normalize submitted country names or codes to OpenAlex country codes."""
+    valid_codes = set(COUNTRIES.values())
+    codes: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        code = COUNTRIES.get(text, text.upper())
+        if code in valid_codes and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _keyword_list(value: str) -> list[str]:
+    return [k.strip() for k in str(value or "").replace("\n", ",").split(",") if k.strip()]
+
+
+def _normalize_openalex_authors(authors: list[dict]) -> list[dict]:
+    """Ensure author records expose both legacy and v2 OpenAlex ID keys."""
+    for author in authors:
+        openalex_id = (author.get("openalex_id") or author.get("author_id") or "").strip()
+        if openalex_id:
+            author["openalex_id"] = openalex_id
+            author["author_id"] = openalex_id
+    return authors
+
+
+def _json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    try:
+        loaded = json.loads(value or "[]")
+        return loaded if isinstance(loaded, list) else []
+    except Exception:
+        return []
+
+
 # ── Session middleware ─────────────────────────────────────────────
 def get_or_create_session(request: Request, response: Response) -> SessionData:
     """Get existing session or create a new one."""
@@ -242,35 +299,36 @@ async def search_page(request: Request, response: Response):
 async def search_openalex(
     request: Request,
     response: Response,
-    keywords: str = Form(""),
-    h_index_min: int = Form(DEFAULT_H_INDEX_MIN),
-    h_index_max: int = Form(DEFAULT_H_INDEX_MAX),
-    countries_exclude: str = Form(""),
-    disciplines: str = Form(""),
-    max_results: int = Form(DEFAULT_MAX_RESULTS),
-    jump_size: int = Form(250),
-    batch_offset: int = Form(0),
 ):
     """Search OpenAlex for authors."""
     sd = get_or_create_session(request, response)
     db = get_db()
+    form = await request.form()
 
-    # Parse multi-value form fields
-    exclude_countries = [c for c in countries_exclude.split(",") if c] if countries_exclude else []
-    selected_disciplines = [d for d in disciplines.split(",") if d] if disciplines else []
+    keywords = str(form.get("keywords") or "")
+    h_index_min = int(form.get("h_index_min") or DEFAULT_H_INDEX_MIN)
+    h_index_max = int(form.get("h_index_max") or DEFAULT_H_INDEX_MAX)
+    max_results = int(form.get("max_results") or DEFAULT_MAX_RESULTS)
+    jump_size = int(form.get("jump_size") or 250)
+    batch_offset = int(form.get("batch_offset") or 0)
+    exclude_countries = _country_codes(_form_values(form, "countries_exclude"))
+    selected_disciplines = _form_values(form, "disciplines")
 
     # Resolve keywords to topics
     client = OpenAlexClient()
     try:
-        topic_ids = client.search_topics(keywords) if keywords else []
-    except OpenAlexRequestError:
+        topic_ids, _topic_details = client.search_topics(_keyword_list(keywords)) if keywords else ([], [])
+    except Exception:
         return render_template("partials/error_message.html", {
             "request": request,
             "message": "Failed to resolve keywords to topics. Check your connection.",
         })
 
     # Build batch key for caching
-    batch_key = f"oa:{','.join(sorted(topic_ids))}:{h_index_min}:{h_index_max}:{jump_size}"
+    batch_key = (
+        f"oa:{','.join(sorted(topic_ids))}:{h_index_min}:{h_index_max}:"
+        f"{','.join(sorted(exclude_countries))}:{','.join(sorted(selected_disciplines))}:{jump_size}"
+    )
 
     # Load cached batches or start fresh
     batch_cache = sd.search_batch_cache
@@ -282,17 +340,22 @@ async def search_openalex(
     # If requesting a batch we don't have yet, fetch it
     if batch_offset >= len(cache["batches"]):
         try:
-            authors, next_cursor = client.load_authors_batch(
+            batch = client.fetch_author_batch(
                 topic_ids=topic_ids,
                 h_index_min=h_index_min,
                 h_index_max=h_index_max,
-                cursor=cache["checkpoints"].get(str(batch_offset)),
-                limit=jump_size,
+                exclude_country_codes=exclude_countries or None,
+                require_orcid=True,
+                cursor=cache["checkpoints"].get(str(batch_offset), "*"),
+                batch_size=jump_size,
+                batch_index=batch_offset,
             )
+            authors = _normalize_openalex_authors(batch.get("results", []))
+            next_cursor = batch.get("next_cursor")
             cache["batches"].append(authors)
             if next_cursor:
                 cache["checkpoints"][str(batch_offset + 1)] = next_cursor
-        except OpenAlexRequestError as e:
+        except Exception as e:
             return render_template("partials/error_message.html", {
                 "request": request,
                 "message": f"OpenAlex API error: {str(e)}",
@@ -316,23 +379,32 @@ async def search_openalex(
 
     # Deduplicate
     current_batch = dedupe_authors(current_batch)
+    sd.search_results = current_batch
+    sd.search_params = {
+        "h_index_min": h_index_min,
+        "h_index_max": h_index_max,
+        "max_results": max_results,
+        "jump_size": jump_size,
+    }
 
     # Save batch cache
     sd.search_batch_cache = batch_cache
     sd.save()
 
     total_estimate = cache.get("total_estimate")
-    if total_estimate is None and topic_ids:
+    if total_estimate is None:
         try:
-            total_estimate = client.count_authors(
+            total_estimate = client.get_total_count(
                 topic_ids=topic_ids,
                 h_index_min=h_index_min,
                 h_index_max=h_index_max,
+                exclude_country_codes=exclude_countries or None,
+                require_orcid=True,
             )
             cache["total_estimate"] = total_estimate
             sd.search_batch_cache = batch_cache
             sd.save()
-        except OpenAlexRequestError:
+        except Exception:
             pass
 
     return render_template("partials/results_table.html", {
@@ -393,37 +465,37 @@ async def search_database(
 async def search_both(
     request: Request,
     response: Response,
-    keywords: str = Form(""),
-    h_index_min: int = Form(DEFAULT_H_INDEX_MIN),
-    h_index_max: int = Form(DEFAULT_H_INDEX_MAX),
-    countries_exclude: str = Form(""),
-    disciplines: str = Form(""),
-    max_results: int = Form(DEFAULT_MAX_RESULTS),
-    jump_size: int = Form(250),
-    batch_offset: int = Form(0),
 ):
     """Search both OpenAlex and Database, merge results."""
     sd = get_or_create_session(request, response)
     db = get_db()
+    form = await request.form()
+
+    keywords = str(form.get("keywords") or "")
+    h_index_min = int(form.get("h_index_min") or DEFAULT_H_INDEX_MIN)
+    h_index_max = int(form.get("h_index_max") or DEFAULT_H_INDEX_MAX)
+    jump_size = int(form.get("jump_size") or 250)
 
     # Get OpenAlex results
     oa_authors = []
-    exclude_countries = [c for c in countries_exclude.split(",") if c] if countries_exclude else []
-    selected_disciplines = [d for d in disciplines.split(",") if d] if disciplines else []
+    exclude_countries = _country_codes(_form_values(form, "countries_exclude"))
+    selected_disciplines = _form_values(form, "disciplines")
 
     client = OpenAlexClient()
     try:
-        topic_ids = client.search_topics(keywords) if keywords else []
-        if topic_ids:
-            authors, _ = client.load_authors_batch(
-                topic_ids=topic_ids,
-                h_index_min=h_index_min,
-                h_index_max=h_index_max,
-                limit=jump_size,
-            )
-            categorize_authors(authors)
-            oa_authors = authors
-    except OpenAlexRequestError:
+        topic_ids, _topic_details = client.search_topics(_keyword_list(keywords)) if keywords else ([], [])
+        batch = client.fetch_author_batch(
+            topic_ids=topic_ids,
+            h_index_min=h_index_min,
+            h_index_max=h_index_max,
+            exclude_country_codes=exclude_countries or None,
+            require_orcid=True,
+            batch_size=jump_size,
+        )
+        authors = _normalize_openalex_authors(batch.get("results", []))
+        categorize_authors(authors)
+        oa_authors = authors
+    except Exception:
         pass
 
     # Get database results
@@ -490,7 +562,7 @@ async def get_results_batch(
             "message": "Batch not available yet. Use 'Next' to load more.",
         })
 
-    authors = cache["batches"][batch_offset]
+    authors = _normalize_openalex_authors(cache["batches"][batch_offset])
     categorize_authors(authors)
     authors = dedupe_authors(authors)
 
@@ -884,39 +956,29 @@ async def collection_panel(request: Request, response: Response):
     db = get_db()
 
     run_status = {"status": "unknown", "collected_today": 0, "attempts_today": 0,
-                  "queue_pending": 0, "total_collected": 0}
+                  "queue_pending": 0, "total_collected": 0, "config": {}}
 
     if db.available:
-        with db._get_cursor() as cur:
-            cur.execute("""
-                SELECT status, keyword_tags, disciplines_json, specialties_json,
-                       exclude_countries_json, h_index_min, h_index_max,
-                       baseline_concurrency, baseline_delay
-                FROM collection_runs
-                LIMIT 1
-            """)
-            row = cur.fetchone()
-            if row:
-                import json as _json
-                run_status["status"] = row[0] or "idle"
-                run_status["config"] = {
-                    "keywords": row[1] or "",
-                    "disciplines": _json.loads(row[2] or "[]"),
-                    "specialty_terms": _json.loads(row[3] or "[]"),
-                    "exclude_countries": _json.loads(row[4] or "[]"),
-                    "h_index_min": row[5] or 10,
-                    "h_index_max": row[6] or 50,
-                    "baseline_concurrency": row[7] or 2,
-                    "baseline_delay_sec": row[8] or 3.0,
-                }
-
-            cur.execute("SELECT COUNT(*) FROM harvested_authors WHERE email_status = 'found'")
-            r = cur.fetchone()
-            run_status["total_collected"] = r[0] if r else 0
-
-            cur.execute("SELECT COUNT(*) FROM harvested_authors WHERE email_status = 'pending'")
-            r = cur.fetchone()
-            run_status["queue_pending"] = r[0] if r else 0
+        summary = db.get_collection_summary()
+        run = summary.get("run") or {}
+        run_status.update({
+            "status": run.get("status") or RUN_STATUS_IDLE,
+            "queue_pending": summary.get("queue_pending", 0),
+            "total_collected": summary.get("total_collected", 0),
+            "collected_today": summary.get("emails_found_today", 0),
+            "attempts_today": summary.get("attempts_today", 0),
+            "config": {
+                "keywords": run.get("keyword_tags") or "",
+                "disciplines": _json_list(run.get("disciplines_json")),
+                "specialty_terms": _json_list(run.get("specialties_json")),
+                "exclude_countries": _json_list(run.get("exclude_countries_json")),
+                "topic_ids": _json_list(run.get("selected_topic_ids_json")) or _json_list(run.get("topic_ids_json")),
+                "h_index_min": run.get("h_index_min") or DEFAULT_H_INDEX_MIN,
+                "h_index_max": run.get("h_index_max") or DEFAULT_H_INDEX_MAX,
+                "baseline_concurrency": run.get("baseline_concurrency") or 2,
+                "baseline_delay_sec": run.get("baseline_delay") or 3.0,
+            },
+        })
 
     return render_template("collection.html", {
         "request": request,
@@ -933,11 +995,23 @@ async def collection_start(request: Request, response: Response):
     db = get_db()
 
     if db.available:
-        with db._get_cursor() as cur:
-            cur.execute("UPDATE collection_runs SET status = %s", (RUN_STATUS_ACTIVE,))
-            if cur.rowcount == 0:
-                cur.execute("INSERT INTO collection_runs (status, config) VALUES (%s, %s)",
-                           (RUN_STATUS_ACTIVE, json.dumps({})))
+        run = db.get_or_create_run() or {}
+        config = {
+            "disciplines": _json_list(run.get("disciplines_json")),
+            "specialties": _json_list(run.get("specialties_json")),
+            "exclude_countries": _json_list(run.get("exclude_countries_json")),
+            "keyword_tags": run.get("keyword_tags") or "",
+            "topic_ids": _json_list(run.get("selected_topic_ids_json")) or _json_list(run.get("topic_ids_json")),
+            "h_index_min": int(run.get("h_index_min") or DEFAULT_H_INDEX_MIN),
+            "h_index_max": int(run.get("h_index_max") or DEFAULT_H_INDEX_MAX),
+        }
+        activated = db.activate_collection_search(
+            config,
+            baseline_concurrency=int(run.get("baseline_concurrency") or 2),
+            baseline_delay=float(run.get("baseline_delay") or 3.0),
+        )
+        if not activated:
+            return JSONResponse({"ok": False, "message": "Could not start collection"}, status_code=500)
 
     return JSONResponse({"ok": True, "message": "Collection started"})
 
@@ -949,8 +1023,7 @@ async def collection_pause(request: Request, response: Response):
     db = get_db()
 
     if db.available:
-        with db._get_cursor() as cur:
-            cur.execute("UPDATE collection_runs SET status = %s", (RUN_STATUS_PAUSED,))
+        db.set_run_status(RUN_STATUS_PAUSED)
 
     return JSONResponse({"ok": True, "message": "Collection paused"})
 
@@ -962,8 +1035,7 @@ async def collection_stop(request: Request, response: Response):
     db = get_db()
 
     if db.available:
-        with db._get_cursor() as cur:
-            cur.execute("UPDATE collection_runs SET status = %s", (RUN_STATUS_STOPPED_TODAY,))
+        db.set_run_status(RUN_STATUS_STOPPED_TODAY)
 
     return JSONResponse({"ok": True, "message": "Collection stopped for today"})
 
@@ -985,46 +1057,23 @@ async def collection_save_config(
     sd = get_or_create_session(request, response)
     db = get_db()
 
-    config = {
-        "keywords": keywords,
-        "disciplines": [d for d in disciplines.split(",") if d],
-        "specialty_terms": [s.strip() for s in specialty_terms.split(",") if s.strip()],
-        "h_index_min": h_index_min,
-        "h_index_max": h_index_max,
-        "exclude_countries": [c for c in exclude_countries.split(",") if c],
-        "baseline_concurrency": baseline_concurrency,
-        "baseline_delay_sec": baseline_delay,
-    }
-
+    discipline_list = [d.strip() for d in disciplines.split(",") if d.strip()]
+    specialty_list = [s.strip() for s in specialty_terms.split(",") if s.strip()]
+    exclude_codes = _country_codes([c.strip() for c in exclude_countries.split(",") if c.strip()])
     if db.available:
-        with db._get_cursor() as cur:
-            cur.execute("SELECT id FROM collection_runs LIMIT 1")
-            row = cur.fetchone()
-            disciplines_json = json.dumps([d for d in disciplines.split(",") if d])
-            specialties_json = json.dumps([s.strip() for s in specialty_terms.split(",") if s.strip()])
-            exclude_countries_json = json.dumps([c for c in exclude_countries.split(",") if c])
-            if row:
-                cur.execute("""
-                    UPDATE collection_runs SET 
-                        keyword_tags = %s,
-                        disciplines_json = %s,
-                        specialties_json = %s,
-                        exclude_countries_json = %s,
-                        h_index_min = %s,
-                        h_index_max = %s,
-                        baseline_concurrency = %s,
-                        baseline_delay = %s
-                    WHERE id = %s
-                """, (keywords, disciplines_json, specialties_json, exclude_countries_json,
-                      h_index_min, h_index_max, baseline_concurrency, baseline_delay, row[0]))
-            else:
-                cur.execute("""
-                    INSERT INTO collection_runs (id, status, keyword_tags, disciplines_json,
-                        specialties_json, exclude_countries_json, h_index_min, h_index_max,
-                        baseline_concurrency, baseline_delay)
-                    VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (RUN_STATUS_IDLE, keywords, disciplines_json, specialties_json,
-                      exclude_countries_json, h_index_min, h_index_max, baseline_concurrency, baseline_delay))
+        saved = db.set_run_config(
+            disciplines=discipline_list,
+            specialties=specialty_list,
+            exclude_countries=exclude_codes,
+            keyword_tags=keywords.strip(),
+            topic_ids=[],
+            h_index_min=h_index_min,
+            h_index_max=h_index_max,
+            baseline_concurrency=baseline_concurrency,
+            baseline_delay=baseline_delay,
+        )
+        if not saved:
+            return JSONResponse({"ok": False, "message": "Could not save collection config"}, status_code=500)
 
     return JSONResponse({"ok": True, "message": "Collection config saved"})
 
@@ -1378,11 +1427,11 @@ def _find_author_in_session(sd: SessionData, orcid_id: str) -> Optional[dict]:
             row = cur.fetchone()
             if row:
                 return {
-                    "orcid_id": row[0],
-                    "name": row[1],
-                    "email": row[2],
-                    "openalex_id": row[3],
-                    "scientific_domain": row[4],
+                    "orcid_id": row.get("orcid_id"),
+                    "name": row.get("author_name"),
+                    "email": row.get("email"),
+                    "openalex_id": row.get("openalex_id"),
+                    "scientific_domain": row.get("scientific_domain"),
                 }
 
     return None
@@ -1407,10 +1456,10 @@ def _hydrate_emails_from_db(db: PostgresStorage, authors: list) -> list:
 
         profile_map = {}
         for row in cur.fetchall():
-            profile_map[row[0]] = {
-                "email": row[1],
-                "scientific_domain": row[2],
-                "scientific_domains_json": row[3],
+            profile_map[row.get("orcid_id")] = {
+                "email": row.get("email"),
+                "scientific_domain": row.get("scientific_domain"),
+                "scientific_domains_json": row.get("scientific_domains_json"),
             }
 
     for author in authors:
@@ -1459,20 +1508,20 @@ def _search_database_email_rows(
             cur.execute(sql, params)
             for row in cur.fetchall():
                 authors.append({
-                    "orcid_id": row[0],
-                    "name": row[1],
-                    "email": row[2],
-                    "openalex_id": row[3],
-                    "scientific_domain": row[4],
-                    "affiliation": row[6],
-                    "country": row[7],
-                    "h_index": row[8],
+                    "orcid_id": row.get("orcid_id"),
+                    "name": row.get("author_name"),
+                    "email": row.get("email"),
+                    "openalex_id": row.get("openalex_id"),
+                    "scientific_domain": row.get("scientific_domain"),
+                    "affiliation": row.get("affiliation"),
+                    "country": row.get("country"),
+                    "h_index": row.get("h_index"),
                     "source": "database",
                 })
 
         if source in ("all", "harvested"):
             sql = """
-                SELECT orcid_id, author_name, email, openalex_id, affiliation, country
+                SELECT orcid_id, author_name, email, openalex_id, institution, country
                 FROM harvested_authors
                 WHERE email_status = 'found' AND email IS NOT NULL AND email <> ''
             """
@@ -1483,17 +1532,17 @@ def _search_database_email_rows(
                     LOWER(email) LIKE LOWER(%s)
                 )"""
                 like_query = f"%{query}%"
-                params = [like_query] * 5
+                params = [like_query] * 2
 
             cur.execute(sql, params)
             for row in cur.fetchall():
                 authors.append({
-                    "orcid_id": row[0],
-                    "name": row[1],
-                    "email": row[2],
-                    "openalex_id": row[3],
-                    "affiliation": row[4],
-                    "country": row[5],
+                    "orcid_id": row.get("orcid_id"),
+                    "name": row.get("author_name"),
+                    "email": row.get("email"),
+                    "openalex_id": row.get("openalex_id"),
+                    "affiliation": row.get("institution"),
+                    "country": row.get("country"),
                     "source": "collected",
                 })
 
@@ -1507,7 +1556,7 @@ def _search_database_email_rows(
         with db._get_cursor() as cur:
             cur.execute("SELECT DISTINCT orcid_id FROM author_invitations")
             for row in cur.fetchall():
-                sent_orcids.add(row[0])
+                sent_orcids.add(row.get("orcid_id"))
         authors = [a for a in authors if a.get("orcid_id") not in sent_orcids]
 
     return authors

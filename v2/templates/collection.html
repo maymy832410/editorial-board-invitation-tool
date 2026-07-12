@@ -22,11 +22,11 @@
         this.saving = true;
         const formData = new FormData();
         formData.append('keywords', document.getElementById('coll-keywords')?.value || '');
-        formData.append('disciplines', document.getElementById('coll-disciplines')?.value || '');
+        formData.append('disciplines', Array.from(document.getElementById('coll-disciplines')?.selectedOptions || []).map(o => o.value).join(','));
         formData.append('specialty_terms', document.getElementById('coll-specialties')?.value || '');
         formData.append('h_index_min', document.getElementById('coll-h-min')?.value || '10');
         formData.append('h_index_max', document.getElementById('coll-h-max')?.value || '50');
-        formData.append('exclude_countries', document.getElementById('coll-countries')?.value || '');
+        formData.append('exclude_countries', Array.from(document.getElementById('coll-countries')?.selectedOptions || []).map(o => o.value).join(','));
         formData.append('baseline_concurrency', document.getElementById('coll-concurrency')?.value || '2');
         formData.append('baseline_delay', document.getElementById('coll-delay')?.value || '3');
 
@@ -135,7 +135,7 @@
             <label>Exclude Countries</label>
             <select id="coll-countries" class="form-input" multiple size="3">
                 {% for country in countries %}
-                <option value="{{ country }}">{{ country }}</option>
+                <option value="{{ country }}" {% if country in (config.exclude_countries or []) or countries[country] in (config.exclude_countries or []) %}selected{% endif %}>{{ country }}</option>
                 {% endfor %}
             </select>
         </div>

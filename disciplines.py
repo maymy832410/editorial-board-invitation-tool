@@ -66,5 +66,8 @@ def categorize_authors(authors: list) -> list:
     """Add discipline field to each author based on their topics."""
     for author in authors:
         topics = author.get("_topics", [])
-        author["discipline"] = get_discipline_from_topics(topics)
+        if topics:
+            author["discipline"] = get_discipline_from_topics(topics)
+        elif not author.get("discipline"):
+            author["discipline"] = "Other"
     return authors

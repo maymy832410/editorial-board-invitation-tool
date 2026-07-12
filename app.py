@@ -279,6 +279,48 @@ def _recipient_tracking_id(author: dict, email: str = "") -> str:
     return f"profile:{profile_key}" if profile_key else ""
 
 
+def _author_openalex_id(author: dict) -> str:
+    """Return a normalized OpenAlex author ID from either schema key."""
+    return (author.get('openalex_id') or author.get('author_id') or '').strip().rstrip('/')
+
+
+def _persist_found_author_email(
+    author: dict,
+    email: str,
+    *,
+    source: str,
+    all_emails: object = "",
+) -> bool:
+    """Persist an interactively found email for later database search and sending."""
+    normalized_email = (email or '').strip()
+    if not normalized_email or not db_storage.available:
+        return False
+
+    openalex_id = _author_openalex_id(author)
+    if openalex_id:
+        db_storage.upsert_harvested_author({**author, "author_id": openalex_id})
+        if isinstance(all_emails, list):
+            all_emails_value = ";".join(str(value).strip() for value in all_emails if str(value).strip())
+        else:
+            all_emails_value = str(all_emails or "").strip()
+        db_storage.update_harvest_email(
+            openalex_id=openalex_id,
+            email=normalized_email,
+            status=EMAIL_STATUS_FOUND,
+            email_source=source,
+            all_emails=all_emails_value,
+        )
+
+    return db_storage.upsert_author_profile(
+        orcid_id=author.get('orcid_id') or "",
+        author_name=author.get('name') or author.get('author_name') or "",
+        email=normalized_email,
+        openalex_id=openalex_id,
+        scientific_domain=author.get('scientific_domain') or author.get('discipline') or "",
+        source=source,
+    )
+
+
 def _clean_domain_label(value: str) -> str:
     """Normalize spacing for domain labels while preserving readable casing."""
     return " ".join((value or "").strip().split())
@@ -2413,7 +2455,9 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     # Get only filtered authors without emails
     to_process = [
         {'orcid_id': a['orcid_id'], 'name': a['name'], 'institution': a.get('institution'), 
-         'country': a.get('country'), 'specialty': a.get('specialty')}
+         'country': a.get('country'), 'specialty': a.get('specialty'),
+         'discipline': a.get('discipline'), 'scientific_domain': a.get('scientific_domain'),
+         'author_id': _author_openalex_id(a), 'openalex_id': _author_openalex_id(a)}
         for a in filtered_authors
         if a.get('orcid_id') and a['orcid_id'] not in processed and not a.get('email')
     ]
@@ -2481,6 +2525,12 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                             if email:
                                 author['email'] = email
                                 author['email_source'] = 'orcid'
+                                _persist_found_author_email(
+                                    author,
+                                    email,
+                                    source='orcid',
+                                    all_emails=result.get('all_emails') or email,
+                                )
                                 orcid_emails_found += 1
                             else:
                                 # Track authors without email for OpenAI fallback
@@ -2517,6 +2567,12 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                                 author['all_emails'] = result.get('all_emails', email)
                                 author['email_source'] = result.get('email_source', 'web_search')
                                 author['email_confidence'] = result.get('email_confidence', 'unknown')
+                                _persist_found_author_email(
+                                    author,
+                                    email,
+                                    source=author['email_source'],
+                                    all_emails=author.get('all_emails') or email,
+                                )
                                 openai_emails_found += 1
                                 break
                 
