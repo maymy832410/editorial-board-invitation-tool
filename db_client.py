@@ -3776,9 +3776,8 @@ class PostgresStorage:
         params: List[Any] = []
 
         if pending_only:
-            clauses.append("h.email_status = %s")
-            params.append(EMAIL_STATUS_PENDING)
             clauses.append("h.orcid_id <> ''")
+            clauses.append("h.email = ''")
             clauses.append("(h.next_retry_at IS NULL OR h.next_retry_at <= NOW())")
 
         search_text = _normalize_text(criteria.get("search_text")).lower()
@@ -3871,6 +3870,15 @@ class PostgresStorage:
                 clauses.append("NOT (h.orcid_id = ANY(%s))")
                 params.append(sent_ids)
 
+        exclude_orcids = [
+            _normalize_orcid(value)
+            for value in criteria.get("exclude_orcids") or []
+            if _normalize_orcid(value)
+        ]
+        if exclude_orcids:
+            clauses.append("NOT (h.orcid_id = ANY(%s))")
+            params.append(exclude_orcids)
+
         return (" AND " + " AND ".join(clauses)) if clauses else "", params
 
     def count_collected_authors(
@@ -3898,7 +3906,7 @@ class PostgresStorage:
                     f"""
                     SELECT
                         COUNT(*) AS total,
-                        COUNT(*) FILTER (WHERE h.email_status = %s AND h.orcid_id <> ''
+                        COUNT(*) FILTER (WHERE h.orcid_id <> '' AND h.email = ''
                             AND (h.next_retry_at IS NULL OR h.next_retry_at <= NOW())) AS pending,
                         COUNT(*) FILTER (WHERE h.email_status = %s) AS found,
                         COUNT(*) FILTER (WHERE h.email_status = %s) AS no_email,
@@ -3911,7 +3919,6 @@ class PostgresStorage:
                     WHERE m.search_run_id = %s {clause};
                     """,
                     [
-                        EMAIL_STATUS_PENDING,
                         EMAIL_STATUS_FOUND,
                         EMAIL_STATUS_NO_EMAIL,
                         EMAIL_STATUS_NO_ORCID,

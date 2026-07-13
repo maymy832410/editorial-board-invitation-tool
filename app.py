@@ -2745,6 +2745,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
 
     db_filter_criteria = st.session_state.get(_scope_key(ui_scope, "collected_filter_criteria"), {})
     db_fetch_criteria = _criteria_for_openalex_email_fetch(db_filter_criteria)
+    db_fetch_criteria["exclude_orcids"] = sorted(processed)
     to_process = (
         [_map_harvested_row_to_author(row) for row in db_storage.fetch_pending_collected_authors(
             search_run_id,
@@ -2804,6 +2805,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
             break
         
         if is_openalex_only and db_storage.available:
+            db_fetch_criteria["exclude_orcids"] = sorted(processed)
             batch = [
                 _map_harvested_row_to_author(row)
                 for row in db_storage.fetch_pending_collected_authors(
@@ -3585,6 +3587,9 @@ def display_results(filters, ui_scope: str):
 
     openalex_collection_complete = _is_openalex_collection_complete(search_state)
     active_search_run_id = _active_collection_search_run_id(search_state)
+    processed = st.session_state.app_state.get('processed_orcids', set())
+    if isinstance(processed, list):
+        processed = set(processed)
     db_collected_criteria = {
         "search_text": active_search_query,
         "disciplines": list(dict.fromkeys(sidebar_disciplines + selected_disciplines)),
@@ -3603,6 +3608,7 @@ def display_results(filters, ui_scope: str):
         "retracted_names": list(retracted_names) if hide_retracted else [],
     }
     db_fetch_criteria = _criteria_for_openalex_email_fetch(db_collected_criteria)
+    db_fetch_criteria["exclude_orcids"] = sorted(processed)
 
     db_collected_counts: dict[str, int] = {}
     db_fetch_counts: dict[str, int] = {}
@@ -3653,9 +3659,6 @@ def display_results(filters, ui_scope: str):
     without_email = sum(1 for r in filtered if not r.get('email'))
     
     # Check how many have been processed already
-    processed = st.session_state.app_state.get('processed_orcids', set())
-    if isinstance(processed, list):
-        processed = set(processed)
     already_processed = sum(1 for r in filtered if r.get('orcid_id') in processed)
     fetch_candidate_count = (
         int(db_fetch_counts.get("pending") or 0)

@@ -1,5 +1,5 @@
 import app
-from db_client import EMAIL_STATUS_PENDING, PostgresStorage
+from db_client import PostgresStorage
 
 
 def test_source_selection_openalex_ignores_stale_database_rows():
@@ -350,16 +350,18 @@ def test_collection_filter_clause_includes_post_filters():
             "email_filter": "without",
             "hide_sent": True,
             "sent_orcids": ["0000-0001"],
+            "exclude_orcids": ["0000-0002"],
             "hide_retracted": True,
             "retracted_names": ["Retracted Author"],
         },
         pending_only=True,
     )
 
-    assert "h.email_status = %s" in clause
+    assert "h.orcid_id <> ''" in clause
+    assert "h.email = ''" in clause
     assert "h.discipline = ANY(%s)" in clause
     assert "h.country = ANY(%s)" in clause
-    assert "h.email = ''" in clause
-    assert EMAIL_STATUS_PENDING in params
     assert ["Medicine"] in params
     assert ["GB"] in params
+    assert ["0000-0001"] in params
+    assert ["0000-0002"] in params
