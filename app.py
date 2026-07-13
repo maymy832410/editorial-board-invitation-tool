@@ -888,6 +888,64 @@ def _collect_openalex_authors_for_state(
     return collected[:target_limit]
 
 
+def _collect_openalex_for_active_search(filters: dict, ui_scope: str, progress_callback=None) -> list[dict]:
+    """Collect all bounded authors for the active OpenAlex search into the durable DB run."""
+    search_state = _get_search_pagination_state()
+    if not search_state.get('filters'):
+        st.warning("Find authors first, then collect and fetch emails.")
+        return []
+    if not db_storage.available:
+        st.error("PostgreSQL is required to collect OpenAlex authors and save emails.")
+        return []
+
+    active_collection = db_storage.activate_collection_search(
+        _collection_config_from_search_state(search_state),
+        topic_details=[
+            {"id": topic_id, "name": topic_id}
+            for topic_id in (search_state.get('filters', {}).get('topic_ids') or [])
+        ],
+        start_over=True,
+        baseline_concurrency=OPENALEX_ORCID_FETCH_CONCURRENCY,
+        baseline_delay=OPENALEX_ORCID_FETCH_DELAY_SEC,
+    )
+    search_run_id = int((active_collection or {}).get('search_run_id') or 0)
+    if not search_run_id:
+        st.error("Could not create a durable collection search in PostgreSQL.")
+        return []
+
+    collected_authors = _collect_openalex_authors_for_state(
+        search_state,
+        client=OpenAlexClient(),
+        storage=db_storage,
+        search_run_id=search_run_id,
+        max_results=int(search_state.get('max_results') or _get_result_limit(search_state)),
+        jump_size=int(search_state.get('jump_size') or 250),
+        disciplines=search_state.get('filters', {}).get('disciplines') or filters.get('disciplines', []),
+        progress_callback=progress_callback,
+    )
+    refreshed_rows = db_storage.fetch_collected_authors(
+        search_run_id,
+        limit=max(len(collected_authors), 1),
+    )
+    if refreshed_rows:
+        collected_authors = [_map_harvested_row_to_author(row) for row in refreshed_rows]
+
+    st.session_state.app_state['search_results'] = collected_authors
+    search_state['all_collected'] = True
+    search_state['collected_count'] = len(collected_authors)
+    search_state['search_run_id'] = search_run_id
+    st.session_state.app_state['active_collection_search_run_id'] = search_run_id
+    search_state['current_batch_index'] = 0
+    search_state['current_batch_results'] = collected_authors
+    search_state['batch_cache'] = {'0': collected_authors}
+    search_state['current_range_start'] = 1 if collected_authors else 0
+    search_state['current_range_end'] = len(collected_authors)
+    st.session_state[_scope_key(ui_scope, "results_page")] = 0
+    st.session_state.filtered_authors = []
+    save_state()
+    return collected_authors
+
+
 def _enrich_db_source_domains_from_openalex(authors: list[dict], max_rows: int = 50) -> tuple[int, int]:
     """Enrich missing scientific domains for visible DB-source rows via strict ORCID matching."""
     if not db_storage.available:
@@ -1390,7 +1448,7 @@ def is_author_notified(
     journal_filter = journal_name if invitation_type == INVITATION_TYPE_PUBLICATION else None
     if db_storage.available:
         return db_storage.is_sent(orcid_id, invitation_type, journal_filter)
-    
+
     sent = st.session_state.app_state.get('sent_invitations', set())
     if isinstance(sent, list):
         sent = set(sent)
@@ -1617,7 +1675,7 @@ def render_manual_unsubscribe_tool() -> None:
 @st.dialog("Send Invitation Email", width="large")
 def email_dialog(author: dict, filters: dict):
     """Dialog for composing and sending invitation email to a specific author."""
-    
+
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'brevo')
     author_key = author.get('orcid_id') or author.get('author_id') or author.get('name', 'author')
@@ -1628,14 +1686,14 @@ def email_dialog(author: dict, filters: dict):
     workflow = WORKFLOW_AUTHOR if invitation_type == INVITATION_TYPE_PUBLICATION else WORKFLOW_EDITORIAL
     st.caption(f"Workflow: {_workflow_label(workflow)}")
     tracking_journal_name = _tracking_journal_name(invitation_type, journal_config)
-    
+
     tracking_id = _recipient_tracking_id(author)
     is_already_notified = is_author_notified(
         tracking_id,
         invitation_type=invitation_type,
         journal_name=tracking_journal_name
     )
-    
+
     # WARNING BANNER for already notified authors
     if is_already_notified:
         st.error(f"⚠️ WARNING: This author has ALREADY been sent a {_invitation_type_label(invitation_type)} invitation for this tracking scope.")
@@ -1646,14 +1704,14 @@ def email_dialog(author: dict, filters: dict):
     )
     if initial_recipient_suppressed:
         st.warning("This recipient has unsubscribed before. Sending is blocked.")
-    
+
     # Author info header
     st.markdown(f"### To: **{author['name']}**")
     if author.get('institution'):
         st.caption(f"{author.get('institution')} | H-index: {author.get('h_index', 'N/A')}")
     if invitation_type == INVITATION_TYPE_PUBLICATION:
         st.caption("Publication invitation subjects include the author name automatically.")
-    
+
     st.divider()
 
     recent_publications_text = ""
@@ -1682,7 +1740,7 @@ def email_dialog(author: dict, filters: dict):
                 recent_publications_text = format_recent_publications(recent_publications)
             else:
                 st.caption("No recent OpenAlex publications were available; the template will still send without that section.")
-    
+
     # Template selection
     template_names = get_template_names(invitation_type)
     col_type, col_scopus = st.columns([2, 1])
@@ -1699,13 +1757,13 @@ def email_dialog(author: dict, filters: dict):
         else:
             scopus_indexed = False
             st.caption("Publication templates use the journal metadata fields.")
-    
+
     # Format template - publisher name and location come from PUBLISHER_INFO (follows selected publisher)
     pub_info = PUBLISHER_INFO.get(publisher_id, {})
     publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
     publisher_location = pub_info.get('location') or journal_config.get('location', '')
     sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
-    
+
     formatted = format_template(
         template_id=template_id,
         author_name=author['name'],
@@ -1726,7 +1784,7 @@ def email_dialog(author: dict, filters: dict):
         journal_scope=journal_config.get('scope', ''),
         invitation_goal=journal_config.get('invitation_goal', '')
     )
-    
+
     # Editable email fields
     to_email = st.text_input(
         "To (Email)",
@@ -1745,14 +1803,14 @@ def email_dialog(author: dict, filters: dict):
         value=formatted['subject'],
         key=f"dialog_subject_{author_key}_{invitation_type}_{template_id}_{scopus_indexed}_{bool(recent_publications_text)}"
     )
-    
+
     body = st.text_area(
         "Email Body",
         value=formatted['body'],
         height=300,
         key=f"dialog_body_{author_key}_{invitation_type}_{template_id}_{scopus_indexed}_{bool(recent_publications_text)}"
     )
-    
+
     # PDF option
     col1, col2 = st.columns(2)
     with col1:
@@ -1767,7 +1825,7 @@ def email_dialog(author: dict, filters: dict):
             "outreach. Unsubscribe requests remain active regardless of this setting."
         ),
     )
-    
+
     # Preview PDF
     if attach_pdf:
         with st.expander("Preview PDF"):
@@ -1788,9 +1846,9 @@ def email_dialog(author: dict, filters: dict):
                 )
             except Exception as e:
                 st.error(f"PDF error: {str(e)}")
-    
+
     st.divider()
-    
+
     # Confirmation checkbox for already notified authors
     confirm_resend = True  # Default to allowed
     if is_already_notified:
@@ -1799,14 +1857,14 @@ def email_dialog(author: dict, filters: dict):
             value=False,
             key=f"dialog_confirm_resend_{invitation_type}_{author_key}"
         )
-    
+
     # Action buttons
     col1, col2 = st.columns(2)
-    
+
     with col1:
         if st.button("Cancel", use_container_width=True):
             st.rerun()
-    
+
     with col2:
         send_disabled = (
             not EMAIL_AVAILABLE
@@ -1830,7 +1888,7 @@ def email_dialog(author: dict, filters: dict):
                     except Exception as e:
                         st.error(f"PDF generation failed: {str(e)}")
                         pdf_bytes = None
-                
+
                 success, msg = email_sender.send_email(
                     publisher_id=publisher_id,
                     to_email=to_email,
@@ -1848,7 +1906,7 @@ def email_dialog(author: dict, filters: dict):
                     journal_quartile=journal_config.get('quartile', ''),
                     unsubscribe_url=_build_unsubscribe_url(to_email, author.get('orcid_id', '')),
                 )
-                
+
                 if success:
                     send_tracking_id = _recipient_tracking_id(author, to_email)
                     db_ok = mark_author_notified(
@@ -1889,7 +1947,7 @@ def email_dialog(author: dict, filters: dict):
                     st.rerun()
                 else:
                     st.error(f"Failed: {msg}")
-    
+
     if not EMAIL_AVAILABLE:
         st.warning("Email sending not configured. Add email_credentials.json.")
 
@@ -1956,10 +2014,10 @@ def bulk_send_preview_dialog(payload: dict, confirmation_key: str):
 
 def render_sidebar():
     """Render the sidebar with all configuration options."""
-    
+
     with st.sidebar:
         st.title("Settings")
-        
+
         # Database Status Indicator
         db_status = db_storage.get_status()
         if db_status["available"]:
@@ -1968,7 +2026,7 @@ def render_sidebar():
             st.error(f"🔴 Database: Offline")
             if db_status["error"]:
                 st.caption(f"Error: {db_status['error'][:50]}...")
-        
+
         st.divider()
         render_manual_unsubscribe_tool()
         st.divider()
@@ -2071,17 +2129,17 @@ def render_sidebar():
                     st.error("Could not delete preset.")
 
         st.divider()
-        
+
         # Publisher Selection
         st.subheader("Publisher")
-        
+
         if EMAIL_AVAILABLE:
             current_publisher = st.session_state.app_state.get('publisher', 'brevo')
             if publisher_options and current_publisher not in publisher_options:
                 current_publisher = list(publisher_options.keys())[0]
                 st.session_state.app_state['publisher'] = current_publisher
                 save_state()
-            
+
             selected_publisher = st.selectbox(
                 "Select Publisher",
                 options=list(publisher_options.keys()),
@@ -2089,11 +2147,11 @@ def render_sidebar():
                 index=list(publisher_options.keys()).index(current_publisher) if current_publisher in publisher_options else 0,
                 key="publisher_select"
             )
-            
+
             if selected_publisher != current_publisher:
                 st.session_state.app_state['publisher'] = selected_publisher
                 save_state()
-            
+
             if st.button("Test Email Connection", use_container_width=True):
                 with st.spinner("Testing..."):
                     success, msg = email_sender.test_connection(selected_publisher)
@@ -2101,7 +2159,7 @@ def render_sidebar():
                     st.success(msg)
                 else:
                     st.error(msg)
-            
+
             st.caption("Send test email to any address:")
             test_email_to = st.text_input(
                 "Send test email to",
@@ -2138,41 +2196,41 @@ def render_sidebar():
             selected_publisher = 'brevo'
 
         st.divider()
-        
+
         # Journal Configuration
         st.subheader("Editorial Invitation Settings")
         st.caption("Used by the Editorial Invitation tab.")
-        
+
         journal_config = st.session_state.app_state.get('journal_config', {})
-        
+
         journal_name = st.text_input(
             "Journal Name",
             value=journal_config.get('name', ''),
             placeholder="e.g., SHIFAA Journal",
             key="journal_name"
         )
-        
+
         journal_issn = st.text_input(
             "ISSN",
             value=journal_config.get('issn', ''),
             placeholder="e.g., 1234-5678",
             key="journal_issn"
         )
-        
+
         journal_link = st.text_input(
             "Journal Website",
             value=journal_config.get('link', ''),
             placeholder="e.g., https://journal.example.com",
             key="journal_link"
         )
-        
+
         publisher_location = st.text_input(
             "Publisher Location",
             value=journal_config.get('location', ''),
             placeholder="e.g., Dubai - UAE",
             key="publisher_location"
         )
-        
+
         editor_name = st.text_input(
             "Editor-in-Chief Name",
             value=journal_config.get('editor_in_chief', ''),
@@ -2230,7 +2288,7 @@ def render_sidebar():
             height=80,
             key="journal_scope"
         )
-        
+
         # Auto-save journal config on change
         new_config = {
             'name': journal_name,
@@ -2245,18 +2303,18 @@ def render_sidebar():
             'invitation_goal': invitation_goal,
             'scope': journal_scope,
         }
-        
+
         if new_config != journal_config:
             st.session_state.app_state['journal_config'] = new_config
             save_state()
-        
+
         st.divider()
-        
+
         # Search Filters
         st.subheader("Search Filters")
-        
+
         search_params = st.session_state.app_state.get('search_params', {})
-        
+
         # Keyword Tags - NEW
         st.markdown("**Keyword Tags** (comma-separated)")
         keyword_tags = st.text_area(
@@ -2268,7 +2326,7 @@ def render_sidebar():
             key="keyword_tags",
             label_visibility="collapsed"
         )
-        
+
         st.markdown("**H-Index Range**")
         col1, col2 = st.columns(2)
         with col1:
@@ -2287,7 +2345,7 @@ def render_sidebar():
                 value=search_params.get('h_index_max', DEFAULT_H_INDEX_MAX),
                 key="h_max"
             )
-        
+
         countries_to_include = st.multiselect(
             "Include Countries",
             options=list(COUNTRIES.keys()),
@@ -2311,7 +2369,7 @@ def render_sidebar():
             key="sidebar_discipline_filter",
             help="Show only results in the selected disciplines"
         )
-        
+
         max_results = st.number_input(
             "Max Results",
             min_value=10,
@@ -2321,67 +2379,62 @@ def render_sidebar():
             key="max_results"
         )
 
-        jump_size = st.selectbox(
-            "Jump Size",
-            options=[250, 500, 1000],
-            index=[250, 500, 1000].index(search_params.get('jump_size', 250)),
-            key="jump_size",
-            help="Load and navigate OpenAlex results in batches of this size"
-        )
-        
+        with st.expander("Advanced OpenAlex and email settings", expanded=False):
+            jump_size = st.selectbox(
+                "Jump Size",
+                options=[250, 500, 1000],
+                index=[250, 500, 1000].index(search_params.get('jump_size', 250)),
+                key="jump_size",
+                help="Load and navigate OpenAlex results in batches of this size"
+            )
+
+            st.markdown("**Email Fetch Settings**")
+            st.caption("The simplified OpenAlex flow uses conservative ORCID pacing automatically.")
+
+            concurrent = st.slider(
+                "Concurrent requests",
+                min_value=1,
+                max_value=20,
+                value=10,
+                help="Used only outside the OpenAlex-only ORCID collection flow",
+                key="concurrent"
+            )
+
+            delay = st.slider(
+                "Batch delay (seconds)",
+                min_value=0.5,
+                max_value=5.0,
+                value=1.0,
+                step=0.5,
+                key="delay"
+            )
+
+            st.markdown("**Web Search Options**")
+            st.caption("ORCID API is always used first. Web fallback is off by default.")
+
+            use_tavily = st.checkbox(
+                "Enable Tavily search",
+                value=False,
+                help="Tavily + GPT-4o-mini extraction (lower cost)",
+                key="use_tavily"
+            )
+
+            use_openai_web = st.checkbox(
+                "Enable OpenAI web search",
+                value=False,
+                help="OpenAI Responses API with web_search (fallback, higher cost)",
+                key="use_openai_web"
+            )
+
+            if use_tavily or use_openai_web:
+                st.caption("Searches faculty pages, Google Scholar, and ResearchGate.")
+
         st.divider()
-        
-        # Speed Settings
-        st.subheader("Email Fetch Settings")
-        
-        concurrent = st.slider(
-            "Concurrent requests",
-            min_value=1,
-            max_value=20,
-            value=10,
-            help="Higher = faster but more risk of rate limiting",
-            key="concurrent"
-        )
-        
-        delay = st.slider(
-            "Batch delay (seconds)",
-            min_value=0.5,
-            max_value=5.0,
-            value=1.0,
-            step=0.5,
-            key="delay"
-        )
-        
-        st.divider()
-        
-        # Email Search Options
-        st.subheader("Email Search Options")
-        
-        st.caption("ORCID API is always used first (free)")
-        
-        use_tavily = st.checkbox(
-            "Enable Tavily search",
-            value=False,
-            help="Tavily + GPT-4o-mini extraction (lower cost)",
-            key="use_tavily"
-        )
-        
-        use_openai_web = st.checkbox(
-            "Enable OpenAI web search",
-            value=False,
-            help="OpenAI Responses API with web_search (fallback, higher cost)",
-            key="use_openai_web"
-        )
-        
-        if use_tavily or use_openai_web:
-            st.caption("🔍 Searches faculty pages, Google Scholar, ResearchGate")
-        
-        st.divider()
-        
+
         # Data Import Section
         with st.expander("📥 Data Import (Admin)"):
             st.caption("Import CSV data into the database")
-            
+
             # Sent Invitations Import
             sent_file = st.file_uploader(
                 "Sent Invitations CSV",
@@ -2391,9 +2444,9 @@ def render_sidebar():
             )
             if sent_file and st.button("Import Sent Invitations", key="btn_import_sent"):
                 _import_sent_csv(sent_file)
-            
+
             st.divider()
-            
+
             # Retraction Watch Import
             retract_file = st.file_uploader(
                 "Retraction Watch CSV",
@@ -2403,7 +2456,7 @@ def render_sidebar():
             )
             if retract_file and st.button("Import Retraction Watch", key="btn_import_retract"):
                 _import_retraction_csv(retract_file)
-            
+
             # Show current counts
             try:
                 sent_count = db_storage.get_sent_count()
@@ -2411,9 +2464,9 @@ def render_sidebar():
                 st.info(f"DB: {sent_count} sent invitations, {retracted_count} retracted authors")
             except Exception:
                 pass
-        
+
         st.divider()
-        
+
         # Reset Button
         if st.button("Reset All Data", type="secondary", use_container_width=True):
             if st.session_state.get('confirm_reset'):
@@ -2425,7 +2478,7 @@ def render_sidebar():
             else:
                 st.session_state.confirm_reset = True
                 st.warning("Click again to confirm reset")
-        
+
         return {
             'keyword_tags': keyword_tags,
             'h_min': h_min,
@@ -2456,9 +2509,8 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
         'query': '',
     }
 
-    st.markdown("### Database Email Search")
-    st.info("Search saved email recipients here. Matching people will appear in the send table below with email preview before sending.")
-    st.caption("Search by name, email, affiliation, country, ORCID/OpenAlex, discipline, specialty, or research area.")
+    st.markdown("### Database Recipients")
+    st.caption("Load saved recipients with email. Suppressed, purged, retracted, and already-sent recipients are excluded by default.")
 
     if not db_storage.available:
         st.warning("Database email search requires PostgreSQL.")
@@ -2484,7 +2536,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
             db_hide_suppressed = st.checkbox("Hide suppressed", value=True, key=_scope_key(ui_scope, "database_email_hide_suppressed"))
         with db_search_cols[4]:
             db_hide_sent = st.checkbox("Hide sent", value=True, key=_scope_key(ui_scope, "database_email_hide_sent"))
-        submitted = st.form_submit_button("Search / Load & Apply Filters", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Load Database Recipients", type="primary", use_container_width=True)
     st.caption("Database email search is uncapped and returns all matching stored email records.")
 
     if submitted:
@@ -2504,6 +2556,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
             rows = [row for row in rows if _recipient_tracking_id(row) not in sent]
         st.session_state[state_key] = {"snapshot": snapshot, "results": rows}
         st.session_state[_scope_key(ui_scope, "results_page")] = 0
+        st.session_state[_scope_key(ui_scope, "recipient_view")] = "Ready to Send"
 
     stored = st.session_state.get(state_key) or {}
     snapshot = stored.get("snapshot") or {}
@@ -2512,7 +2565,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
     if not db_search_active:
         st.caption("Tip: type here to show database recipients below, or switch Author Source to Database Emails.")
     else:
-        st.caption(f"Applied database results: {len(db_source_results):,}. Draft changes wait for Search / Load.")
+        st.caption(f"Loaded database recipients: {len(db_source_results):,}.")
 
     panel_state.update({
         'results': db_source_results,
@@ -2526,7 +2579,7 @@ def render_database_email_search_panel(filters: dict, ui_scope: str, author_sour
 def render_search_section(filters, ui_scope: str):
     """Render the search and results section."""
     if ui_scope == WORKFLOW_AUTHOR:
-        st.subheader("1. Invitation Purpose")
+        st.subheader("1. Campaign")
         invitation_type = st.selectbox(
             "Invitation Purpose",
             options=[INVITATION_TYPE_PUBLICATION, INVITATION_TYPE_EDITORIAL],
@@ -2541,15 +2594,18 @@ def render_search_section(filters, ui_scope: str):
     author_source_mode = AUTHOR_SOURCE_OPENALEX
 
     if is_author_workflow:
-        source_modes = [AUTHOR_SOURCE_OPENALEX, AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH]
-        persisted_source_mode = st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH)
+        st.subheader("2. Source")
+        source_modes = [AUTHOR_SOURCE_OPENALEX, AUTHOR_SOURCE_DATABASE]
+        persisted_source_mode = st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_OPENALEX)
+        if persisted_source_mode not in source_modes:
+            persisted_source_mode = AUTHOR_SOURCE_OPENALEX
         author_source_mode = st.selectbox(
             "Author Source",
             options=source_modes,
-            index=_safe_select_index(source_modes, persisted_source_mode, default=2),
+            index=_safe_select_index(source_modes, persisted_source_mode, default=0),
             format_func=_author_source_label,
             key=_scope_key(ui_scope, "author_source_mode_select"),
-            help="Choose whether Author Invitation candidates come from OpenAlex, your database emails, or both."
+            help="Choose OpenAlex for new discovery, or Database for saved email recipients."
         )
         if author_source_mode != persisted_source_mode:
             st.session_state.app_state['author_source_mode'] = author_source_mode
@@ -2557,15 +2613,12 @@ def render_search_section(filters, ui_scope: str):
         filters['author_source_mode'] = author_source_mode
         if author_source_mode == AUTHOR_SOURCE_OPENALEX:
             filters['database_email_panel'] = {'results': [], 'total': 0, 'active': False, 'query': ''}
-            st.caption("OpenAlex-only mode ignores saved database recipients until emails are fetched and saved for collected OpenAlex authors.")
         else:
             filters['database_email_panel'] = render_database_email_search_panel(filters, ui_scope, author_source_mode)
         st.divider()
 
-    st.header("2. Filters")
-    st.caption(f"Active workflow: {_invitation_type_label(invitation_type)}")
-    if is_author_workflow:
-        st.caption(f"Source mode: {_author_source_label(author_source_mode)}")
+    st.header("3. Recipients")
+    st.caption(f"{_invitation_type_label(invitation_type)} · {_author_source_label(author_source_mode) if is_author_workflow else 'OpenAlex'}")
 
     # Text search filter — visible immediately for finding specific authors
     search_results_key = _scope_key(ui_scope, "search_results_text")
@@ -2578,77 +2631,74 @@ def render_search_section(filters, ui_scope: str):
     if search_query:
         st.caption(f"Searching for: **{search_query}**")
 
-    if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
-        search_button_label = "Use Search / Load Above"
-    elif is_author_workflow and author_source_mode == AUTHOR_SOURCE_BOTH:
-        search_button_label = "Search OpenAlex + Merge DB"
+    search_clicked = False
+    stop_clicked = False
+    if not (is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE):
+        # Search button
+        col1, col2, col3 = st.columns([2, 1, 1])
+
+        with col1:
+            search_clicked = st.button(
+                "Find Authors",
+                type="primary",
+                use_container_width=True,
+                key=_scope_key(ui_scope, "search_openalex"),
+            )
+
+        with col2:
+            stop_clicked = st.button("Stop", use_container_width=True, key=_scope_key(ui_scope, "stop_search"))
+
+        with col3:
+            pass  # Reserved for future use
     else:
-        search_button_label = "Search OpenAlex"
-    
-    # Search button
-    col1, col2, col3 = st.columns([2, 1, 1])
-    
-    with col1:
-        search_clicked = st.button(
-            search_button_label,
-            type="primary",
-            use_container_width=True,
-            key=_scope_key(ui_scope, "search_openalex"),
-            disabled=is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE,
-        )
-    
-    with col2:
-        stop_clicked = st.button("Stop", use_container_width=True, key=_scope_key(ui_scope, "stop_search"))
-    
-    with col3:
-        pass  # Reserved for future use
-    
+        st.caption("Use the Database Recipients loader above, then review the ready-to-send list below.")
+
     if stop_clicked:
         st.session_state.stop_fetching = True
-    
+
     # Handle search
     if search_clicked:
         run_search(filters, ui_scope)
-    
+
     # Display results (returns filtered list for email fetching)
     display_results(filters, ui_scope)
 
 
 def run_search(filters, ui_scope: str):
     """Execute the author search with keyword-based topic filtering."""
-    
+
     include_country_codes = [COUNTRIES[c] for c in filters.get('include_countries', []) if c in COUNTRIES]
     exclude_country_codes = [
         COUNTRIES[c] for c in filters['exclude_countries']
         if c in COUNTRIES and c not in set(filters.get('include_countries', []))
     ] or None
-    
+
     client = OpenAlexClient()
-    
+
     # Parse keyword tags
     keyword_tags = filters.get('keyword_tags', '')
     keywords = [k.strip() for k in keyword_tags.split(',') if k.strip()]
-    
+
     topic_ids = None
-    
+
     # Step 1: Search for topics if keywords provided
     if keywords:
         with st.spinner(f"Searching topics for: {', '.join(keywords)}..."):
             topic_ids, topic_details = client.search_topics(keywords, max_per_keyword=3, max_total=25)
-        
+
         if topic_ids:
             msg = f"Found {len(topic_ids)} matching topics"
             if len(topic_ids) >= 25:
                 msg += " (limited to 25 for API compatibility)"
             st.success(msg)
-            
+
             # Show some matching topics
             with st.expander("View matching topics", expanded=False):
                 for t in topic_details[:15]:
                     st.write(f"- **{t['name']}** ({t['works_count']:,} works) - from '{t['keyword']}'")
         else:
             st.warning("No topics found for the given keywords. Searching without topic filter.")
-    
+
     # Show search info
     search_info = f"H-index: {filters['h_min']}-{filters['h_max']}"
     if filters.get('include_countries'):
@@ -2658,7 +2708,7 @@ def run_search(filters, ui_scope: str):
     if keywords:
         search_info += f" | Keywords: {', '.join(keywords[:3])}{'...' if len(keywords) > 3 else ''}"
     st.info(f"Searching: {search_info}")
-    
+
     # Step 2: Get total count with topic filter
     with st.spinner("Counting matching authors..."):
         total_count = client.get_total_count(
@@ -2669,11 +2719,11 @@ def run_search(filters, ui_scope: str):
             topic_ids=topic_ids,
             require_orcid=True
         )
-    
+
     if total_count == 0:
         st.warning("No authors found. Try adjusting filters or keywords.")
         return
-    
+
     visible_limit = min(total_count, filters['max_results'])
     st.success(f"Found {total_count:,} authors. Loading the first {filters['jump_size']:,}-result batch out of {visible_limit:,} visible results...")
 
@@ -2760,7 +2810,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     if not is_openalex_only and not filtered_authors:
         st.warning("No filtered authors to process.")
         return
-    
+
     processed = st.session_state.app_state.get('processed_orcids', set())
     if isinstance(processed, list):
         processed = set(processed)
@@ -2777,15 +2827,15 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         if is_openalex_only and db_storage.available
         else _build_email_fetch_candidates(filtered_authors, processed)
     )
-    
+
     if not to_process:
         st.info("All authors already processed.")
         return
-    
+
     st.session_state.stop_fetching = False
     use_tavily = (not is_openalex_only) and filters.get('use_tavily', True)
     use_openai_web = (not is_openalex_only) and filters.get('use_openai_web', True)
-    
+
     progress_bar = st.progress(0)
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -2796,9 +2846,9 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         openai_metric = st.empty()
     with col4:
         speed_metric = st.empty()
-    
+
     status_text = st.empty()
-    
+
     if is_openalex_only:
         fetch_concurrency = OPENALEX_ORCID_FETCH_CONCURRENCY
         fetch_delay = OPENALEX_ORCID_FETCH_DELAY_SEC
@@ -2819,13 +2869,13 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     processed_this_run = 0
     rate_limited = False
     start_time = time.time()
-    
+
     batch_start = 0
     while batch_start < total:
         if st.session_state.stop_fetching:
             st.warning("Stopped by user")
             break
-        
+
         if is_openalex_only and db_storage.available:
             db_fetch_criteria["exclude_orcids"] = sorted(processed)
             batch = [
@@ -2844,10 +2894,10 @@ def run_email_fetch_filtered(filters, ui_scope: str):
             f"Fetching from ORCID (batch {(batch_start // batch_size) + 1}, "
             f"{fetch_concurrency} concurrent, {fetch_delay:g}s delay)..."
         )
-        
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
         try:
             batch_results = loop.run_until_complete(
                 fetch_emails_async(
@@ -2856,12 +2906,12 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                     delay_between_batches=fetch_delay
                 )
             )
-            
+
             authors_without_email = []
             for result in batch_results:
                 orcid_id = result.get('orcid_id')
                 email = result.get('email')
-                
+
                 if not orcid_id:
                     continue
 
@@ -2899,10 +2949,10 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                     processed_this_run += 1
                 if is_openalex_only and search_run_id and not result.get('rate_limited'):
                     db_storage.bump_search_stat(search_run_id, "attempts", 1)
-            
+
             if (use_tavily or use_openai_web) and authors_without_email:
                 status_text.text(f"Searching web for emails ({len(authors_without_email)} authors)...")
-                
+
                 async def fetch_web_emails():
                     async with AsyncOpenAIEmailClient(
                         max_concurrent=min(5, fetch_concurrency),
@@ -2913,9 +2963,9 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                             use_tavily=use_tavily,
                             use_openai_web=use_openai_web
                         )
-                
+
                 web_results = loop.run_until_complete(fetch_web_emails())
-                
+
                 for result in web_results:
                     email = result.get('email')
                     if email:
@@ -2935,26 +2985,26 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                             all_emails=email_updates.get('all_emails') or email,
                         )
                         openai_emails_found += 1
-                
+
         finally:
             loop.close()
-        
+
         st.session_state.app_state['processed_orcids'] = processed
         if is_openalex_only and search_run_id:
             _refresh_collected_results_from_db(search_run_id, db_fetch_criteria)
         else:
             _sync_current_batch_cache()
-        
+
         processed_count = processed_this_run
         progress_bar.progress(min(processed_count / total, 1.0))
         processed_metric.metric("Processed", f"{processed_count}/{total}")
         found_metric.metric("ORCID Emails", orcid_emails_found)
         openai_metric.metric("Web Found", openai_emails_found)
-        
+
         elapsed = time.time() - start_time
         speed = processed_count / elapsed if elapsed > 0 else 0
         speed_metric.metric("Speed", f"{speed:.1f}/sec")
-        
+
         save_state()
 
         if rate_limited:
@@ -2963,13 +3013,14 @@ def run_email_fetch_filtered(filters, ui_scope: str):
             )
             break
         batch_start += len(batch)
-    
+
     total_found = orcid_emails_found + openai_emails_found
     st.session_state.stop_fetching = False
-    
+
     result_suffix = " Paused on ORCID rate limit." if rate_limited else ""
     if is_openalex_only:
         st.session_state[_scope_key(ui_scope, "show_collected_emails_after_fetch")] = True
+        st.session_state[_scope_key(ui_scope, "recipient_view")] = "Ready to Send"
     st.session_state.last_fetch_result = (
         f"Found {total_found} emails from {processed_this_run} processed authors "
         f"out of {total} filtered candidates ({orcid_emails_found} ORCID + {openai_emails_found} Web)."
@@ -2977,6 +3028,34 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     )
     save_state()
     st.rerun()
+
+
+def run_openalex_collect_and_fetch(filters: dict, ui_scope: str) -> None:
+    """Run the simplified OpenAlex pipeline: collect all matches, then fetch ORCID emails."""
+    progress = st.progress(0)
+    status = st.empty()
+
+    def _progress(done: int, total: int) -> None:
+        progress.progress(min(done / total, 1.0) if total else 0)
+        status.text(f"Collecting OpenAlex authors {done:,} / {total:,}...")
+
+    with st.spinner("Collecting matching OpenAlex authors..."):
+        collected_authors = _collect_openalex_for_active_search(
+            filters,
+            ui_scope,
+            progress_callback=_progress,
+        )
+    if not collected_authors:
+        return
+
+    st.session_state[_scope_key(ui_scope, "collected_filter_criteria")] = {}
+    st.session_state[_scope_key(ui_scope, "filtered_authors")] = collected_authors
+    st.session_state.filtered_authors = collected_authors
+    st.session_state.last_collect_result = (
+        f"Collected {len(collected_authors):,} OpenAlex authors. Fetching ORCID emails now..."
+    )
+    save_state()
+    run_email_fetch_filtered(filters, ui_scope)
 
 
 def _enqueue_bulk_send(payload: dict) -> None:
@@ -3093,7 +3172,7 @@ def _render_bulk_job_status(ui_scope: str) -> None:
 
 def display_results(filters, ui_scope: str):
     """Display search results with selection and filtering."""
-    
+
     openalex_results = st.session_state.app_state.get('search_results', [])
     search_state = _get_search_pagination_state()
     pending_dialog_author_key = _scope_key(ui_scope, "pending_email_dialog_author")
@@ -3125,7 +3204,7 @@ def display_results(filters, ui_scope: str):
         results = _select_author_source_results(author_source_mode, openalex_results, db_source_results)
     else:
         results = openalex_results
-    
+
     empty_results_message = ""
     if not results:
         if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
@@ -3165,7 +3244,7 @@ def display_results(filters, ui_scope: str):
                 else:
                     st.info("No visible rows were enriched. Ensure ORCID values exist and are valid in OpenAlex.")
                 st.rerun()
-    
+
     # Show email fetch result message from previous run
     if st.session_state.get('last_fetch_result'):
         st.success(st.session_state.pop('last_fetch_result'))
@@ -3177,142 +3256,126 @@ def display_results(filters, ui_scope: str):
     )
 
     if show_openalex_batch_controls:
-        current_jump_size = int(search_state.get('jump_size', 250) or 250)
-        selected_jump_size = st.selectbox(
-            "Batch Jump Size",
-            options=[250, 500, 1000],
-            index=[250, 500, 1000].index(current_jump_size),
-            key=_scope_key(ui_scope, "batch_jump_size_control"),
-            help="Reload OpenAlex result batches using the selected jump size"
-        )
-        if selected_jump_size != current_jump_size:
-            load_search_batch(0, jump_size=selected_jump_size, reset=True)
-            st.rerun()
-
         total_batches = max(int(search_state.get('total_batches', 0) or 0), 1)
         current_batch_index = int(search_state.get('current_batch_index', 0) or 0)
         current_start = int(search_state.get('current_range_start', 0) or 0)
         current_end = int(search_state.get('current_range_end', 0) or 0)
-
-        st.caption(
-            f"Visible OpenAlex range: {current_start:,}-{current_end:,} of {total_visible_results:,} | "
-            f"Batch {current_batch_index + 1} of {total_batches}"
-        )
-
-        batch_prev_col, batch_num_col, batch_go_col, batch_next_col = st.columns([1, 1.2, 0.8, 1])
-        with batch_prev_col:
-            if st.button(
-                "← Previous Batch",
-                disabled=current_batch_index == 0,
-                use_container_width=True,
-                key=_scope_key(ui_scope, "prev_batch")
-            ):
-                load_search_batch(current_batch_index - 1)
-                st.rerun()
-        with batch_num_col:
-            target_batch = st.number_input(
-                "Jump to Batch",
-                min_value=1,
-                max_value=total_batches,
-                value=current_batch_index + 1,
-                step=1,
-                key=_scope_key(ui_scope, "target_batch_number")
-            )
-        with batch_go_col:
-            if st.button("Go", use_container_width=True, key=_scope_key(ui_scope, "go_batch")):
-                load_search_batch(int(target_batch) - 1)
-                st.rerun()
-        with batch_next_col:
-            if st.button(
-                "Next Batch →",
-                disabled=current_batch_index >= total_batches - 1,
-                use_container_width=True,
-                key=_scope_key(ui_scope, "next_batch")
-            ):
-                load_search_batch(current_batch_index + 1)
-                st.rerun()
-
-        st.caption("OpenAlex deep paging is cursor-based, so batch jumps reuse saved checkpoints rather than direct page numbers.")
-
         collected_count = len(st.session_state.app_state.get('search_results', []) or [])
         collect_disabled = not search_state.get('filters') or _get_result_limit(search_state) <= 0
-        collect_label = (
-            f"Collect All Matching OpenAlex Authors "
-            f"({min(_get_result_limit(search_state), int(search_state.get('max_results') or 0)):,} max)"
+        target_count = min(_get_result_limit(search_state), int(search_state.get('max_results') or 0))
+
+        summary_cols = st.columns(3)
+        summary_cols[0].metric("OpenAlex Matches", f"{int(search_state.get('total_count') or 0):,}")
+        summary_cols[1].metric("Target Cap", f"{target_count:,}")
+        summary_cols[2].metric("Collected", f"{int(search_state.get('collected_count') or collected_count):,}")
+
+        combined_disabled = collect_disabled or not db_storage.available
+        combined_help = (
+            "Collects every bounded OpenAlex match, saves the collection in PostgreSQL, "
+            "then fetches ORCID emails for all collected post-filter candidates."
         )
         if st.button(
-            collect_label,
-            key=_scope_key(ui_scope, "collect_all_openalex"),
-            type="secondary",
+            "Collect Authors & Fetch ORCID Emails",
+            key=_scope_key(ui_scope, "collect_and_fetch_openalex"),
+            type="primary",
             use_container_width=True,
-            disabled=collect_disabled,
-            help="Fetches all bounded OpenAlex matches for the pre-filters, saves them to the collected-author database, and displays them for post-filtering.",
+            disabled=combined_disabled,
+            help=combined_help,
         ):
-            progress = st.progress(0)
-            status = st.empty()
+            run_openalex_collect_and_fetch(filters, ui_scope)
+        if not db_storage.available:
+            st.warning("PostgreSQL is required to collect OpenAlex authors and save fetched emails.")
 
-            def _progress(done: int, total: int) -> None:
-                progress.progress(min(done / total, 1.0) if total else 0)
-                status.text(f"Collected {done:,} / {total:,} OpenAlex authors...")
+        collect_label = (
+            f"Collect All Matching OpenAlex Authors "
+            f"({target_count:,} max)"
+        )
 
-            with st.spinner("Collecting all matching OpenAlex authors..."):
-                active_collection = None
-                if db_storage.available:
-                    active_collection = db_storage.activate_collection_search(
-                        _collection_config_from_search_state(search_state),
-                        topic_details=[
-                            {"id": topic_id, "name": topic_id}
-                            for topic_id in (search_state.get('filters', {}).get('topic_ids') or [])
-                        ],
-                        start_over=True,
-                        baseline_concurrency=OPENALEX_ORCID_FETCH_CONCURRENCY,
-                        baseline_delay=OPENALEX_ORCID_FETCH_DELAY_SEC,
-                    )
-                search_run_id = int((active_collection or {}).get('search_run_id') or 0)
-                if not search_run_id:
-                    st.error("Could not create a durable collection search in PostgreSQL.")
-                    st.stop()
-
-                collected_authors = _collect_openalex_authors_for_state(
-                    search_state,
-                    client=OpenAlexClient(),
-                    storage=db_storage,
-                    search_run_id=search_run_id,
-                    max_results=int(search_state.get('max_results') or _get_result_limit(search_state)),
-                    jump_size=int(search_state.get('jump_size') or 250),
-                    disciplines=search_state.get('filters', {}).get('disciplines') or filters.get('disciplines', []),
-                    progress_callback=_progress,
-                )
-                refreshed_rows = db_storage.fetch_collected_authors(
-                    search_run_id,
-                    limit=max(len(collected_authors), 1),
-                )
-                if refreshed_rows:
-                    collected_authors = [_map_harvested_row_to_author(row) for row in refreshed_rows]
-
-            st.session_state.app_state['search_results'] = collected_authors
-            search_state['all_collected'] = True
-            search_state['collected_count'] = len(collected_authors)
-            search_state['search_run_id'] = search_run_id
-            st.session_state.app_state['active_collection_search_run_id'] = search_run_id
-            search_state['current_batch_index'] = 0
-            search_state['current_batch_results'] = collected_authors
-            search_state['batch_cache'] = {'0': collected_authors}
-            search_state['current_range_start'] = 1 if collected_authors else 0
-            search_state['current_range_end'] = len(collected_authors)
-            st.session_state[_scope_key(ui_scope, "results_page")] = 0
-            st.session_state.filtered_authors = []
-            st.session_state.last_collect_result = (
-                f"Collected {len(collected_authors):,} OpenAlex authors from the active pre-filters."
+        with st.expander("Advanced OpenAlex controls", expanded=False):
+            current_jump_size = int(search_state.get('jump_size', 250) or 250)
+            selected_jump_size = st.selectbox(
+                "Batch Jump Size",
+                options=[250, 500, 1000],
+                index=[250, 500, 1000].index(current_jump_size),
+                key=_scope_key(ui_scope, "batch_jump_size_control"),
+                help="Reload OpenAlex result batches using the selected jump size"
             )
-            save_state()
-            st.rerun()
+            if selected_jump_size != current_jump_size:
+                load_search_batch(0, jump_size=selected_jump_size, reset=True)
+                st.rerun()
+
+            st.caption(
+                f"Visible OpenAlex range: {current_start:,}-{current_end:,} of {total_visible_results:,} | "
+                f"Batch {current_batch_index + 1} of {total_batches}"
+            )
+
+            batch_prev_col, batch_num_col, batch_go_col, batch_next_col = st.columns([1, 1.2, 0.8, 1])
+            with batch_prev_col:
+                if st.button(
+                    "Previous Batch",
+                    disabled=current_batch_index == 0,
+                    use_container_width=True,
+                    key=_scope_key(ui_scope, "prev_batch")
+                ):
+                    load_search_batch(current_batch_index - 1)
+                    st.rerun()
+            with batch_num_col:
+                target_batch = st.number_input(
+                    "Jump to Batch",
+                    min_value=1,
+                    max_value=total_batches,
+                    value=current_batch_index + 1,
+                    step=1,
+                    key=_scope_key(ui_scope, "target_batch_number")
+                )
+            with batch_go_col:
+                if st.button("Go", use_container_width=True, key=_scope_key(ui_scope, "go_batch")):
+                    load_search_batch(int(target_batch) - 1)
+                    st.rerun()
+            with batch_next_col:
+                if st.button(
+                    "Next Batch",
+                    disabled=current_batch_index >= total_batches - 1,
+                    use_container_width=True,
+                    key=_scope_key(ui_scope, "next_batch")
+                ):
+                    load_search_batch(current_batch_index + 1)
+                    st.rerun()
+
+            st.caption("OpenAlex deep paging is cursor-based, so batch jumps reuse saved checkpoints rather than direct page numbers.")
+            if st.button(
+                collect_label,
+                key=_scope_key(ui_scope, "collect_all_openalex"),
+                type="secondary",
+                use_container_width=True,
+                disabled=collect_disabled or not db_storage.available,
+                help="Collects the bounded OpenAlex matches without starting ORCID email fetching.",
+            ):
+                progress = st.progress(0)
+                status = st.empty()
+
+                def _progress(done: int, total: int) -> None:
+                    progress.progress(min(done / total, 1.0) if total else 0)
+                    status.text(f"Collected {done:,} / {total:,} OpenAlex authors...")
+
+                with st.spinner("Collecting all matching OpenAlex authors..."):
+                    collected_authors = _collect_openalex_for_active_search(
+                        filters,
+                        ui_scope,
+                        progress_callback=_progress,
+                    )
+                if collected_authors:
+                    st.session_state.last_collect_result = (
+                        f"Collected {len(collected_authors):,} OpenAlex authors from the active pre-filters."
+                    )
+                    save_state()
+                    st.rerun()
 
         if st.session_state.get('last_collect_result'):
             st.success(st.session_state.pop('last_collect_result'))
         elif collected_count:
             st.caption(f"Current OpenAlex result set contains {collected_count:,} authors.")
-    
+
     filtered = results.copy()
 
     # Apply text search filter from top-of-page search input
@@ -3347,14 +3410,14 @@ def display_results(filters, ui_scope: str):
         if show_openalex_batch_controls:
             _sync_current_batch_cache()
         save_state()
-    
+
     if st.session_state.get('last_bulk_enqueue_result'):
         message = st.session_state.pop('last_bulk_enqueue_result')
         st.toast(message, icon="✅" if message.startswith("Queued") else "⚠️")
-    
+
     # Get retracted author names from DB (lowercased set for fast matching)
     retracted_names = _cached_retracted_names()
-    
+
     # Tag each author with retraction and sent status
     for r in filtered:
         r['is_retracted'] = r.get('name', '').lower() in retracted_names
@@ -3363,7 +3426,7 @@ def display_results(filters, ui_scope: str):
     sidebar_disciplines = [d for d in filters.get('disciplines', []) if d]
     if sidebar_disciplines:
         filtered = [r for r in filtered if r.get('discipline') in sidebar_disciplines]
-    
+
     # Collect unique disciplines, specialties, and author domains from results.
     all_disciplines = set()
     all_specialties = set()
@@ -3376,10 +3439,10 @@ def display_results(filters, ui_scope: str):
         elif r.get('specialty'):
             all_specialties.add(r['specialty'])
         all_author_domains.update(_extract_author_domains(r))
-    
+
     # Filter options - Row 1: Discipline and Specialty filters
     col_f1, col_f2 = st.columns(2)
-    
+
     with col_f1:
         # Discipline filter (multiselect)
         selected_disciplines = st.multiselect(
@@ -3389,7 +3452,7 @@ def display_results(filters, ui_scope: str):
             key=_scope_key(ui_scope, "discipline_filter"),
             help="Filter by broad discipline category"
         )
-    
+
     with col_f2:
         previous_specialties_key = _scope_key(ui_scope, "specialty_filter_multi_previous")
         specialty_filter_key = _scope_key(ui_scope, "specialty_filter_multi")
@@ -3460,11 +3523,11 @@ def display_results(filters, ui_scope: str):
         if st.session_state.get(previous_specialties_key) != selected_specialty_signature:
             st.session_state[_scope_key(ui_scope, "results_page")] = 0
             st.session_state[previous_specialties_key] = selected_specialty_signature
-    
+
     # Apply discipline filter
     if selected_disciplines:
         filtered = [r for r in filtered if r.get('discipline') in selected_disciplines]
-    
+
     # Apply specialty filter
     matched_before_other_filters = len(filtered)
     if selected_specialties:
@@ -3474,7 +3537,7 @@ def display_results(filters, ui_scope: str):
         f"Selected specialties: {len(selected_specialties):,} | "
         f"Matched before other filters: {matched_before_other_filters:,}"
     )
-    
+
     # Country post-filters. Inclusion wins if a code is selected in both lists.
     all_countries = sorted({r.get('country') for r in results if r.get('country')})
     included_codes: set[str] = set()
@@ -3566,7 +3629,7 @@ def display_results(filters, ui_scope: str):
             r for r in filtered
             if not excluded_domain_lookup.intersection({value.lower() for value in _extract_author_domains(r)})
         ]
-    
+
     # Filter options - Row 2: Checkboxes
     col_filter1, col_filter2, col_filter3 = st.columns(3)
     filter_email_key = _scope_key(ui_scope, "filter_email")
@@ -3592,15 +3655,15 @@ def display_results(filters, ui_scope: str):
         )
 
     retracted_in_scope = sum(1 for r in filtered if r.get('is_retracted'))
-    
+
     # Apply email filter
     if show_only_with_email:
         filtered = [r for r in filtered if r.get('email')]
-    
+
     # Apply sent filter
     if show_only_not_sent:
         filtered = [r for r in filtered if _recipient_tracking_id(r) not in sent_invitations]
-    
+
     # Apply retraction filter
     if hide_retracted:
         filtered = [r for r in filtered if not r.get('is_retracted')]
@@ -3672,14 +3735,14 @@ def display_results(filters, ui_scope: str):
     removed_duplicates = before_dedupe_count - len(filtered)
     if removed_duplicates:
         st.caption(f"Removed duplicate authors from filtered results: {removed_duplicates:,}")
-    
+
     # Store filtered list in session state for email fetching
     st.session_state[_scope_key(ui_scope, "filtered_authors")] = filtered
     st.session_state.filtered_authors = filtered
-    
+
     # Count authors without email in filtered list
     without_email = sum(1 for r in filtered if not r.get('email'))
-    
+
     # Check how many have been processed already
     already_processed = sum(1 for r in filtered if r.get('orcid_id') in processed)
     fetch_candidate_count = (
@@ -3755,50 +3818,72 @@ def display_results(filters, ui_scope: str):
                     disabled=not diagnostic_display_rows,
                     key=_scope_key(ui_scope, "download_displayed_diagnostics"),
                 )
-    
-    # Fetch Emails button - only for filtered authors
-    st.divider()
-    col_btn1, col_btn2 = st.columns([2, 1])
-    with col_btn1:
-        if is_author_workflow and author_source_mode == AUTHOR_SOURCE_OPENALEX:
+
+    # Fetch Emails button - available only as an advanced/resume action in the simplified author flow.
+    fetch_emails_clicked = False
+    stop_clicked = False
+    if is_author_workflow and author_source_mode == AUTHOR_SOURCE_OPENALEX:
+        with st.expander("Advanced ORCID fetch controls", expanded=False):
             if not openalex_collection_complete and without_email > 0:
-                fetch_btn_label = "Collect All Matching OpenAlex Authors Before Fetching Emails"
+                fetch_btn_label = "Collect Authors & Fetch ORCID Emails first"
             elif fetch_candidate_count > 0:
-                fetch_btn_label = f"Fetch Emails for {fetch_candidate_count} Filtered Collected Authors"
+                fetch_btn_label = f"Resume ORCID Fetch for {fetch_candidate_count} Filtered Collected Authors"
             else:
                 fetch_btn_label = "All Filtered Collected Authors Have Emails or Are Processed"
-        else:
-            fetch_btn_label = f"Fetch Emails for {fetch_candidate_count} Filtered Authors" if fetch_candidate_count > 0 else "All Filtered Authors Have Emails or Are Processed"
-        fetch_emails_clicked = st.button(
-            fetch_btn_label,
-            type="primary" if fetch_candidate_count > 0 else "secondary",
-            use_container_width=True,
-            disabled=fetch_candidate_count == 0,
-            key=_scope_key(ui_scope, "fetch_emails")
-        )
-    with col_btn2:
-        stop_clicked = st.button(
-            "Stop Fetching",
-            use_container_width=True,
-            key=_scope_key(ui_scope, "stop_fetching")
-        )
-    
-    # Show tip about email rates if many processed but few found
-    if already_processed > 0 and without_email > 0:
+            adv_col_btn1, adv_col_btn2 = st.columns([2, 1])
+            with adv_col_btn1:
+                fetch_emails_clicked = st.button(
+                    fetch_btn_label,
+                    type="secondary",
+                    use_container_width=True,
+                    disabled=fetch_candidate_count == 0,
+                    key=_scope_key(ui_scope, "fetch_emails")
+                )
+            with adv_col_btn2:
+                stop_clicked = st.button(
+                    "Stop Fetching",
+                    use_container_width=True,
+                    key=_scope_key(ui_scope, "stop_fetching")
+                )
+            st.caption(
+                "Use this only to resume remaining ORCID lookups after a pause or rate limit. "
+                "The main OpenAlex button already collects and fetches across the full collected set."
+            )
+    elif not (is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE):
+        st.divider()
+        col_btn1, col_btn2 = st.columns([2, 1])
+        with col_btn1:
+            fetch_btn_label = (
+                f"Fetch Emails for {fetch_candidate_count} Filtered Authors"
+                if fetch_candidate_count > 0
+                else "All Filtered Authors Have Emails or Are Processed"
+            )
+            fetch_emails_clicked = st.button(
+                fetch_btn_label,
+                type="primary" if fetch_candidate_count > 0 else "secondary",
+                use_container_width=True,
+                disabled=fetch_candidate_count == 0,
+                key=_scope_key(ui_scope, "fetch_emails")
+            )
+        with col_btn2:
+            stop_clicked = st.button(
+                "Stop Fetching",
+                use_container_width=True,
+                key=_scope_key(ui_scope, "stop_fetching")
+            )
+
+    if already_processed > 0 and without_email > 0 and not (is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE):
         with_email_count = sum(1 for r in filtered if r.get('email'))
         rate = (with_email_count / already_processed * 100) if already_processed > 0 else 0
         if rate < 20:
-            st.caption(
-                f"ℹ️ ORCID public emails: ~10-15% of academics share their email publicly. "
-                f"Enable **Tavily search** or **OpenAI web search** in sidebar for more results."
-            )
-    
+            st.caption("ORCID public email yield is usually limited because many profiles do not expose an email address.")
+
     if stop_clicked:
         st.session_state.stop_fetching = True
-    
+
     if fetch_emails_clicked:
         run_email_fetch_filtered(filters, ui_scope)
-    
+
     # Summary metrics
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
@@ -3814,15 +3899,8 @@ def display_results(filters, ui_scope: str):
     with col5:
         sent_count = sum(1 for r in filtered if _recipient_tracking_id(r) in sent_invitations)
         st.metric(f"Sent ({_invitation_type_label(invitation_type)})", sent_count)
-    
+
     st.divider()
-
-    # Results table with Send buttons
-    st.subheader(f"3. Results ({len(filtered):,})")
-
-    if not filtered:
-        st.info(empty_results_message or "No authors match the current filters.")
-        return
 
     invitation_counts: dict[str, int] = {}
     suppressed_keys = {"emails": set(), "orcids": set(), "profile_keys": set()}
@@ -3844,7 +3922,60 @@ def display_results(filters, ui_scope: str):
                 in suppressed_keys["orcids"]
             or (row.get('profile_key') or '').strip() in suppressed_keys["profile_keys"]
         )
-    
+
+    ready_results = [
+        row for row in filtered
+        if row.get('email')
+        and not result_is_suppressed(row)
+        and not row.get('is_retracted')
+        and _recipient_tracking_id(row) not in sent_invitations
+    ]
+    no_email_results = [
+        row for row in filtered
+        if not row.get('email')
+        and not result_is_suppressed(row)
+        and not row.get('is_retracted')
+        and _recipient_tracking_id(row) not in sent_invitations
+    ]
+    blocked_results = [
+        row for row in filtered
+        if result_is_suppressed(row)
+        or row.get('is_retracted')
+        or _recipient_tracking_id(row) in sent_invitations
+    ]
+    recipient_views = {
+        "Ready to Send": ready_results,
+        "No Email": no_email_results,
+        "Suppressed / Purged": blocked_results,
+        "Diagnostics": filtered,
+    }
+    recipient_view_key = _scope_key(ui_scope, "recipient_view")
+    recipient_view_options = list(recipient_views.keys())
+    if st.session_state.get(recipient_view_key) not in recipient_view_options:
+        st.session_state[recipient_view_key] = "Ready to Send"
+    recipient_view = st.radio(
+        "Recipient tab",
+        options=recipient_view_options,
+        horizontal=True,
+        key=recipient_view_key,
+    )
+    if recipient_view == "Diagnostics":
+        st.caption(
+            f"Ready={len(ready_results):,} | No email={len(no_email_results):,} | "
+            f"Suppressed/Purged/Sent/Retracted={len(blocked_results):,}"
+        )
+    filtered = recipient_views[recipient_view]
+
+    # Results table with Send buttons
+    st.subheader(f"Recipients: {recipient_view} ({len(filtered):,})")
+
+    if not filtered:
+        if recipient_view == "Ready to Send":
+            st.info("No ready-to-send recipients match the current filters yet.")
+        else:
+            st.info(empty_results_message or "No authors match the current filters.")
+        return
+
     # Prepare dataframe for export
     df_data = []
     for r in filtered:
@@ -3873,9 +4004,9 @@ def display_results(filters, ui_scope: str):
             'orcid_id': orcid_id,
             'all_topics': r.get('all_topics', [])
         })
-    
+
     df = pd.DataFrame(df_data)
-    
+
     # Custom CSS for row highlighting
     st.markdown("""
     <style>
@@ -3908,7 +4039,7 @@ def display_results(filters, ui_scope: str):
     }
     </style>
     """, unsafe_allow_html=True)
-    
+
     # Table header
     header_cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
     with header_cols[0]:
@@ -3925,9 +4056,9 @@ def display_results(filters, ui_scope: str):
         st.markdown("**Email**")
     with header_cols[6]:
         st.markdown("**Send / Re-send**")
-    
+
     st.divider()
-    
+
     # Display rows with Send buttons (paginated)
     page_size = 25
     total_pages = (len(filtered) + page_size - 1) // page_size
@@ -3935,7 +4066,7 @@ def display_results(filters, ui_scope: str):
     if results_page_key not in st.session_state:
         st.session_state[results_page_key] = 0
     current_results_page = st.session_state[results_page_key]
-    
+
     # Pagination controls
     if total_pages > 1:
         col_prev, col_page, col_next = st.columns([1, 2, 1])
@@ -3957,16 +4088,16 @@ def display_results(filters, ui_scope: str):
             ):
                 st.session_state[results_page_key] = min(total_pages - 1, current_results_page + 1)
                 st.rerun()
-    
+
     # Get current page of results
     start_idx = current_results_page * page_size
     end_idx = min(start_idx + page_size, len(filtered))
     page_results = filtered[start_idx:end_idx]
-    
+
     # --- Bulk send controls ---
     filtered_with_email = [a for a in filtered if a.get('email')]
 
-    st.subheader("4. Review & Queue")
+    st.subheader("4. Send")
     st.caption(f"Bulk settings for {_invitation_type_label(invitation_type)}")
     bulk_template_names = get_template_names(invitation_type)
     bulk_col1, bulk_col2, bulk_col3 = st.columns([1.4, 1.4, 1.2])
@@ -4015,7 +4146,7 @@ def display_results(filters, ui_scope: str):
         ),
     )
     filters['suppress_after_send'] = bulk_suppress_after_send
-    
+
     col_count, col_note, col_bulk = st.columns([1.2, 1.2, 1.6])
     with col_count:
         eligible_batch_limit = min(1000, len(filtered_with_email))
@@ -4091,7 +4222,7 @@ def display_results(filters, ui_scope: str):
         if isinstance(pending_filters, dict):
             dialog_filters.update(pending_filters)
         email_dialog(pending_author, dialog_filters)
-    
+
     # --- Display rows ---
     for idx, author in enumerate(page_results):
         orcid_id = author.get('orcid_id', '')
@@ -4105,9 +4236,9 @@ def display_results(filters, ui_scope: str):
             orcid_id,
             author.get('profile_key', ''),
         )
-        
+
         cols = st.columns([2.2, 0.6, 1.8, 1.3, 0.7, 2, 1])
-        
+
         with cols[0]:
             name_display = author.get('name', '')
             source_origin = author.get('source_origin', AUTHOR_SOURCE_OPENALEX)
@@ -4128,23 +4259,23 @@ def display_results(filters, ui_scope: str):
                 st.caption(f"Invited: {invited_count}")
             if is_suppressed:
                 st.caption("Suppressed")
-        
+
         with cols[1]:
             st.write(author.get('h_index', ''))
-        
+
         with cols[2]:
             specialty = author.get('specialty', '') or ''
             if len(specialty) > 30:
                 specialty = specialty[:27] + "..."
             st.write(specialty)
-        
+
         with cols[3]:
             st.write(author.get('discipline', ''))
-        
+
         with cols[4]:
             country_code = author.get('country', '')
             st.write(country_code or '—')
-        
+
         with cols[5]:
             email = author.get('email', '')
             all_emails = author.get('all_emails', '')
@@ -4161,7 +4292,7 @@ def display_results(filters, ui_scope: str):
                     st.write(email_display)
             else:
                 st.caption("No email")
-        
+
         with cols[6]:
             if is_suppressed:
                 st.button(
@@ -4204,9 +4335,9 @@ def display_results(filters, ui_scope: str):
                     key=_scope_key(ui_scope, f"no_email_{start_idx + idx}"),
                     use_container_width=True
                 )
-    
+
     st.divider()
-    
+
     export_key = _scope_key(ui_scope, "prepared_exports")
     export_signature = tuple(_recipient_tracking_id(row) for row in filtered)
     if st.button("Prepare CSV Exports", key=_scope_key(ui_scope, "prepare_exports"), use_container_width=True):
@@ -4229,33 +4360,33 @@ def display_results(filters, ui_scope: str):
 
 def render_invitation_section(filters):
     """Render the invitation template section with editable fields."""
-    
+
     st.header("Send Invitation")
-    
+
     selected = st.session_state.selected_author
     journal_config = st.session_state.app_state.get('journal_config', {})
     publisher_id = filters.get('publisher', 'brevo')
-    
+
     # Check if ready
     if not selected:
         st.info("Select an author from the table above to send an invitation.")
         return
-    
+
     if not journal_config.get('name'):
         st.warning("Please configure journal details in the sidebar.")
         return
-    
+
     is_already_notified = is_author_notified(selected.get('orcid_id', ''))
-    
+
     if is_already_notified:
         st.error("⚠️ WARNING: This author has ALREADY been notified! Sending again will result in a DUPLICATE invitation.")
     recipient_suppressed = is_recipient_suppressed(selected.get('email', ''), selected.get('orcid_id', ''))
     if recipient_suppressed:
         st.warning("This recipient has unsubscribed before. Sending is blocked.")
-    
+
     # Template selection
     col1, col2 = st.columns([2, 1])
-    
+
     with col1:
         template_names = get_template_names()
         template_id = st.selectbox(
@@ -4265,20 +4396,20 @@ def render_invitation_section(filters):
             key="template_select"
         )
         scopus_indexed = st.checkbox("Journal is Scopus indexed", value=False, key="main_scopus")
-    
+
     with col2:
         st.markdown(f"**Selected Author:** {selected['name']}")
         if selected.get('email'):
             st.markdown(f"**Author Email:** {selected['email']}")
         else:
             st.warning("No email available")
-    
+
     # Format template - publisher name and location come from PUBLISHER_INFO (follows selected publisher)
     pub_info = PUBLISHER_INFO.get(publisher_id, {})
     publisher_name = pub_info.get('name') or (email_sender.get_publisher_name(publisher_id) if EMAIL_AVAILABLE else "")
     publisher_location = pub_info.get('location') or journal_config.get('location', '')
     sender_email = email_sender.get_publisher_email(publisher_id) if EMAIL_AVAILABLE else ""
-    
+
     formatted = format_template(
         template_id=template_id,
         author_name=selected['name'],
@@ -4291,15 +4422,15 @@ def render_invitation_section(filters):
         publisher_location=publisher_location,
         scopus_indexed=scopus_indexed
     )
-    
+
     st.divider()
-    
+
     # Editable email fields
     st.subheader("Email Content (Editable)")
-    
+
     # Use author's orcid_id to create unique keys so fields update when author changes
     author_key = selected.get('orcid_id', 'none')
-    
+
     # To field - editable for testing
     default_to = selected.get('email', '') or ''
     to_email = st.text_input(
@@ -4308,14 +4439,14 @@ def render_invitation_section(filters):
         placeholder="Enter email address (change for testing)",
         key=f"email_to_{author_key}"
     )
-    
+
     # Subject - editable
     subject = st.text_input(
         "Subject",
         value=formatted['subject'],
         key=f"email_subject_{author_key}_{template_id}_{scopus_indexed}"
     )
-    
+
     # Body - editable
     body = st.text_area(
         "Email Body",
@@ -4323,9 +4454,9 @@ def render_invitation_section(filters):
         height=350,
         key=f"email_body_{author_key}_{template_id}_{scopus_indexed}"
     )
-    
+
     st.divider()
-    
+
     # PDF attachment option
     col_opt1, col_opt2 = st.columns(2)
     with col_opt1:
@@ -4343,7 +4474,7 @@ def render_invitation_section(filters):
             "outreach. Unsubscribe requests remain active regardless of this setting."
         ),
     )
-    
+
     # Preview PDF
     if attach_pdf:
         with st.expander("Preview PDF"):
@@ -4365,9 +4496,9 @@ def render_invitation_section(filters):
                 st.success(f"PDF ready ({len(pdf_bytes):,} bytes)")
             except Exception as e:
                 st.error(f"PDF generation error: {str(e)}")
-    
+
     st.divider()
-    
+
     # Confirmation checkbox for already notified authors
     confirm_resend = True  # Default to allowed
     if is_already_notified:
@@ -4376,18 +4507,18 @@ def render_invitation_section(filters):
             value=False,
             key="confirm_resend_main"
         )
-    
+
     # Action buttons
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
         # Copy subject to clipboard workaround
         st.text_input("Copy Subject:", value=subject, key="copy_subject", disabled=True)
-    
+
     with col2:
         if st.button("Show Body for Copy", use_container_width=True):
             st.code(body, language=None)
-    
+
     with col3:
         # Send button
         send_blocked = recipient_suppressed or (is_already_notified and not confirm_resend)
@@ -4409,7 +4540,7 @@ def render_invitation_section(filters):
                         except Exception as e:
                             st.error(f"PDF generation failed: {str(e)}")
                             pdf_bytes = None
-                    
+
                     success, msg = email_sender.send_email(
                         publisher_id=publisher_id,
                         to_email=to_email,
@@ -4426,7 +4557,7 @@ def render_invitation_section(filters):
                         journal_quartile=journal_config.get('quartile', ''),
                         unsubscribe_url=_build_unsubscribe_url(to_email, selected.get('orcid_id', '')),
                     )
-                
+
                 if success:
                     db_ok = mark_author_notified(
                         selected['orcid_id'],
@@ -4771,7 +4902,7 @@ def main():
                 if st.button("Cancel", key=f"header_cancel_job_{job.get('id')}", use_container_width=True):
                     db_storage.cancel_bulk_email_job(int(job.get('id')))
                     st.rerun()
-    
+
     # Render sidebar and get filters
     shared_filters = render_sidebar()
 
