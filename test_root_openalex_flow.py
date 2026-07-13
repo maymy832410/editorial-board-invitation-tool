@@ -335,6 +335,36 @@ def test_email_fetch_criteria_ignores_display_email_filter_only():
     assert display_criteria["email_filter"] == "with"
 
 
+def test_diagnostic_rows_for_csv_are_compact():
+    rows = app._diagnostic_rows_for_csv([
+        {
+            "openalex_id": "https://openalex.org/A1",
+            "orcid_id": "0000-0001",
+            "author_name": "Author One",
+            "email": "",
+            "email_status": "no_email",
+            "attempts": 2,
+            "discipline": "Medicine",
+        }
+    ])
+
+    assert rows == [{
+        "openalex_id": "https://openalex.org/A1",
+        "orcid_id": "0000-0001",
+        "name": "Author One",
+        "email": "",
+        "email_status": "no_email",
+        "email_source": "",
+        "next_retry_at": "",
+        "attempts": 2,
+        "h_index": "",
+        "discipline": "Medicine",
+        "specialty": "",
+        "country": "",
+        "institution": "",
+    }]
+
+
 def test_collection_filter_clause_includes_post_filters():
     storage = PostgresStorage.__new__(PostgresStorage)
 

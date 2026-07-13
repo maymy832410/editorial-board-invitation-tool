@@ -428,6 +428,28 @@ def _criteria_for_openalex_email_fetch(criteria: dict | None) -> dict:
     return fetch_criteria
 
 
+def _diagnostic_rows_for_csv(rows: list[dict]) -> list[dict]:
+    """Keep diagnostic CSV columns compact and useful."""
+    prepared: list[dict] = []
+    for row in rows:
+        prepared.append({
+            "openalex_id": row.get("openalex_id") or row.get("author_id") or "",
+            "orcid_id": row.get("orcid_id") or "",
+            "name": row.get("author_name") or row.get("name") or "",
+            "email": row.get("email") or "",
+            "email_status": row.get("email_status") or "",
+            "email_source": row.get("email_source") or "",
+            "next_retry_at": row.get("next_retry_at") or "",
+            "attempts": row.get("attempts") or "",
+            "h_index": row.get("h_index") or "",
+            "discipline": row.get("discipline") or "",
+            "specialty": row.get("specialty") or "",
+            "country": row.get("country") or "",
+            "institution": row.get("institution") or "",
+        })
+    return prepared
+
+
 def _find_session_author_by_orcid(orcid_id: str) -> dict | None:
     """Find the first in-session author matching an ORCID."""
     for author in st.session_state.app_state.get('search_results', []) or []:
@@ -3671,6 +3693,68 @@ def display_results(filters, ui_scope: str):
         )
         else len(_build_email_fetch_candidates(filtered, processed))
     )
+
+    if (
+        is_author_workflow
+        and author_source_mode == AUTHOR_SOURCE_OPENALEX
+        and openalex_collection_complete
+        and active_search_run_id
+        and db_storage.available
+    ):
+        with st.expander("OpenAlex fetch diagnostics", expanded=fetch_candidate_count <= 5):
+            diag_cols = st.columns(4)
+            diag_cols[0].metric("Search run", active_search_run_id)
+            diag_cols[1].metric("Displayed rows", f"{len(filtered):,}")
+            diag_cols[2].metric("Fetchable ORCID rows", f"{fetch_candidate_count:,}")
+            diag_cols[3].metric("With saved email", f"{db_collected_counts.get('with_email', 0):,}")
+
+            status_bits = [
+                f"total={db_collected_counts.get('total', 0):,}",
+                f"fetchable={db_fetch_counts.get('pending', 0):,}",
+                f"found={db_collected_counts.get('found', 0):,}",
+                f"no_email={db_collected_counts.get('no_email', 0):,}",
+                f"no_orcid={db_collected_counts.get('no_orcid', 0):,}",
+                f"error={db_collected_counts.get('error', 0):,}",
+                f"processed_this_session={len(processed):,}",
+            ]
+            st.caption(" | ".join(status_bits))
+
+            st.json({
+                "display_criteria": db_collected_criteria,
+                "fetch_criteria": db_fetch_criteria,
+            }, expanded=False)
+
+            diagnostic_fetch_rows = db_storage.fetch_pending_collected_authors(
+                active_search_run_id,
+                db_fetch_criteria,
+                limit=1000,
+            )
+            diagnostic_display_rows = db_storage.fetch_collected_authors(
+                active_search_run_id,
+                db_collected_criteria,
+                limit=5000,
+            )
+            diag_csv_cols = st.columns(2)
+            with diag_csv_cols[0]:
+                st.download_button(
+                    "Download fetchable sample CSV",
+                    pd.DataFrame(_diagnostic_rows_for_csv(diagnostic_fetch_rows)).to_csv(index=False),
+                    file_name=f"openalex_fetchable_run_{active_search_run_id}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    disabled=not diagnostic_fetch_rows,
+                    key=_scope_key(ui_scope, "download_fetchable_diagnostics"),
+                )
+            with diag_csv_cols[1]:
+                st.download_button(
+                    "Download displayed collected CSV",
+                    pd.DataFrame(_diagnostic_rows_for_csv(diagnostic_display_rows)).to_csv(index=False),
+                    file_name=f"openalex_displayed_run_{active_search_run_id}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    disabled=not diagnostic_display_rows,
+                    key=_scope_key(ui_scope, "download_displayed_diagnostics"),
+                )
     
     # Fetch Emails button - only for filtered authors
     st.divider()
