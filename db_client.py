@@ -3764,6 +3764,231 @@ class PostgresStorage:
             print(f"PostgreSQL count search harvest error: {e}")
             return counts
 
+    def _collection_filter_clause(
+        self,
+        criteria: Optional[Dict[str, Any]] = None,
+        *,
+        pending_only: bool = False,
+    ) -> tuple[str, List[Any]]:
+        """Build SQL predicates for post-filtering one collected search run."""
+        criteria = criteria or {}
+        clauses: List[str] = []
+        params: List[Any] = []
+
+        if pending_only:
+            clauses.append("h.email_status = %s")
+            params.append(EMAIL_STATUS_PENDING)
+            clauses.append("h.orcid_id <> ''")
+            clauses.append("(h.next_retry_at IS NULL OR h.next_retry_at <= NOW())")
+
+        search_text = _normalize_text(criteria.get("search_text")).lower()
+        if search_text:
+            like = f"%{search_text}%"
+            clauses.append(
+                """
+                (
+                    LOWER(h.author_name) LIKE %s OR LOWER(h.email) LIKE %s OR
+                    LOWER(h.all_emails) LIKE %s OR LOWER(h.institution) LIKE %s OR
+                    LOWER(h.country) LIKE %s OR LOWER(h.orcid_id) LIKE %s OR
+                    LOWER(h.openalex_id) LIKE %s OR LOWER(h.discipline) LIKE %s OR
+                    LOWER(h.specialty) LIKE %s OR LOWER(h.subfield) LIKE %s OR
+                    LOWER(h.research_areas) LIKE %s OR LOWER(h.all_topics_json) LIKE %s
+                )
+                """
+            )
+            params.extend([like] * 12)
+
+        disciplines = [_normalize_text(v) for v in criteria.get("disciplines") or [] if _normalize_text(v)]
+        if disciplines:
+            clauses.append("h.discipline = ANY(%s)")
+            params.append(disciplines)
+
+        include_countries = [
+            _normalize_text(v).upper()
+            for v in criteria.get("include_countries") or []
+            if _normalize_text(v)
+        ]
+        if include_countries:
+            clauses.append("h.country = ANY(%s)")
+            params.append(include_countries)
+
+        exclude_countries = [
+            _normalize_text(v).upper()
+            for v in criteria.get("exclude_countries") or []
+            if _normalize_text(v)
+        ]
+        if exclude_countries:
+            clauses.append("NOT (h.country = ANY(%s))")
+            params.append(exclude_countries)
+
+        def add_domain_terms(values: List[str], *, negate: bool = False) -> None:
+            terms = [_normalize_text(v).lower() for v in values or [] if _normalize_text(v)]
+            if not terms:
+                return
+            term_clauses = []
+            for term in terms:
+                like = f"%{term}%"
+                term_clauses.append(
+                    """
+                    (
+                        LOWER(h.discipline) LIKE %s OR LOWER(h.specialty) LIKE %s OR
+                        LOWER(h.subfield) LIKE %s OR LOWER(h.research_areas) LIKE %s OR
+                        LOWER(h.all_topics_json) LIKE %s
+                    )
+                    """
+                )
+                params.extend([like] * 5)
+            joined = " OR ".join(term_clauses)
+            clauses.append(f"NOT ({joined})" if negate else f"({joined})")
+
+        add_domain_terms(criteria.get("specialties") or [])
+        add_domain_terms(criteria.get("include_domains") or [])
+        add_domain_terms(criteria.get("exclude_domains") or [], negate=True)
+
+        email_filter = criteria.get("email_filter")
+        if email_filter == "with":
+            clauses.append("h.email <> ''")
+        elif email_filter == "without":
+            clauses.append("h.email = ''")
+
+        if criteria.get("hide_retracted"):
+            names = [
+                _normalize_author_name(value)
+                for value in criteria.get("retracted_names") or []
+                if _normalize_author_name(value)
+            ]
+            if names:
+                clauses.append("NOT (h.author_name_lower = ANY(%s))")
+                params.append(names)
+
+        if criteria.get("hide_sent"):
+            sent_ids = [
+                _normalize_orcid(value)
+                for value in criteria.get("sent_orcids") or []
+                if _normalize_orcid(value)
+            ]
+            if sent_ids:
+                clauses.append("NOT (h.orcid_id = ANY(%s))")
+                params.append(sent_ids)
+
+        return (" AND " + " AND ".join(clauses)) if clauses else "", params
+
+    def count_collected_authors(
+        self,
+        search_run_id: int,
+        criteria: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
+        """Return DB-backed counts for post-filtered authors in one search run."""
+        result = {
+            "total": 0,
+            "pending": 0,
+            "found": 0,
+            "no_email": 0,
+            "no_orcid": 0,
+            "error": 0,
+            "with_email": 0,
+            "without_email": 0,
+        }
+        if not self.available or not search_run_id:
+            return result
+        clause, params = self._collection_filter_clause(criteria)
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (WHERE h.email_status = %s AND h.orcid_id <> ''
+                            AND (h.next_retry_at IS NULL OR h.next_retry_at <= NOW())) AS pending,
+                        COUNT(*) FILTER (WHERE h.email_status = %s) AS found,
+                        COUNT(*) FILTER (WHERE h.email_status = %s) AS no_email,
+                        COUNT(*) FILTER (WHERE h.email_status = %s) AS no_orcid,
+                        COUNT(*) FILTER (WHERE h.email_status = %s) AS error,
+                        COUNT(*) FILTER (WHERE h.email <> '') AS with_email,
+                        COUNT(*) FILTER (WHERE h.email = '') AS without_email
+                    FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                    JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                    WHERE m.search_run_id = %s {clause};
+                    """,
+                    [
+                        EMAIL_STATUS_PENDING,
+                        EMAIL_STATUS_FOUND,
+                        EMAIL_STATUS_NO_EMAIL,
+                        EMAIL_STATUS_NO_ORCID,
+                        EMAIL_STATUS_ERROR,
+                        int(search_run_id),
+                    ] + params,
+                )
+                row = cur.fetchone() or {}
+                for key in result:
+                    result[key] = int(row.get(key) or 0)
+            return result
+        except Exception as e:
+            print(f"PostgreSQL count_collected_authors error: {e}")
+            return result
+
+    def fetch_collected_authors(
+        self,
+        search_run_id: int,
+        criteria: Optional[Dict[str, Any]] = None,
+        *,
+        limit: int = 50000,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Return post-filtered collected authors for display/export/bulk send."""
+        if not self.available or not search_run_id:
+            return []
+        safe_limit = max(1, min(int(limit or 50000), 100000))
+        safe_offset = max(0, int(offset or 0))
+        clause, params = self._collection_filter_clause(criteria)
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT h.*
+                    FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                    JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                    WHERE m.search_run_id = %s {clause}
+                    ORDER BY h.h_index DESC NULLS LAST, h.author_name ASC, h.openalex_id ASC
+                    LIMIT %s OFFSET %s;
+                    """,
+                    [int(search_run_id)] + params + [safe_limit, safe_offset],
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL fetch_collected_authors error: {e}")
+            return []
+
+    def fetch_pending_collected_authors(
+        self,
+        search_run_id: int,
+        criteria: Optional[Dict[str, Any]] = None,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return pending ORCID candidates from one post-filtered collected search."""
+        if not self.available or not search_run_id:
+            return []
+        safe_limit = max(1, min(int(limit or 20), 1000))
+        clause, params = self._collection_filter_clause(criteria, pending_only=True)
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT h.*
+                    FROM {self.COLLECTION_RUN_AUTHORS_TABLE} m
+                    JOIN {self.HARVESTED_AUTHORS_TABLE} h ON h.openalex_id = m.openalex_id
+                    WHERE m.search_run_id = %s {clause}
+                    ORDER BY h.next_retry_at ASC NULLS FIRST, h.created_at ASC, h.openalex_id ASC
+                    LIMIT %s;
+                    """,
+                    [int(search_run_id)] + params + [safe_limit],
+                )
+                return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL fetch_pending_collected_authors error: {e}")
+            return []
+
     def bump_daily_stat(self, field: str, increment: int = 1, day: Optional[Any] = None) -> bool:
         """Increment a counter in collection_daily_stats for the given UTC day."""
         if not self.available:

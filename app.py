@@ -51,6 +51,7 @@ from db_client import (
     RUN_STATUS_IDLE,
     RUN_STATUS_PAUSED,
     EMAIL_STATUS_FOUND,
+    EMAIL_STATUS_PENDING,
     EMAIL_STATUS_NO_EMAIL,
     EMAIL_STATUS_ERROR,
     BULK_JOB_STATUS_QUEUED,
@@ -355,7 +356,7 @@ def _persist_rate_limited_author_email(author: dict) -> bool:
     db_storage.upsert_harvested_author({**author, "author_id": openalex_id})
     return db_storage.update_harvest_email(
         openalex_id=openalex_id,
-        status=EMAIL_STATUS_ERROR,
+        status=EMAIL_STATUS_PENDING,
         email_source="orcid",
         next_retry_at=datetime.now(timezone.utc) + timedelta(minutes=OPENALEX_ORCID_RATE_LIMIT_RETRY_MINUTES),
     )
@@ -384,6 +385,40 @@ def _build_email_fetch_candidates(authors: list[dict], processed_orcids: set[str
         candidate['openalex_id'] = _author_openalex_id(candidate)
         candidates.append(candidate)
     return candidates
+
+
+def _active_collection_search_run_id(search_state: dict | None = None) -> int:
+    """Return the active durable collection search id from pagination/session state."""
+    search_state = search_state or _get_search_pagination_state()
+    return int(
+        search_state.get('search_run_id')
+        or st.session_state.app_state.get('active_collection_search_run_id')
+        or 0
+    )
+
+
+def _refresh_collected_results_from_db(
+    search_run_id: int,
+    criteria: dict | None = None,
+    *,
+    limit: int = 100000,
+) -> list[dict]:
+    """Reload collected OpenAlex authors from PostgreSQL into session state."""
+    if not search_run_id or not db_storage.available:
+        return []
+    rows = db_storage.fetch_collected_authors(search_run_id, criteria or {}, limit=limit)
+    authors = [_map_harvested_row_to_author(row) for row in rows]
+    st.session_state.app_state['search_results'] = authors
+    search_state = _get_search_pagination_state()
+    search_state['current_batch_results'] = authors
+    search_state['batch_cache'] = {'0': authors}
+    search_state['current_range_start'] = 1 if authors else 0
+    search_state['current_range_end'] = len(authors)
+    search_state['collected_count'] = len(authors)
+    search_state['all_collected'] = True
+    search_state['search_run_id'] = search_run_id
+    st.session_state.app_state['active_collection_search_run_id'] = search_run_id
+    return authors
 
 
 def _find_session_author_by_orcid(orcid_id: str) -> dict | None:
@@ -545,6 +580,45 @@ def _map_database_email_row_to_author(row: dict) -> dict:
     }
 
 
+def _map_harvested_row_to_author(row: dict) -> dict:
+    """Convert one harvested_authors row into the shared author result schema."""
+    topics = _parse_json_list(row.get('all_topics_json'))
+    topics = [_clean_domain_label(str(topic)) for topic in topics if _clean_domain_label(str(topic))]
+    if not topics and row.get('specialty'):
+        topics = [_clean_domain_label(row.get('specialty', ''))]
+
+    openalex_id = (row.get('openalex_id') or '').strip()
+    orcid_id = (row.get('orcid_id') or '').strip()
+    email = (row.get('email') or '').strip()
+    specialty = _clean_domain_label(row.get('specialty', '')) or (topics[0] if topics else '')
+    discipline = _clean_domain_label(row.get('discipline', '')) or 'Other'
+
+    return {
+        'profile_key': f"orcid:{orcid_id}" if orcid_id else f"openalex:{openalex_id}",
+        'author_id': openalex_id,
+        'openalex_id': openalex_id,
+        'name': (row.get('author_name') or '').strip() or f"Author {orcid_id or openalex_id}",
+        'orcid_id': orcid_id,
+        'orcid_url': f"https://orcid.org/{orcid_id}" if orcid_id else '',
+        'h_index': row.get('h_index'),
+        'works_count': row.get('works_count'),
+        'cited_by_count': row.get('cited_by_count'),
+        'institution': row.get('institution', '') or '',
+        'country': row.get('country', '') or '',
+        'discipline': discipline,
+        'specialty': specialty,
+        'subfield': row.get('subfield', '') or '',
+        'all_topics': topics,
+        'research_areas': row.get('research_areas', '') or ", ".join(topics[:3]),
+        'email': email,
+        'all_emails': row.get('all_emails') or email,
+        'email_source': row.get('email_source') or '',
+        'email_status': row.get('email_status') or '',
+        'scientific_domain': discipline,
+        'source_origin': AUTHOR_SOURCE_OPENALEX,
+    }
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_author_source_rows_from_db(limit: int) -> list[dict]:
     """Load Author Invitation candidates from author_profiles (ORCID + email only)."""
@@ -694,11 +768,27 @@ def _author_matches_collection_prefilters(author: dict, disciplines: list[str] |
     return True
 
 
+def _collection_config_from_search_state(search_state: dict) -> dict:
+    """Build the durable collection-search config from active OpenAlex pre-filters."""
+    search_filters = search_state.get('filters') or {}
+    return {
+        "domains": search_filters.get('disciplines') or [],
+        "disciplines": search_filters.get('disciplines') or [],
+        "specialties": [],
+        "exclude_countries": search_filters.get('exclude_country_codes') or [],
+        "keyword_tags": ", ".join(search_filters.get('keyword_tags') or []),
+        "topic_ids": search_filters.get('topic_ids') or [],
+        "h_index_min": search_filters.get('h_index_min') or 0,
+        "h_index_max": search_filters.get('h_index_max') or 0,
+    }
+
+
 def _collect_openalex_authors_for_state(
     search_state: dict,
     *,
     client: OpenAlexClient,
     storage,
+    search_run_id: int,
     max_results: int,
     jump_size: int,
     disciplines: list[str] | None = None,
@@ -746,7 +836,15 @@ def _collect_openalex_authors_for_state(
             author['openalex_id'] = _author_openalex_id(author)
 
         if storage and getattr(storage, 'available', False) and authors:
-            storage.bulk_upsert_harvested_authors(authors, run_id=1)
+            if search_run_id:
+                storage.persist_seed_batch(
+                    int(search_run_id),
+                    authors,
+                    next_cursor=batch.get('next_cursor'),
+                    has_more=bool(batch.get('has_more')),
+                )
+            else:
+                storage.bulk_upsert_harvested_authors(authors, run_id=1)
 
         collected.extend(authors)
         if progress_callback:
@@ -2558,6 +2656,7 @@ def run_search(filters, ui_scope: str):
             'include_country_codes': include_country_codes or None,
             'exclude_country_codes': exclude_country_codes,
             'topic_ids': topic_ids,
+            'keyword_tags': keyword_tags,
             'require_orcid': True,
             'disciplines': filters.get('disciplines', []),
         },
@@ -2627,7 +2726,9 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH),
     )
     is_openalex_only = ui_scope == WORKFLOW_AUTHOR and author_source_mode == AUTHOR_SOURCE_OPENALEX
-    if is_openalex_only and not _is_openalex_collection_complete(_get_search_pagination_state()):
+    search_state = _get_search_pagination_state()
+    search_run_id = _active_collection_search_run_id(search_state)
+    if is_openalex_only and (not _is_openalex_collection_complete(search_state) or not search_run_id):
         st.warning("Collect all matching OpenAlex authors first, then apply post-filters and fetch emails.")
         return
     
@@ -2635,7 +2736,16 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     if isinstance(processed, list):
         processed = set(processed)
 
-    to_process = _build_email_fetch_candidates(filtered_authors, processed)
+    db_filter_criteria = st.session_state.get(_scope_key(ui_scope, "collected_filter_criteria"), {})
+    to_process = (
+        [_map_harvested_row_to_author(row) for row in db_storage.fetch_pending_collected_authors(
+            search_run_id,
+            db_filter_criteria,
+            limit=OPENALEX_ORCID_FETCH_CHUNK_SIZE,
+        )]
+        if is_openalex_only and db_storage.available
+        else _build_email_fetch_candidates(filtered_authors, processed)
+    )
     
     if not to_process:
         st.info("All authors already processed.")
@@ -2667,21 +2777,39 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         fetch_delay = filters['delay']
         batch_size = filters['concurrent'] * 5
 
-    total = len(to_process)
+    db_counts = (
+        db_storage.count_collected_authors(search_run_id, db_filter_criteria)
+        if is_openalex_only and db_storage.available
+        else {}
+    )
+    total = int(db_counts.get("pending") or len(to_process))
     orcid_emails_found = 0
     openai_emails_found = 0
     processed_this_run = 0
     rate_limited = False
     start_time = time.time()
     
-    for batch_start in range(0, total, batch_size):
+    batch_start = 0
+    while batch_start < total:
         if st.session_state.stop_fetching:
             st.warning("Stopped by user")
             break
         
-        batch = to_process[batch_start:batch_start + batch_size]
+        if is_openalex_only and db_storage.available:
+            batch = [
+                _map_harvested_row_to_author(row)
+                for row in db_storage.fetch_pending_collected_authors(
+                    search_run_id,
+                    db_filter_criteria,
+                    limit=batch_size,
+                )
+            ]
+        else:
+            batch = to_process[batch_start:batch_start + batch_size]
+        if not batch:
+            break
         status_text.text(
-            f"Fetching from ORCID (batch {batch_start // batch_size + 1}, "
+            f"Fetching from ORCID (batch {(batch_start // batch_size) + 1}, "
             f"{fetch_concurrency} concurrent, {fetch_delay:g}s delay)..."
         )
         
@@ -2719,11 +2847,15 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                         source='orcid',
                         all_emails=result.get('all_emails') or email,
                     )
+                    if is_openalex_only and search_run_id:
+                        db_storage.bump_search_stat(search_run_id, "emails_found", 1)
                     orcid_emails_found += 1
                     processed.add(orcid_id)
                     processed_this_run += 1
                 elif result.get('rate_limited'):
                     _persist_rate_limited_author_email(author)
+                    if is_openalex_only and search_run_id:
+                        db_storage.bump_search_stat(search_run_id, "orcid_429", 1)
                     rate_limited = True
                     status_text.text("ORCID rate limit reached. Saved progress and paused this fetch run.")
                     break
@@ -2733,6 +2865,8 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                     authors_without_email.append(author)
                     processed.add(orcid_id)
                     processed_this_run += 1
+                if is_openalex_only and search_run_id and not result.get('rate_limited'):
+                    db_storage.bump_search_stat(search_run_id, "attempts", 1)
             
             if (use_tavily or use_openai_web) and authors_without_email:
                 status_text.text(f"Searching web for emails ({len(authors_without_email)} authors)...")
@@ -2774,7 +2908,10 @@ def run_email_fetch_filtered(filters, ui_scope: str):
             loop.close()
         
         st.session_state.app_state['processed_orcids'] = processed
-        _sync_current_batch_cache()
+        if is_openalex_only and search_run_id:
+            _refresh_collected_results_from_db(search_run_id, db_filter_criteria)
+        else:
+            _sync_current_batch_cache()
         
         processed_count = processed_this_run
         progress_bar.progress(min(processed_count / total, 1.0))
@@ -2793,6 +2930,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                 "ORCID rate limit reached. Progress was saved; wait before resuming the remaining filtered authors."
             )
             break
+        batch_start += len(batch)
     
     total_found = orcid_emails_found + openai_emails_found
     st.session_state.stop_fetching = False
@@ -3084,19 +3222,45 @@ def display_results(filters, ui_scope: str):
                 status.text(f"Collected {done:,} / {total:,} OpenAlex authors...")
 
             with st.spinner("Collecting all matching OpenAlex authors..."):
+                active_collection = None
+                if db_storage.available:
+                    active_collection = db_storage.activate_collection_search(
+                        _collection_config_from_search_state(search_state),
+                        topic_details=[
+                            {"id": topic_id, "name": topic_id}
+                            for topic_id in (search_state.get('filters', {}).get('topic_ids') or [])
+                        ],
+                        start_over=True,
+                        baseline_concurrency=OPENALEX_ORCID_FETCH_CONCURRENCY,
+                        baseline_delay=OPENALEX_ORCID_FETCH_DELAY_SEC,
+                    )
+                search_run_id = int((active_collection or {}).get('search_run_id') or 0)
+                if not search_run_id:
+                    st.error("Could not create a durable collection search in PostgreSQL.")
+                    st.stop()
+
                 collected_authors = _collect_openalex_authors_for_state(
                     search_state,
                     client=OpenAlexClient(),
                     storage=db_storage,
+                    search_run_id=search_run_id,
                     max_results=int(search_state.get('max_results') or _get_result_limit(search_state)),
                     jump_size=int(search_state.get('jump_size') or 250),
                     disciplines=search_state.get('filters', {}).get('disciplines') or filters.get('disciplines', []),
                     progress_callback=_progress,
                 )
+                refreshed_rows = db_storage.fetch_collected_authors(
+                    search_run_id,
+                    limit=max(len(collected_authors), 1),
+                )
+                if refreshed_rows:
+                    collected_authors = [_map_harvested_row_to_author(row) for row in refreshed_rows]
 
             st.session_state.app_state['search_results'] = collected_authors
             search_state['all_collected'] = True
             search_state['collected_count'] = len(collected_authors)
+            search_state['search_run_id'] = search_run_id
+            st.session_state.app_state['active_collection_search_run_id'] = search_run_id
             search_state['current_batch_index'] = 0
             search_state['current_batch_results'] = collected_authors
             search_state['batch_cache'] = {'0': collected_authors}
@@ -3279,6 +3443,8 @@ def display_results(filters, ui_scope: str):
     
     # Country post-filters. Inclusion wins if a code is selected in both lists.
     all_countries = sorted({r.get('country') for r in results if r.get('country')})
+    included_codes: set[str] = set()
+    excluded_codes: set[str] = set()
     if all_countries:
         code_to_name = {v: k for k, v in COUNTRIES.items()}
         country_options = [f"{code_to_name.get(c, c)} ({c})" for c in all_countries]
@@ -3404,6 +3570,56 @@ def display_results(filters, ui_scope: str):
         if retracted_in_scope:
             st.caption(f"Hidden retracted authors: {retracted_in_scope:,}")
 
+    openalex_collection_complete = _is_openalex_collection_complete(search_state)
+    active_search_run_id = _active_collection_search_run_id(search_state)
+    db_collected_criteria = {
+        "search_text": active_search_query,
+        "disciplines": list(dict.fromkeys(sidebar_disciplines + selected_disciplines)),
+        "specialties": selected_specialties,
+        "include_countries": sorted(included_codes),
+        "exclude_countries": sorted(excluded_codes),
+        "include_domains": selected_domain_labels,
+        "exclude_domains": excluded_domain_labels,
+        "email_filter": "with" if show_only_with_email else "",
+        "hide_sent": show_only_not_sent,
+        "sent_orcids": [
+            value for value in sent_invitations
+            if isinstance(value, str) and not value.startswith("email:")
+        ],
+        "hide_retracted": hide_retracted,
+        "retracted_names": list(retracted_names) if hide_retracted else [],
+    }
+
+    db_collected_counts: dict[str, int] = {}
+    if (
+        is_author_workflow
+        and author_source_mode == AUTHOR_SOURCE_OPENALEX
+        and openalex_collection_complete
+        and active_search_run_id
+        and db_storage.available
+    ):
+        db_rows = db_storage.fetch_collected_authors(
+            active_search_run_id,
+            db_collected_criteria,
+            limit=100000,
+        )
+        filtered = [_map_harvested_row_to_author(row) for row in db_rows]
+        db_collected_counts = db_storage.count_collected_authors(
+            active_search_run_id,
+            db_collected_criteria,
+        )
+        st.session_state.app_state['search_results'] = filtered
+        search_state['current_batch_results'] = filtered
+        search_state['batch_cache'] = {'0': filtered}
+        search_state['collected_count'] = int(db_collected_counts.get("total") or len(filtered))
+        search_state['current_range_start'] = 1 if filtered else 0
+        search_state['current_range_end'] = len(filtered)
+        st.caption(
+            f"Database-backed collected set: {db_collected_counts.get('total', len(filtered)):,} "
+            f"post-filtered authors, {db_collected_counts.get('pending', 0):,} pending ORCID lookups."
+        )
+    st.session_state[_scope_key(ui_scope, "collected_filter_criteria")] = db_collected_criteria
+
     before_dedupe_count = len(filtered)
     filtered = dedupe_authors(filtered)
     removed_duplicates = before_dedupe_count - len(filtered)
@@ -3422,8 +3638,17 @@ def display_results(filters, ui_scope: str):
     if isinstance(processed, list):
         processed = set(processed)
     already_processed = sum(1 for r in filtered if r.get('orcid_id') in processed)
-    openalex_collection_complete = _is_openalex_collection_complete(search_state)
-    fetch_candidate_count = len(_build_email_fetch_candidates(filtered, processed))
+    fetch_candidate_count = (
+        int(db_collected_counts.get("pending") or 0)
+        if (
+            is_author_workflow
+            and author_source_mode == AUTHOR_SOURCE_OPENALEX
+            and openalex_collection_complete
+            and active_search_run_id
+            and db_storage.available
+        )
+        else len(_build_email_fetch_candidates(filtered, processed))
+    )
     
     # Fetch Emails button - only for filtered authors
     st.divider()

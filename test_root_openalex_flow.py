@@ -1,4 +1,5 @@
 import app
+from db_client import EMAIL_STATUS_PENDING, PostgresStorage
 
 
 def test_source_selection_openalex_ignores_stale_database_rows():
@@ -85,7 +86,8 @@ def test_collect_openalex_authors_uses_prefilters_and_persists():
         def __init__(self):
             self.persisted = []
 
-        def bulk_upsert_harvested_authors(self, authors, run_id=1):
+        def persist_seed_batch(self, search_run_id, authors, next_cursor=None, has_more=False):
+            self.search_run_id = search_run_id
             self.persisted.extend(authors)
             return len(authors)
 
@@ -108,6 +110,7 @@ def test_collect_openalex_authors_uses_prefilters_and_persists():
         search_state,
         client=FakeClient(),
         storage=storage,
+        search_run_id=42,
         max_results=2,
         jump_size=250,
         disciplines=["Medicine"],
@@ -120,6 +123,7 @@ def test_collect_openalex_authors_uses_prefilters_and_persists():
     assert storage.persisted[0]["openalex_id"] == "https://openalex.org/A1"
     assert storage.persisted[0]["orcid_id"] == "0000-0001"
     assert storage.persisted[0]["source_origin"] == app.AUTHOR_SOURCE_OPENALEX
+    assert storage.search_run_id == 42
 
 
 def test_persist_found_email_updates_harvested_and_profile(monkeypatch):
@@ -265,6 +269,78 @@ def test_rate_limited_email_persist_keeps_author_retryable(monkeypatch):
 
     assert saved is True
     assert storage.harvested[0]["author_id"] == "https://openalex.org/A1"
-    assert storage.email_updates[0]["status"] == app.EMAIL_STATUS_ERROR
+    assert storage.email_updates[0]["status"] == app.EMAIL_STATUS_PENDING
     assert storage.email_updates[0]["email_source"] == "orcid"
     assert storage.email_updates[0]["next_retry_at"] is not None
+
+
+def test_harvested_row_maps_to_openalex_author():
+    author = app._map_harvested_row_to_author({
+        "openalex_id": "https://openalex.org/A1",
+        "orcid_id": "0000-0001",
+        "author_name": "Author One",
+        "email": "author@example.com",
+        "all_emails": "author@example.com",
+        "email_source": "orcid",
+        "email_status": app.EMAIL_STATUS_FOUND,
+        "h_index": 25,
+        "institution": "Example University",
+        "country": "GB",
+        "discipline": "Medicine",
+        "specialty": "Oncology",
+        "all_topics_json": '["Oncology", "Cancer Biology"]',
+    })
+
+    assert author["source_origin"] == app.AUTHOR_SOURCE_OPENALEX
+    assert author["openalex_id"] == "https://openalex.org/A1"
+    assert author["email"] == "author@example.com"
+    assert author["all_topics"] == ["Oncology", "Cancer Biology"]
+
+
+def test_collection_config_from_search_state_uses_prefilters():
+    config = app._collection_config_from_search_state({
+        "filters": {
+            "disciplines": ["Medicine"],
+            "exclude_country_codes": ["US"],
+            "keyword_tags": ["cancer"],
+            "topic_ids": ["T1"],
+            "h_index_min": 10,
+            "h_index_max": 80,
+        }
+    })
+
+    assert config["disciplines"] == ["Medicine"]
+    assert config["exclude_countries"] == ["US"]
+    assert config["keyword_tags"] == "cancer"
+    assert config["topic_ids"] == ["T1"]
+    assert config["h_index_min"] == 10
+
+
+def test_collection_filter_clause_includes_post_filters():
+    storage = PostgresStorage.__new__(PostgresStorage)
+
+    clause, params = storage._collection_filter_clause(
+        {
+            "search_text": "oncology",
+            "disciplines": ["Medicine"],
+            "include_countries": ["GB"],
+            "exclude_countries": ["US"],
+            "specialties": ["Cancer"],
+            "include_domains": ["Biology"],
+            "exclude_domains": ["Physics"],
+            "email_filter": "without",
+            "hide_sent": True,
+            "sent_orcids": ["0000-0001"],
+            "hide_retracted": True,
+            "retracted_names": ["Retracted Author"],
+        },
+        pending_only=True,
+    )
+
+    assert "h.email_status = %s" in clause
+    assert "h.discipline = ANY(%s)" in clause
+    assert "h.country = ANY(%s)" in clause
+    assert "h.email = ''" in clause
+    assert EMAIL_STATUS_PENDING in params
+    assert ["Medicine"] in params
+    assert ["GB"] in params
