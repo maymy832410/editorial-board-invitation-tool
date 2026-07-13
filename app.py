@@ -421,6 +421,13 @@ def _refresh_collected_results_from_db(
     return authors
 
 
+def _criteria_for_openalex_email_fetch(criteria: dict | None) -> dict:
+    """Use post-filters for fetching, but never let the display email filter hide pending rows."""
+    fetch_criteria = dict(criteria or {})
+    fetch_criteria["email_filter"] = ""
+    return fetch_criteria
+
+
 def _find_session_author_by_orcid(orcid_id: str) -> dict | None:
     """Find the first in-session author matching an ORCID."""
     for author in st.session_state.app_state.get('search_results', []) or []:
@@ -2717,9 +2724,6 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     """Fetch emails for the full post-filtered author set."""
     filtered_authors_key = _scope_key(ui_scope, "filtered_authors")
     filtered_authors = st.session_state.get(filtered_authors_key, st.session_state.get('filtered_authors', []))
-    if not filtered_authors:
-        st.warning("No filtered authors to process.")
-        return
 
     author_source_mode = filters.get(
         'author_source_mode',
@@ -2731,16 +2735,20 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     if is_openalex_only and (not _is_openalex_collection_complete(search_state) or not search_run_id):
         st.warning("Collect all matching OpenAlex authors first, then apply post-filters and fetch emails.")
         return
+    if not is_openalex_only and not filtered_authors:
+        st.warning("No filtered authors to process.")
+        return
     
     processed = st.session_state.app_state.get('processed_orcids', set())
     if isinstance(processed, list):
         processed = set(processed)
 
     db_filter_criteria = st.session_state.get(_scope_key(ui_scope, "collected_filter_criteria"), {})
+    db_fetch_criteria = _criteria_for_openalex_email_fetch(db_filter_criteria)
     to_process = (
         [_map_harvested_row_to_author(row) for row in db_storage.fetch_pending_collected_authors(
             search_run_id,
-            db_filter_criteria,
+            db_fetch_criteria,
             limit=OPENALEX_ORCID_FETCH_CHUNK_SIZE,
         )]
         if is_openalex_only and db_storage.available
@@ -2778,7 +2786,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         batch_size = filters['concurrent'] * 5
 
     db_counts = (
-        db_storage.count_collected_authors(search_run_id, db_filter_criteria)
+        db_storage.count_collected_authors(search_run_id, db_fetch_criteria)
         if is_openalex_only and db_storage.available
         else {}
     )
@@ -2800,7 +2808,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                 _map_harvested_row_to_author(row)
                 for row in db_storage.fetch_pending_collected_authors(
                     search_run_id,
-                    db_filter_criteria,
+                    db_fetch_criteria,
                     limit=batch_size,
                 )
             ]
@@ -2909,7 +2917,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         
         st.session_state.app_state['processed_orcids'] = processed
         if is_openalex_only and search_run_id:
-            _refresh_collected_results_from_db(search_run_id, db_filter_criteria)
+            _refresh_collected_results_from_db(search_run_id, db_fetch_criteria)
         else:
             _sync_current_batch_cache()
         
@@ -2936,6 +2944,8 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     st.session_state.stop_fetching = False
     
     result_suffix = " Paused on ORCID rate limit." if rate_limited else ""
+    if is_openalex_only:
+        st.session_state[_scope_key(ui_scope, "show_collected_emails_after_fetch")] = True
     st.session_state.last_fetch_result = (
         f"Found {total_found} emails from {processed_this_run} processed authors "
         f"out of {total} filtered candidates ({orcid_emails_found} ORCID + {openai_emails_found} Web)."
@@ -3535,11 +3545,14 @@ def display_results(filters, ui_scope: str):
     
     # Filter options - Row 2: Checkboxes
     col_filter1, col_filter2, col_filter3 = st.columns(3)
+    filter_email_key = _scope_key(ui_scope, "filter_email")
+    if st.session_state.pop(_scope_key(ui_scope, "show_collected_emails_after_fetch"), False):
+        st.session_state[filter_email_key] = True
     with col_filter1:
         show_only_with_email = st.checkbox(
             "Show only authors with email",
             value=False,
-            key=_scope_key(ui_scope, "filter_email")
+            key=filter_email_key
         )
     with col_filter2:
         show_only_not_sent = st.checkbox(
@@ -3589,8 +3602,10 @@ def display_results(filters, ui_scope: str):
         "hide_retracted": hide_retracted,
         "retracted_names": list(retracted_names) if hide_retracted else [],
     }
+    db_fetch_criteria = _criteria_for_openalex_email_fetch(db_collected_criteria)
 
     db_collected_counts: dict[str, int] = {}
+    db_fetch_counts: dict[str, int] = {}
     if (
         is_author_workflow
         and author_source_mode == AUTHOR_SOURCE_OPENALEX
@@ -3608,6 +3623,10 @@ def display_results(filters, ui_scope: str):
             active_search_run_id,
             db_collected_criteria,
         )
+        db_fetch_counts = db_storage.count_collected_authors(
+            active_search_run_id,
+            db_fetch_criteria,
+        )
         st.session_state.app_state['search_results'] = filtered
         search_state['current_batch_results'] = filtered
         search_state['batch_cache'] = {'0': filtered}
@@ -3616,7 +3635,7 @@ def display_results(filters, ui_scope: str):
         search_state['current_range_end'] = len(filtered)
         st.caption(
             f"Database-backed collected set: {db_collected_counts.get('total', len(filtered)):,} "
-            f"post-filtered authors, {db_collected_counts.get('pending', 0):,} pending ORCID lookups."
+            f"post-filtered authors, {db_fetch_counts.get('pending', 0):,} pending ORCID lookups."
         )
     st.session_state[_scope_key(ui_scope, "collected_filter_criteria")] = db_collected_criteria
 
@@ -3639,7 +3658,7 @@ def display_results(filters, ui_scope: str):
         processed = set(processed)
     already_processed = sum(1 for r in filtered if r.get('orcid_id') in processed)
     fetch_candidate_count = (
-        int(db_collected_counts.get("pending") or 0)
+        int(db_fetch_counts.get("pending") or 0)
         if (
             is_author_workflow
             and author_source_mode == AUTHOR_SOURCE_OPENALEX

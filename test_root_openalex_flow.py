@@ -316,6 +316,25 @@ def test_collection_config_from_search_state_uses_prefilters():
     assert config["h_index_min"] == 10
 
 
+def test_email_fetch_criteria_ignores_display_email_filter_only():
+    display_criteria = {
+        "search_text": "oncology",
+        "disciplines": ["Medicine"],
+        "include_countries": ["GB"],
+        "email_filter": "with",
+        "hide_sent": True,
+    }
+
+    fetch_criteria = app._criteria_for_openalex_email_fetch(display_criteria)
+
+    assert fetch_criteria["email_filter"] == ""
+    assert fetch_criteria["search_text"] == "oncology"
+    assert fetch_criteria["disciplines"] == ["Medicine"]
+    assert fetch_criteria["include_countries"] == ["GB"]
+    assert fetch_criteria["hide_sent"] is True
+    assert display_criteria["email_filter"] == "with"
+
+
 def test_collection_filter_clause_includes_post_filters():
     storage = PostgresStorage.__new__(PostgresStorage)
 
