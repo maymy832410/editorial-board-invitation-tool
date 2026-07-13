@@ -163,3 +163,108 @@ def test_persist_found_email_updates_harvested_and_profile(monkeypatch):
     assert storage.email_updates[0]["email"] == "author@example.com"
     assert storage.profiles[0]["email"] == "author@example.com"
     assert storage.profiles[0]["openalex_id"] == "https://openalex.org/A1"
+
+
+def test_build_email_fetch_candidates_uses_full_filtered_set():
+    authors = [
+        {
+            "author_id": "https://openalex.org/A1",
+            "name": "Visible Page Author",
+            "orcid_id": "0000-0001",
+            "email": "",
+        },
+        {
+            "author_id": "https://openalex.org/A2",
+            "name": "Collected Later Batch Author",
+            "orcid_id": "0000-0002",
+            "email": None,
+        },
+        {
+            "author_id": "https://openalex.org/A3",
+            "name": "Already Has Email",
+            "orcid_id": "0000-0003",
+            "email": "has@example.com",
+        },
+        {
+            "author_id": "https://openalex.org/A4",
+            "name": "Already Processed",
+            "orcid_id": "0000-0004",
+            "email": "",
+        },
+    ]
+
+    candidates = app._build_email_fetch_candidates(authors, {"0000-0004"})
+
+    assert [candidate["orcid_id"] for candidate in candidates] == ["0000-0001", "0000-0002"]
+    assert candidates[1]["openalex_id"] == "https://openalex.org/A2"
+
+
+def test_persist_missing_email_updates_harvested_without_dropping_metadata(monkeypatch):
+    class FakeStorage:
+        available = True
+
+        def __init__(self):
+            self.harvested = []
+            self.email_updates = []
+
+        def upsert_harvested_author(self, author):
+            self.harvested.append(author)
+            return True
+
+        def update_harvest_email(self, **kwargs):
+            self.email_updates.append(kwargs)
+            return True
+
+    storage = FakeStorage()
+    monkeypatch.setattr(app, "db_storage", storage)
+
+    saved = app._persist_missing_author_email(
+        {
+            "author_id": "https://openalex.org/A1",
+            "orcid_id": "0000-0001",
+            "name": "Author One",
+            "discipline": "Medicine",
+            "country": "GB",
+        },
+        app.EMAIL_STATUS_NO_EMAIL,
+    )
+
+    assert saved is True
+    assert storage.harvested[0]["discipline"] == "Medicine"
+    assert storage.harvested[0]["country"] == "GB"
+    assert storage.email_updates[0]["status"] == app.EMAIL_STATUS_NO_EMAIL
+    assert storage.email_updates[0]["email_source"] == "orcid"
+
+
+def test_rate_limited_email_persist_keeps_author_retryable(monkeypatch):
+    class FakeStorage:
+        available = True
+
+        def __init__(self):
+            self.harvested = []
+            self.email_updates = []
+
+        def upsert_harvested_author(self, author):
+            self.harvested.append(author)
+            return True
+
+        def update_harvest_email(self, **kwargs):
+            self.email_updates.append(kwargs)
+            return True
+
+    storage = FakeStorage()
+    monkeypatch.setattr(app, "db_storage", storage)
+
+    saved = app._persist_rate_limited_author_email(
+        {
+            "author_id": "https://openalex.org/A1",
+            "orcid_id": "0000-0001",
+            "name": "Author One",
+        }
+    )
+
+    assert saved is True
+    assert storage.harvested[0]["author_id"] == "https://openalex.org/A1"
+    assert storage.email_updates[0]["status"] == app.EMAIL_STATUS_ERROR
+    assert storage.email_updates[0]["email_source"] == "orcid"
+    assert storage.email_updates[0]["next_retry_at"] is not None

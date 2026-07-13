@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 import streamlit as st
 import pandas as pd
 
@@ -63,6 +64,11 @@ WORKFLOW_EDITORIAL = "editorial"
 AUTHOR_SOURCE_OPENALEX = "openalex"
 AUTHOR_SOURCE_DATABASE = "database"
 AUTHOR_SOURCE_BOTH = "both"
+
+OPENALEX_ORCID_FETCH_CONCURRENCY = 2
+OPENALEX_ORCID_FETCH_DELAY_SEC = 3.0
+OPENALEX_ORCID_FETCH_CHUNK_SIZE = 20
+OPENALEX_ORCID_RATE_LIMIT_RETRY_MINUTES = 30
 
 QUARTILE_OPTIONS = ["", "Q1", "Q2", "Q3", "Q4"]
 INDEXING_OPTIONS = ["", "Not indexed", "Scopus", "Web of Science", "DOAJ", "Other"]
@@ -337,6 +343,62 @@ def _persist_missing_author_email(author: dict, status: str) -> bool:
         status=normalized_status,
         email_source="orcid",
     )
+
+
+def _persist_rate_limited_author_email(author: dict) -> bool:
+    """Record an ORCID rate-limit outcome without permanently consuming the author."""
+    if not db_storage.available:
+        return False
+    openalex_id = _author_openalex_id(author)
+    if not openalex_id:
+        return False
+    db_storage.upsert_harvested_author({**author, "author_id": openalex_id})
+    return db_storage.update_harvest_email(
+        openalex_id=openalex_id,
+        status=EMAIL_STATUS_ERROR,
+        email_source="orcid",
+        next_retry_at=datetime.now(timezone.utc) + timedelta(minutes=OPENALEX_ORCID_RATE_LIMIT_RETRY_MINUTES),
+    )
+
+
+def _is_openalex_collection_complete(search_state: dict) -> bool:
+    """Return whether the current OpenAlex result set contains all bounded matches."""
+    return bool(search_state.get('all_collected'))
+
+
+def _build_email_fetch_candidates(authors: list[dict], processed_orcids: set[str]) -> list[dict]:
+    """Build ORCID lookup candidates from the full post-filtered result set."""
+    candidates: list[dict] = []
+    seen_orcids: set[str] = set()
+    for author in authors:
+        orcid_id = (author.get('orcid_id') or '').strip()
+        if not orcid_id or orcid_id in processed_orcids or author.get('email'):
+            continue
+        if orcid_id in seen_orcids:
+            continue
+        seen_orcids.add(orcid_id)
+        candidate = dict(author)
+        candidate['orcid_id'] = orcid_id
+        candidate['name'] = candidate.get('name') or candidate.get('author_name') or ''
+        candidate['author_id'] = _author_openalex_id(candidate)
+        candidate['openalex_id'] = _author_openalex_id(candidate)
+        candidates.append(candidate)
+    return candidates
+
+
+def _find_session_author_by_orcid(orcid_id: str) -> dict | None:
+    """Find the first in-session author matching an ORCID."""
+    for author in st.session_state.app_state.get('search_results', []) or []:
+        if (author.get('orcid_id') or '').strip() == orcid_id:
+            return author
+    return None
+
+
+def _update_session_authors_for_email(orcid_id: str, updates: dict) -> None:
+    """Apply saved email fields to every matching in-session author row."""
+    for author in st.session_state.app_state.get('search_results', []) or []:
+        if (author.get('orcid_id') or '').strip() == orcid_id:
+            author.update(updates)
 
 
 def _clean_domain_label(value: str) -> str:
@@ -915,6 +977,8 @@ def _set_current_batch(search_state, batch_payload, start_cursor):
     search_state['current_batch_results'] = batch_payload['results']
     search_state['current_range_start'] = batch_payload['start_index'] + 1 if current_count else 0
     search_state['current_range_end'] = batch_payload['end_index']
+    search_state['all_collected'] = False
+    search_state['collected_count'] = 0
     batch_cache[str(batch_payload['batch_index'])] = batch_payload['results']
 
     st.session_state.app_state['search_results'] = batch_payload['results']
@@ -954,6 +1018,8 @@ def load_search_batch(target_batch_index, jump_size=None, reset=False):
         search_state['current_cursor'] = '*'
         search_state['next_cursor'] = None
         search_state['current_batch_results'] = []
+        search_state['all_collected'] = False
+        search_state['collected_count'] = 0
         target_batch_index = 0
 
     total_limit = _get_result_limit(search_state)
@@ -2505,6 +2571,8 @@ def run_search(filters, ui_scope: str):
         'checkpoints': {'0': '*'},
         'batch_cache': {},
         'current_batch_results': [],
+        'all_collected': False,
+        'collected_count': 0,
     }
 
     st.session_state.app_state['search_pagination'] = search_state
@@ -2547,41 +2615,36 @@ def run_search(filters, ui_scope: str):
 
 
 def run_email_fetch_filtered(filters, ui_scope: str):
-    """Fetch emails ONLY for currently filtered authors.
-    
-    Uses ORCID API first, then falls back to OpenAI inference for missing emails.
-    """
-    
-    # Get filtered authors from session state
+    """Fetch emails for the full post-filtered author set."""
     filtered_authors_key = _scope_key(ui_scope, "filtered_authors")
     filtered_authors = st.session_state.get(filtered_authors_key, st.session_state.get('filtered_authors', []))
     if not filtered_authors:
         st.warning("No filtered authors to process.")
         return
+
+    author_source_mode = filters.get(
+        'author_source_mode',
+        st.session_state.app_state.get('author_source_mode', AUTHOR_SOURCE_BOTH),
+    )
+    is_openalex_only = ui_scope == WORKFLOW_AUTHOR and author_source_mode == AUTHOR_SOURCE_OPENALEX
+    if is_openalex_only and not _is_openalex_collection_complete(_get_search_pagination_state()):
+        st.warning("Collect all matching OpenAlex authors first, then apply post-filters and fetch emails.")
+        return
     
     processed = st.session_state.app_state.get('processed_orcids', set())
     if isinstance(processed, list):
         processed = set(processed)
-    
-    # Get only filtered authors without emails
-    to_process = [
-        {'orcid_id': a['orcid_id'], 'name': a['name'], 'institution': a.get('institution'), 
-         'country': a.get('country'), 'specialty': a.get('specialty'),
-         'discipline': a.get('discipline'), 'scientific_domain': a.get('scientific_domain'),
-         'author_id': _author_openalex_id(a), 'openalex_id': _author_openalex_id(a)}
-        for a in filtered_authors
-        if a.get('orcid_id') and a['orcid_id'] not in processed and not a.get('email')
-    ]
+
+    to_process = _build_email_fetch_candidates(filtered_authors, processed)
     
     if not to_process:
         st.info("All authors already processed.")
         return
     
     st.session_state.stop_fetching = False
-    use_tavily = filters.get('use_tavily', True)
-    use_openai_web = filters.get('use_openai_web', True)
+    use_tavily = (not is_openalex_only) and filters.get('use_tavily', True)
+    use_openai_web = (not is_openalex_only) and filters.get('use_openai_web', True)
     
-    # Progress display
     progress_bar = st.progress(0)
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -2595,11 +2658,20 @@ def run_email_fetch_filtered(filters, ui_scope: str):
     
     status_text = st.empty()
     
-    # Process in batches
-    batch_size = filters['concurrent'] * 5
+    if is_openalex_only:
+        fetch_concurrency = OPENALEX_ORCID_FETCH_CONCURRENCY
+        fetch_delay = OPENALEX_ORCID_FETCH_DELAY_SEC
+        batch_size = OPENALEX_ORCID_FETCH_CHUNK_SIZE
+    else:
+        fetch_concurrency = filters['concurrent']
+        fetch_delay = filters['delay']
+        batch_size = filters['concurrent'] * 5
+
     total = len(to_process)
     orcid_emails_found = 0
     openai_emails_found = 0
+    processed_this_run = 0
+    rate_limited = False
     start_time = time.time()
     
     for batch_start in range(0, total, batch_size):
@@ -2608,9 +2680,11 @@ def run_email_fetch_filtered(filters, ui_scope: str):
             break
         
         batch = to_process[batch_start:batch_start + batch_size]
-        status_text.text(f"Fetching from ORCID (batch {batch_start // batch_size + 1})...")
+        status_text.text(
+            f"Fetching from ORCID (batch {batch_start // batch_size + 1}, "
+            f"{fetch_concurrency} concurrent, {fetch_delay:g}s delay)..."
+        )
         
-        # Run async ORCID fetch
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -2618,50 +2692,54 @@ def run_email_fetch_filtered(filters, ui_scope: str):
             batch_results = loop.run_until_complete(
                 fetch_emails_async(
                     batch,
-                    max_concurrent=filters['concurrent'],
-                    delay_between_batches=filters['delay']
+                    max_concurrent=fetch_concurrency,
+                    delay_between_batches=fetch_delay
                 )
             )
             
-            # Update results from ORCID
             authors_without_email = []
             for result in batch_results:
                 orcid_id = result.get('orcid_id')
                 email = result.get('email')
                 
-                if orcid_id:
-                    # Update in search results
-                    for author in st.session_state.app_state['search_results']:
-                        if author.get('orcid_id') == orcid_id:
-                            if email:
-                                author['email'] = email
-                                author['email_source'] = 'orcid'
-                                _persist_found_author_email(
-                                    author,
-                                    email,
-                                    source='orcid',
-                                    all_emails=result.get('all_emails') or email,
-                                )
-                                orcid_emails_found += 1
-                            else:
-                                # Track authors without email for OpenAI fallback
-                                if not result.get('rate_limited'):
-                                    _persist_missing_author_email(
-                                        author,
-                                        result.get('email_status') or EMAIL_STATUS_NO_EMAIL,
-                                    )
-                                authors_without_email.append(author)
-                            break
-                    
+                if not orcid_id:
+                    continue
+
+                author = _find_session_author_by_orcid(orcid_id) or result
+                if email:
+                    email_updates = {
+                        'email': email,
+                        'email_source': 'orcid',
+                        'all_emails': result.get('all_emails') or email,
+                    }
+                    _update_session_authors_for_email(orcid_id, email_updates)
+                    _persist_found_author_email(
+                        {**author, **email_updates},
+                        email,
+                        source='orcid',
+                        all_emails=result.get('all_emails') or email,
+                    )
+                    orcid_emails_found += 1
                     processed.add(orcid_id)
+                    processed_this_run += 1
+                elif result.get('rate_limited'):
+                    _persist_rate_limited_author_email(author)
+                    rate_limited = True
+                    status_text.text("ORCID rate limit reached. Saved progress and paused this fetch run.")
+                    break
+                else:
+                    email_status = result.get('email_status') or EMAIL_STATUS_NO_EMAIL
+                    _persist_missing_author_email(author, email_status)
+                    authors_without_email.append(author)
+                    processed.add(orcid_id)
+                    processed_this_run += 1
             
-            # Web search fallback for authors without ORCID email
             if (use_tavily or use_openai_web) and authors_without_email:
                 status_text.text(f"Searching web for emails ({len(authors_without_email)} authors)...")
                 
                 async def fetch_web_emails():
                     async with AsyncOpenAIEmailClient(
-                        max_concurrent=min(5, filters['concurrent']),
+                        max_concurrent=min(5, fetch_concurrency),
                         delay_between_requests=0.5
                     ) as client:
                         return await client.fetch_emails_batch(
@@ -2672,25 +2750,25 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                 
                 web_results = loop.run_until_complete(fetch_web_emails())
                 
-                # Update with web search results
                 for result in web_results:
                     email = result.get('email')
                     if email:
                         orcid_id = result.get('orcid_id')
-                        for author in st.session_state.app_state['search_results']:
-                            if author.get('orcid_id') == orcid_id:
-                                author['email'] = email
-                                author['all_emails'] = result.get('all_emails', email)
-                                author['email_source'] = result.get('email_source', 'web_search')
-                                author['email_confidence'] = result.get('email_confidence', 'unknown')
-                                _persist_found_author_email(
-                                    author,
-                                    email,
-                                    source=author['email_source'],
-                                    all_emails=author.get('all_emails') or email,
-                                )
-                                openai_emails_found += 1
-                                break
+                        author = _find_session_author_by_orcid(orcid_id) or result
+                        email_updates = {
+                            'email': email,
+                            'all_emails': result.get('all_emails', email),
+                            'email_source': result.get('email_source', 'web_search'),
+                            'email_confidence': result.get('email_confidence', 'unknown'),
+                        }
+                        _update_session_authors_for_email(orcid_id, email_updates)
+                        _persist_found_author_email(
+                            {**author, **email_updates},
+                            email,
+                            source=email_updates['email_source'],
+                            all_emails=email_updates.get('all_emails') or email,
+                        )
+                        openai_emails_found += 1
                 
         finally:
             loop.close()
@@ -2698,8 +2776,7 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         st.session_state.app_state['processed_orcids'] = processed
         _sync_current_batch_cache()
         
-        # Update metrics
-        processed_count = batch_start + len(batch)
+        processed_count = processed_this_run
         progress_bar.progress(min(processed_count / total, 1.0))
         processed_metric.metric("Processed", f"{processed_count}/{total}")
         found_metric.metric("ORCID Emails", orcid_emails_found)
@@ -2709,16 +2786,22 @@ def run_email_fetch_filtered(filters, ui_scope: str):
         speed = processed_count / elapsed if elapsed > 0 else 0
         speed_metric.metric("Speed", f"{speed:.1f}/sec")
         
-        # Auto-save
         save_state()
+
+        if rate_limited:
+            st.warning(
+                "ORCID rate limit reached. Progress was saved; wait before resuming the remaining filtered authors."
+            )
+            break
     
     total_found = orcid_emails_found + openai_emails_found
     st.session_state.stop_fetching = False
     
-    # Save result message and rerun to ensure display refreshes with updated emails
+    result_suffix = " Paused on ORCID rate limit." if rate_limited else ""
     st.session_state.last_fetch_result = (
-        f"Found {total_found} emails from {total} authors "
-        f"({orcid_emails_found} ORCID + {openai_emails_found} Web)"
+        f"Found {total_found} emails from {processed_this_run} processed authors "
+        f"out of {total} filtered candidates ({orcid_emails_found} ORCID + {openai_emails_found} Web)."
+        f"{result_suffix}"
     )
     save_state()
     st.rerun()
@@ -3012,6 +3095,8 @@ def display_results(filters, ui_scope: str):
                 )
 
             st.session_state.app_state['search_results'] = collected_authors
+            search_state['all_collected'] = True
+            search_state['collected_count'] = len(collected_authors)
             search_state['current_batch_index'] = 0
             search_state['current_batch_results'] = collected_authors
             search_state['batch_cache'] = {'0': collected_authors}
@@ -3337,23 +3422,27 @@ def display_results(filters, ui_scope: str):
     if isinstance(processed, list):
         processed = set(processed)
     already_processed = sum(1 for r in filtered if r.get('orcid_id') in processed)
+    openalex_collection_complete = _is_openalex_collection_complete(search_state)
+    fetch_candidate_count = len(_build_email_fetch_candidates(filtered, processed))
     
     # Fetch Emails button - only for filtered authors
     st.divider()
     col_btn1, col_btn2 = st.columns([2, 1])
     with col_btn1:
         if is_author_workflow and author_source_mode == AUTHOR_SOURCE_OPENALEX:
-            fetch_btn_label = (
-                f"Fetch Emails for {without_email} Filtered Collected Authors"
-                if without_email > 0 else "All Filtered Collected Authors Have Emails"
-            )
+            if not openalex_collection_complete and without_email > 0:
+                fetch_btn_label = "Collect All Matching OpenAlex Authors Before Fetching Emails"
+            elif fetch_candidate_count > 0:
+                fetch_btn_label = f"Fetch Emails for {fetch_candidate_count} Filtered Collected Authors"
+            else:
+                fetch_btn_label = "All Filtered Collected Authors Have Emails or Are Processed"
         else:
-            fetch_btn_label = f"Fetch Emails for {without_email} Filtered Authors" if without_email > 0 else "All Filtered Authors Have Emails"
+            fetch_btn_label = f"Fetch Emails for {fetch_candidate_count} Filtered Authors" if fetch_candidate_count > 0 else "All Filtered Authors Have Emails or Are Processed"
         fetch_emails_clicked = st.button(
             fetch_btn_label,
-            type="primary" if without_email > 0 else "secondary",
+            type="primary" if fetch_candidate_count > 0 else "secondary",
             use_container_width=True,
-            disabled=without_email == 0,
+            disabled=fetch_candidate_count == 0,
             key=_scope_key(ui_scope, "fetch_emails")
         )
     with col_btn2:
