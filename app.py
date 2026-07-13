@@ -50,6 +50,8 @@ from db_client import (
     RUN_STATUS_IDLE,
     RUN_STATUS_PAUSED,
     EMAIL_STATUS_FOUND,
+    EMAIL_STATUS_NO_EMAIL,
+    EMAIL_STATUS_ERROR,
     BULK_JOB_STATUS_QUEUED,
     BULK_JOB_STATUS_RUNNING,
 )
@@ -318,6 +320,22 @@ def _persist_found_author_email(
         openalex_id=openalex_id,
         scientific_domain=author.get('scientific_domain') or author.get('discipline') or "",
         source=source,
+    )
+
+
+def _persist_missing_author_email(author: dict, status: str) -> bool:
+    """Persist non-found ORCID lookup outcomes for collected OpenAlex authors."""
+    if not db_storage.available:
+        return False
+    openalex_id = _author_openalex_id(author)
+    if not openalex_id:
+        return False
+    db_storage.upsert_harvested_author({**author, "author_id": openalex_id})
+    normalized_status = EMAIL_STATUS_ERROR if status == EMAIL_STATUS_ERROR else EMAIL_STATUS_NO_EMAIL
+    return db_storage.update_harvest_email(
+        openalex_id=openalex_id,
+        status=normalized_status,
+        email_source="orcid",
     )
 
 
@@ -591,6 +609,94 @@ def _merge_author_source_results(openalex_rows: list[dict], db_rows: list[dict])
             existing['discipline'] = db_row.get('discipline', '')
 
     return merged_rows
+
+
+def _select_author_source_results(
+    source_mode: str,
+    openalex_rows: list[dict],
+    db_rows: list[dict],
+) -> list[dict]:
+    """Return author rows for the selected source without stale DB leakage."""
+    if source_mode == AUTHOR_SOURCE_DATABASE:
+        return list(db_rows)
+    if source_mode == AUTHOR_SOURCE_BOTH:
+        return _merge_author_source_results(openalex_rows, db_rows)
+    return list(openalex_rows)
+
+
+def _author_matches_collection_prefilters(author: dict, disciplines: list[str] | None = None) -> bool:
+    """Apply local pre-filters that OpenAlex cannot express directly enough."""
+    discipline_set = {d.strip().lower() for d in disciplines or [] if d.strip()}
+    if discipline_set and (author.get('discipline') or '').strip().lower() not in discipline_set:
+        return False
+    return True
+
+
+def _collect_openalex_authors_for_state(
+    search_state: dict,
+    *,
+    client: OpenAlexClient,
+    storage,
+    max_results: int,
+    jump_size: int,
+    disciplines: list[str] | None = None,
+    progress_callback=None,
+) -> list[dict]:
+    """Fetch all bounded OpenAlex matches for the active pre-filter set and persist them."""
+    search_filters = search_state.get('filters') or {}
+    if not search_filters:
+        return []
+
+    target_limit = min(
+        int(max_results or search_state.get('max_results') or 0),
+        _get_result_limit(search_state),
+    )
+    if target_limit <= 0:
+        return []
+
+    collected: list[dict] = []
+    cursor = '*'
+    batch_index = 0
+    safe_jump = max(1, min(int(jump_size or search_state.get('jump_size') or 250), 1000))
+
+    while cursor and len(collected) < target_limit:
+        remaining = target_limit - len(collected)
+        batch = client.fetch_author_batch(
+            h_index_min=search_filters.get('h_index_min'),
+            h_index_max=search_filters.get('h_index_max'),
+            include_country_codes=search_filters.get('include_country_codes'),
+            exclude_country_codes=search_filters.get('exclude_country_codes'),
+            topic_ids=search_filters.get('topic_ids'),
+            require_orcid=search_filters.get('require_orcid', True),
+            cursor=cursor,
+            batch_size=min(safe_jump, remaining),
+            batch_index=batch_index,
+        )
+        authors = [
+            author for author in (batch.get('results') or [])
+            if _author_matches_collection_prefilters(author, disciplines)
+        ]
+        for author in authors:
+            author.setdefault('source_origin', AUTHOR_SOURCE_OPENALEX)
+            author.setdefault('scientific_domain', _clean_domain_label(author.get('discipline', '')))
+            author.setdefault('email', None)
+            author['author_id'] = _author_openalex_id(author)
+            author['openalex_id'] = _author_openalex_id(author)
+
+        if storage and getattr(storage, 'available', False) and authors:
+            storage.bulk_upsert_harvested_authors(authors, run_id=1)
+
+        collected.extend(authors)
+        if progress_callback:
+            progress_callback(min(len(collected), target_limit), target_limit)
+
+        cursor = batch.get('next_cursor') if batch.get('has_more') else None
+        batch_index += 1
+
+        if not batch.get('results'):
+            break
+
+    return collected[:target_limit]
 
 
 def _enrich_db_source_domains_from_openalex(authors: list[dict], max_rows: int = 50) -> tuple[int, int]:
@@ -2256,7 +2362,11 @@ def render_search_section(filters, ui_scope: str):
             st.session_state.app_state['author_source_mode'] = author_source_mode
             save_state()
         filters['author_source_mode'] = author_source_mode
-        filters['database_email_panel'] = render_database_email_search_panel(filters, ui_scope, author_source_mode)
+        if author_source_mode == AUTHOR_SOURCE_OPENALEX:
+            filters['database_email_panel'] = {'results': [], 'total': 0, 'active': False, 'query': ''}
+            st.caption("OpenAlex-only mode ignores saved database recipients until emails are fetched and saved for collected OpenAlex authors.")
+        else:
+            filters['database_email_panel'] = render_database_email_search_panel(filters, ui_scope, author_source_mode)
         st.divider()
 
     st.header("2. Filters")
@@ -2383,6 +2493,7 @@ def run_search(filters, ui_scope: str):
             'exclude_country_codes': exclude_country_codes,
             'topic_ids': topic_ids,
             'require_orcid': True,
+            'disciplines': filters.get('disciplines', []),
         },
         'total_count': total_count,
         'max_results': filters['max_results'],
@@ -2534,6 +2645,11 @@ def run_email_fetch_filtered(filters, ui_scope: str):
                                 orcid_emails_found += 1
                             else:
                                 # Track authors without email for OpenAI fallback
+                                if not result.get('rate_limited'):
+                                    _persist_missing_author_email(
+                                        author,
+                                        result.get('email_status') or EMAIL_STATUS_NO_EMAIL,
+                                    )
                                 authors_without_email.append(author)
                             break
                     
@@ -2750,10 +2866,8 @@ def display_results(filters, ui_scope: str):
     db_search_active = bool(db_panel.get('active'))
     db_search_query = db_panel.get('query') or ''
 
-    if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
-        results = db_source_results
-    elif is_author_workflow and (author_source_mode == AUTHOR_SOURCE_BOTH or db_search_active):
-        results = _merge_author_source_results(openalex_results, db_source_results)
+    if is_author_workflow:
+        results = _select_author_source_results(author_source_mode, openalex_results, db_source_results)
     else:
         results = openalex_results
     
@@ -2761,12 +2875,12 @@ def display_results(filters, ui_scope: str):
     if not results:
         if is_author_workflow and author_source_mode == AUTHOR_SOURCE_DATABASE:
             empty_results_message = "No database email records match the current search and filters."
-        elif db_search_active:
+        elif author_source_mode == AUTHOR_SOURCE_BOTH and db_search_active:
             empty_results_message = "No database email records match the current search and filters."
         else:
             empty_results_message = "No results yet. Use the search button above."
 
-    if is_author_workflow and (author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH} or db_search_active):
+    if is_author_workflow and author_source_mode in {AUTHOR_SOURCE_DATABASE, AUTHOR_SOURCE_BOTH}:
         db_count = len(db_source_results)
         openalex_count = len(openalex_results)
         st.caption(
@@ -2864,6 +2978,57 @@ def display_results(filters, ui_scope: str):
                 st.rerun()
 
         st.caption("OpenAlex deep paging is cursor-based, so batch jumps reuse saved checkpoints rather than direct page numbers.")
+
+        collected_count = len(st.session_state.app_state.get('search_results', []) or [])
+        collect_disabled = not search_state.get('filters') or _get_result_limit(search_state) <= 0
+        collect_label = (
+            f"Collect All Matching OpenAlex Authors "
+            f"({min(_get_result_limit(search_state), int(search_state.get('max_results') or 0)):,} max)"
+        )
+        if st.button(
+            collect_label,
+            key=_scope_key(ui_scope, "collect_all_openalex"),
+            type="secondary",
+            use_container_width=True,
+            disabled=collect_disabled,
+            help="Fetches all bounded OpenAlex matches for the pre-filters, saves them to the collected-author database, and displays them for post-filtering.",
+        ):
+            progress = st.progress(0)
+            status = st.empty()
+
+            def _progress(done: int, total: int) -> None:
+                progress.progress(min(done / total, 1.0) if total else 0)
+                status.text(f"Collected {done:,} / {total:,} OpenAlex authors...")
+
+            with st.spinner("Collecting all matching OpenAlex authors..."):
+                collected_authors = _collect_openalex_authors_for_state(
+                    search_state,
+                    client=OpenAlexClient(),
+                    storage=db_storage,
+                    max_results=int(search_state.get('max_results') or _get_result_limit(search_state)),
+                    jump_size=int(search_state.get('jump_size') or 250),
+                    disciplines=search_state.get('filters', {}).get('disciplines') or filters.get('disciplines', []),
+                    progress_callback=_progress,
+                )
+
+            st.session_state.app_state['search_results'] = collected_authors
+            search_state['current_batch_index'] = 0
+            search_state['current_batch_results'] = collected_authors
+            search_state['batch_cache'] = {'0': collected_authors}
+            search_state['current_range_start'] = 1 if collected_authors else 0
+            search_state['current_range_end'] = len(collected_authors)
+            st.session_state[_scope_key(ui_scope, "results_page")] = 0
+            st.session_state.filtered_authors = []
+            st.session_state.last_collect_result = (
+                f"Collected {len(collected_authors):,} OpenAlex authors from the active pre-filters."
+            )
+            save_state()
+            st.rerun()
+
+        if st.session_state.get('last_collect_result'):
+            st.success(st.session_state.pop('last_collect_result'))
+        elif collected_count:
+            st.caption(f"Current OpenAlex result set contains {collected_count:,} authors.")
     
     filtered = results.copy()
 
@@ -2891,8 +3056,11 @@ def display_results(filters, ui_scope: str):
             )
         ]
 
-    # Reuse known database emails so invitations can be sent without refetching.
-    if _hydrate_result_emails_from_db(filtered):
+    # Reuse known database emails only when database records are an explicit source.
+    should_hydrate_database_emails = (
+        not is_author_workflow or author_source_mode == AUTHOR_SOURCE_BOTH
+    )
+    if should_hydrate_database_emails and _hydrate_result_emails_from_db(filtered):
         if show_openalex_batch_controls:
             _sync_current_batch_cache()
         save_state()
@@ -3174,7 +3342,13 @@ def display_results(filters, ui_scope: str):
     st.divider()
     col_btn1, col_btn2 = st.columns([2, 1])
     with col_btn1:
-        fetch_btn_label = f"Fetch Emails for {without_email} Filtered Authors" if without_email > 0 else "All Filtered Authors Have Emails"
+        if is_author_workflow and author_source_mode == AUTHOR_SOURCE_OPENALEX:
+            fetch_btn_label = (
+                f"Fetch Emails for {without_email} Filtered Collected Authors"
+                if without_email > 0 else "All Filtered Collected Authors Have Emails"
+            )
+        else:
+            fetch_btn_label = f"Fetch Emails for {without_email} Filtered Authors" if without_email > 0 else "All Filtered Authors Have Emails"
         fetch_emails_clicked = st.button(
             fetch_btn_label,
             type="primary" if without_email > 0 else "secondary",
