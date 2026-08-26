@@ -169,7 +169,7 @@ def dedupe_brevo_export_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, A
 def format_brevo_csv_row(row: dict[str, Any]) -> dict[str, str]:
     """Map a database row to Brevo CSV columns."""
     return {
-        "EMAIL": (row.get("email") or "").strip(),
+        "EMAIL": (row.get("email") or row.get("EMAIL") or "").strip(),
         "FIRSTNAME": (row.get("author_name") or row.get("FIRSTNAME") or "").strip(),
         "ORCID": (row.get("orcid_id") or row.get("ORCID") or "").strip(),
         "COUNTRY": (row.get("country") or row.get("COUNTRY") or "").strip(),
