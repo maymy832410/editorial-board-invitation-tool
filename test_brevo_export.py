@@ -132,6 +132,22 @@ class BrevoExportCsvTests(unittest.TestCase):
         self.assertNotIn("CONTACT ID", csv_text)
         self.assertNotIn("WHATSAPP", csv_text)
 
+    def test_write_brevo_csv_keeps_email_when_rows_already_formatted(self):
+        csv_text = write_brevo_csv(
+            [
+                {
+                    "EMAIL": "ahmed.hassan@university.edu",
+                    "FIRSTNAME": "Ahmed Hassan",
+                    "ORCID": "0000-0002-1234-5678",
+                    "COUNTRY": "IQ",
+                    "DISCIPLINE": "Medicine",
+                }
+            ]
+        )
+
+        self.assertIn("ahmed.hassan@university.edu", csv_text)
+        self.assertIn("Ahmed Hassan", csv_text)
+
 
 class BrevoExportSqlTests(unittest.TestCase):
     def test_default_sql_excludes_suppressed_and_retracted(self):
