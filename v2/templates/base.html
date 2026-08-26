@@ -69,6 +69,14 @@
                         hx-swap="innerHTML">
                     ⚡ Jobs
                 </button>
+                <button class="tab-btn"
+                        :class="{ 'active': activeTab === 'export' }"
+                        @click="activeTab = 'export'"
+                        hx-get="/export"
+                        hx-target="#export-panel"
+                        hx-swap="innerHTML">
+                    📤 Broadcast
+                </button>
             </div>
 
             <div class="content-area">
@@ -96,6 +104,10 @@
 
                 <div x-show="activeTab === 'jobs'" x-cloak>
                     <div id="jobs-panel">Loading...</div>
+                </div>
+
+                <div x-show="activeTab === 'export'" x-cloak>
+                    <div id="export-panel">Loading...</div>
                 </div>
             </div>
         </main>

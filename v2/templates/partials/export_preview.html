@@ -1,0 +1,36 @@
+{% if error %}
+<div class="alert alert-error">{{ error }}</div>
+{% elif counts %}
+<div class="metrics-grid">
+    <div class="metric-card metric-card-primary">
+        <span class="metric-value">{{ counts.eligible }}</span>
+        <span class="metric-label">Eligible contacts</span>
+    </div>
+    <div class="metric-card">
+        <span class="metric-value">{{ counts.total_with_email }}</span>
+        <span class="metric-label">Unique emails</span>
+    </div>
+    <div class="metric-card">
+        <span class="metric-value">{{ counts.excluded_suppressed }}</span>
+        <span class="metric-label">Excluded suppressed</span>
+    </div>
+    <div class="metric-card">
+        <span class="metric-value">{{ counts.excluded_retracted }}</span>
+        <span class="metric-label">Excluded retracted</span>
+    </div>
+    <div class="metric-card">
+        <span class="metric-value">{{ counts.excluded_country }}</span>
+        <span class="metric-label">Excluded by country</span>
+    </div>
+    <div class="metric-card">
+        <span class="metric-value">{{ counts.excluded_discipline }}</span>
+        <span class="metric-label">Excluded by discipline</span>
+    </div>
+</div>
+<p class="text-sm text-muted">
+    CSV columns: EMAIL, FIRSTNAME, ORCID, COUNTRY, DISCIPLINE.
+    FIRSTNAME is the full author name for Brevo personalization.
+</p>
+{% else %}
+<p class="placeholder-text">Set filters and click Preview count before downloading.</p>
+{% endif %}

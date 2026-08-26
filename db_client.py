@@ -6,11 +6,21 @@ import re
 import secrets
 import hashlib
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Set, Dict, List, Any
+from typing import Iterator, Optional, Set, Dict, List, Any
 from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.extras
+
+from brevo_export import (
+    EMPTY_BREVO_EXPORT_COUNTS,
+    BrevoExportFilters,
+    build_brevo_export_count_sql,
+    build_brevo_export_rows_sql,
+    format_brevo_csv_row,
+    normalize_brevo_export_filters,
+    parse_export_counts,
+)
 
 
 INVITATION_TYPE_EDITORIAL = "editorial"
@@ -1798,6 +1808,63 @@ class PostgresStorage:
         except Exception as e:
             print(f"PostgreSQL search database email recipients error: {e}")
             return []
+
+    def _brevo_export_table_names(self) -> Dict[str, str]:
+        """Map export SQL aliases onto the live PostgreSQL table names."""
+        return {
+            "profiles": self.PROFILE_TABLE_NAME,
+            "harvested": self.HARVESTED_AUTHORS_TABLE,
+            "suppressions": self.EMAIL_SUPPRESSIONS_TABLE,
+            "retracted": "retracted_authors",
+            "invitations": self.INVITATION_TABLE_NAME,
+        }
+
+    def count_brevo_export_contacts(
+        self,
+        filters: Optional[BrevoExportFilters] = None,
+        **filter_kwargs: Any,
+    ) -> Dict[str, int]:
+        """Return eligible/excluded counts for a Brevo contact export."""
+        if not self.available:
+            return dict(EMPTY_BREVO_EXPORT_COUNTS)
+        normalized = filters or normalize_brevo_export_filters(**filter_kwargs)
+        sql, params = build_brevo_export_count_sql(
+            normalized,
+            table_names=self._brevo_export_table_names(),
+        )
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(sql, params)
+                return parse_export_counts(cur.fetchone())
+        except Exception as e:
+            print(f"PostgreSQL count Brevo export contacts error: {e}")
+            return dict(EMPTY_BREVO_EXPORT_COUNTS)
+
+    def iter_brevo_export_contacts(
+        self,
+        filters: Optional[BrevoExportFilters] = None,
+        **filter_kwargs: Any,
+    ) -> Iterator[Dict[str, str]]:
+        """Yield Brevo CSV rows for eligible unique database emails."""
+        if not self.available:
+            return
+        normalized = filters or normalize_brevo_export_filters(**filter_kwargs)
+        sql, params = build_brevo_export_rows_sql(
+            normalized,
+            table_names=self._brevo_export_table_names(),
+        )
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(sql, params)
+                while True:
+                    batch = cur.fetchmany(500)
+                    if not batch:
+                        break
+                    for row in batch:
+                        yield format_brevo_csv_row(dict(row))
+        except Exception as e:
+            print(f"PostgreSQL iterate Brevo export contacts error: {e}")
+            return
 
     def get_invitation_counts(self, orcid_ids: List[str]) -> Dict[str, int]:
         """Get invitation counts for a list of ORCID IDs."""

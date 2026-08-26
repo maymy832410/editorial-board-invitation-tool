@@ -719,6 +719,54 @@ body {
     margin-bottom: 12px;
 }
 
+/* ── Broadcast / Brevo Export ──────────────────────────── */
+.export-panel {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+}
+
+.export-panel h2 {
+    font-size: 1.1rem;
+    margin-bottom: 8px;
+}
+
+.export-intro {
+    margin-bottom: 16px;
+}
+
+.export-form .filter-row {
+    margin-bottom: 16px;
+}
+
+.export-form label {
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+
+.export-checkboxes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 16px;
+    padding: 12px;
+    background: var(--bg-gray);
+    border-radius: var(--radius);
+}
+
+.export-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+}
+
+.metric-card-primary .metric-value {
+    color: var(--success);
+}
+
 /* ── History Panel ─────────────────────────────────────── */
 .history-panel {
     background: var(--bg);
