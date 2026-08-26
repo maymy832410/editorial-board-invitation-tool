@@ -1,0 +1,88 @@
+<!-- Brevo contact export panel -->
+<div class="export-panel">
+    <h2>Broadcast export for Brevo</h2>
+    <p class="text-sm text-muted export-intro">
+        Download unique database contacts as a Brevo import CSV.
+        Sending happens in Brevo. Purged contacts are already removed from mailing tables and cannot be exported.
+    </p>
+
+    <form id="brevo-export-form" class="export-form" method="post" action="/export/brevo.csv">
+        <div class="filter-row">
+            <div class="filter-group">
+                <label for="export-source">Source</label>
+                <select id="export-source" name="source" class="form-input">
+                    <option value="all">All database records</option>
+                    <option value="profiles">Author profiles</option>
+                    <option value="harvested">Collected emails</option>
+                </select>
+            </div>
+            <div class="filter-group filter-wide">
+                <label for="export-query">Search (optional)</label>
+                <input id="export-query" type="text" name="query" class="form-input"
+                       placeholder="Name, email, or ORCID">
+            </div>
+        </div>
+
+        <div class="filter-row">
+            <div class="filter-group filter-wide">
+                <label for="export-countries-include">Include countries</label>
+                <select id="export-countries-include" name="countries_include" class="form-input" multiple size="6">
+                    {% for country, code in countries.items() %}
+                    <option value="{{ country }}">{{ country }} ({{ code }})</option>
+                    {% endfor %}
+                </select>
+                <p class="text-sm text-muted">Leave empty to include every country.</p>
+            </div>
+            <div class="filter-group filter-wide">
+                <label for="export-countries-exclude">Exclude countries</label>
+                <select id="export-countries-exclude" name="countries_exclude" class="form-input" multiple size="6">
+                    {% for country, code in countries.items() %}
+                    <option value="{{ country }}">{{ country }} ({{ code }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="filter-group filter-wide">
+                <label for="export-disciplines">Disciplines</label>
+                <select id="export-disciplines" name="disciplines" class="form-input" multiple size="6">
+                    {% for discipline in disciplines %}
+                    <option value="{{ discipline }}">{{ discipline }}</option>
+                    {% endfor %}
+                </select>
+                <p class="text-sm text-muted">Leave empty to include every discipline.</p>
+            </div>
+        </div>
+
+        <div class="export-checkboxes">
+            <label class="checkbox-label">
+                <input type="checkbox" name="include_suppressed" value="1">
+                Include suppressed contacts
+            </label>
+            <label class="checkbox-label">
+                <input type="checkbox" name="include_retracted" value="1">
+                Include retracted authors
+            </label>
+            <label class="checkbox-label">
+                <input type="checkbox" name="exclude_invited" value="1">
+                Exclude already invited
+            </label>
+        </div>
+
+        <div class="export-actions">
+            <button type="button"
+                    class="btn btn-secondary"
+                    hx-post="/export/preview"
+                    hx-include="#brevo-export-form"
+                    hx-target="#export-preview"
+                    hx-swap="innerHTML">
+                Preview count
+            </button>
+            <button type="submit" class="btn btn-primary">
+                Download CSV
+            </button>
+        </div>
+    </form>
+
+    <div id="export-preview">
+        {% include 'partials/export_preview.html' %}
+    </div>
+</div>

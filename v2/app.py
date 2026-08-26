@@ -6,7 +6,7 @@ import sys
 import time
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +70,11 @@ from db_client import (
     BULK_RECIPIENT_STATUS_SENT,
     BULK_RECIPIENT_STATUS_FAILED,
     BULK_RECIPIENT_STATUS_SKIPPED,
+)
+from brevo_export import (
+    BREVO_CSV_FIELDS,
+    BrevoExportFilters,
+    normalize_brevo_export_filters,
 )
 from journal_presets import normalize_journal_preset_config
 from session_store import (
@@ -189,6 +194,28 @@ def _country_codes(values: list[str]) -> list[str]:
         if code in valid_codes and code not in codes:
             codes.append(code)
     return codes
+
+
+def _form_flag(form, name: str) -> bool:
+    """Treat a present checkbox/value as true."""
+    values = _form_values(form, name)
+    if not values:
+        return False
+    return values[-1].lower() in {"1", "true", "on", "yes"}
+
+
+def _brevo_export_filters_from_form(form) -> BrevoExportFilters:
+    """Parse Broadcast-tab filters from a preview or download form."""
+    return normalize_brevo_export_filters(
+        source=(_form_values(form, "source") or ["all"])[0],
+        query=(_form_values(form, "query") or [""])[0],
+        include_countries=_country_codes(_form_values(form, "countries_include")),
+        exclude_countries=_country_codes(_form_values(form, "countries_exclude")),
+        disciplines=_form_values(form, "disciplines"),
+        include_suppressed=_form_flag(form, "include_suppressed"),
+        include_retracted=_form_flag(form, "include_retracted"),
+        exclude_invited=_form_flag(form, "exclude_invited"),
+    )
 
 
 def _keyword_list(value: str) -> list[str]:
@@ -1146,6 +1173,77 @@ async def bulk_job_status(request: Request, response: Response):
         "request": request,
         "jobs": jobs,
     })
+
+
+@app.get("/export", response_class=HTMLResponse)
+async def export_panel(request: Request, response: Response):
+    """Broadcast tab: Brevo contact-export filters and download."""
+    get_or_create_session(request, response)
+    return render_template("export.html", {
+        "request": request,
+        "countries": COUNTRIES,
+        "disciplines": ALL_DISCIPLINES,
+        "counts": None,
+        "error": None,
+    })
+
+
+@app.post("/export/preview", response_class=HTMLResponse)
+async def export_preview(request: Request, response: Response):
+    """Return eligible/excluded counts for the current export filters."""
+    get_or_create_session(request, response)
+    db = get_db()
+    if not db.available:
+        return render_template("partials/export_preview.html", {
+            "request": request,
+            "counts": None,
+            "error": "Database not available.",
+        })
+
+    form = await request.form()
+    filters = _brevo_export_filters_from_form(form)
+    counts = db.count_brevo_export_contacts(filters)
+    return render_template("partials/export_preview.html", {
+        "request": request,
+        "counts": counts,
+        "error": None,
+    })
+
+
+@app.post("/export/brevo.csv")
+async def export_brevo_csv(request: Request, response: Response):
+    """Stream a Brevo-ready CSV of filtered database contacts."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    get_or_create_session(request, response)
+    db = get_db()
+    if not db.available:
+        return JSONResponse({"ok": False, "error": "Database not available"}, status_code=500)
+
+    form = await request.form()
+    filters = _brevo_export_filters_from_form(form)
+
+    def generate():
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=BREVO_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        yield buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        for row in db.iter_brevo_export_contacts(filters):
+            writer.writerow(row)
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+
+    filename = f"map_authors_{date.today().isoformat()}.csv"
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/unsubscribe")
