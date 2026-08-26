@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from brevo_export import (
     BREVO_CSV_FIELDS,
@@ -158,6 +159,14 @@ class BrevoExportSqlTests(unittest.TestCase):
         self.assertIn("UPPER(COALESCE(country, '')) <> ALL(%s)", sql)
         self.assertIn(["US"], params)
         self.assertIn(["DE"], params)
+
+
+class BrevoExportV1AppTests(unittest.TestCase):
+    def test_streamlit_app_exposes_broadcast_workspace(self):
+        source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertIn("def render_brevo_export_panel", source)
+        self.assertIn('"Broadcast"', source)
+        self.assertIn("render_brevo_export_panel()", source)
 
 
 if __name__ == "__main__":

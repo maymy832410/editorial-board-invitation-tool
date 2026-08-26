@@ -1,4 +1,8 @@
-"""Editorial Board Invitation Tool v2 - FastAPI + HTMX"""
+"""Editorial Board Invitation Tool v2 - FastAPI + HTMX.
+
+DISCARD FOR FUTURE IMPLEMENTATIONS: do not add new features here.
+The supported app is the Streamlit v1 entrypoint in ../app.py.
+"""
 
 import json
 import os

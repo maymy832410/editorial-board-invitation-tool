@@ -58,6 +58,7 @@ from db_client import (
     BULK_JOB_STATUS_RUNNING,
 )
 from journal_presets import normalize_journal_preset_config
+from brevo_export import EMPTY_BREVO_EXPORT_COUNTS, normalize_brevo_export_filters, write_brevo_csv
 
 WORKFLOW_AUTHOR = "author"
 WORKFLOW_EDITORIAL = "editorial"
@@ -4855,6 +4856,114 @@ def render_collection_panel():
         st.info("No emails collected yet. Start the worker and configure filters above.")
 
 
+def render_brevo_export_panel():
+    """Database-wide Brevo CSV export: filters, counts, and download."""
+    st.header("Broadcast export for Brevo")
+    st.caption(
+        "Download unique database contacts as a Brevo import CSV. "
+        "Sending happens in Brevo. Purged contacts are already removed from mailing tables and cannot be exported."
+    )
+
+    if not db_storage.available:
+        st.error("Database not available.")
+        return
+
+    source = st.selectbox(
+        "Source",
+        options=["all", "profiles", "harvested"],
+        format_func=lambda value: {
+            "all": "All database records",
+            "profiles": "Author profiles",
+            "harvested": "Collected emails",
+        }[value],
+        key="brevo_export_source",
+    )
+    query = st.text_input(
+        "Search (optional)",
+        placeholder="Name, email, or ORCID",
+        key="brevo_export_query",
+    )
+    include_countries = st.multiselect(
+        "Include countries",
+        options=list(COUNTRIES.keys()),
+        key="brevo_export_include_countries",
+        help="Leave empty to include every country.",
+    )
+    exclude_countries = st.multiselect(
+        "Exclude countries",
+        options=list(COUNTRIES.keys()),
+        key="brevo_export_exclude_countries",
+    )
+    disciplines = st.multiselect(
+        "Disciplines",
+        options=ALL_DISCIPLINES,
+        key="brevo_export_disciplines",
+        help="Leave empty to include every discipline.",
+    )
+    include_suppressed = st.checkbox(
+        "Include suppressed contacts",
+        value=False,
+        key="brevo_export_include_suppressed",
+    )
+    include_retracted = st.checkbox(
+        "Include retracted authors",
+        value=False,
+        key="brevo_export_include_retracted",
+    )
+    exclude_invited = st.checkbox(
+        "Exclude already invited",
+        value=False,
+        key="brevo_export_exclude_invited",
+    )
+
+    filters = normalize_brevo_export_filters(
+        source=source,
+        query=query,
+        include_countries=[COUNTRIES[name] for name in include_countries if name in COUNTRIES],
+        exclude_countries=[COUNTRIES[name] for name in exclude_countries if name in COUNTRIES],
+        disciplines=disciplines,
+        include_suppressed=include_suppressed,
+        include_retracted=include_retracted,
+        exclude_invited=exclude_invited,
+    )
+
+    preview_col, prepare_col = st.columns(2)
+    preview_clicked = preview_col.button("Preview count", type="primary", use_container_width=True)
+    prepare_clicked = prepare_col.button("Prepare CSV", use_container_width=True)
+
+    if preview_clicked or prepare_clicked:
+        with st.spinner("Counting eligible contacts..."):
+            counts = db_storage.count_brevo_export_contacts(filters)
+        st.session_state["brevo_export_counts"] = counts
+        if prepare_clicked:
+            with st.spinner("Building CSV..."):
+                csv_text = write_brevo_csv(db_storage.iter_brevo_export_contacts(filters))
+            st.session_state["brevo_export_csv"] = csv_text
+            st.session_state["brevo_export_csv_name"] = f"map_authors_{datetime.now().date().isoformat()}.csv"
+
+    counts = st.session_state.get("brevo_export_counts") or EMPTY_BREVO_EXPORT_COUNTS
+    if st.session_state.get("brevo_export_counts"):
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Eligible contacts", counts.get("eligible", 0))
+        m2.metric("Unique emails", counts.get("total_with_email", 0))
+        m3.metric("Excluded suppressed", counts.get("excluded_suppressed", 0))
+        m4, m5, m6 = st.columns(3)
+        m4.metric("Excluded retracted", counts.get("excluded_retracted", 0))
+        m5.metric("Excluded by country", counts.get("excluded_country", 0))
+        m6.metric("Excluded by discipline", counts.get("excluded_discipline", 0))
+        st.caption("CSV columns: EMAIL, FIRSTNAME, ORCID, COUNTRY, DISCIPLINE. FIRSTNAME is the full author name.")
+
+    csv_text = st.session_state.get("brevo_export_csv")
+    if csv_text:
+        st.download_button(
+            "Download CSV",
+            data=csv_text,
+            file_name=st.session_state.get("brevo_export_csv_name", "map_authors.csv"),
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
 def main():
     """Main app entry point."""
 
@@ -4906,7 +5015,7 @@ def main():
     # Render sidebar and get filters
     shared_filters = render_sidebar()
 
-    views = ["Author Outreach", "Jobs", "Collection", "Settings"]
+    views = ["Author Outreach", "Broadcast", "Jobs", "Collection", "Settings"]
     active_view = st.radio(
         "Workspace",
         options=views,
@@ -4924,6 +5033,8 @@ def main():
         author_filters = dict(shared_filters)
         author_filters['invitation_type'] = _workflow_invitation_type(WORKFLOW_AUTHOR)
         render_search_section(author_filters, WORKFLOW_AUTHOR)
+    elif active_view == "Broadcast":
+        render_brevo_export_panel()
     elif active_view == "Jobs":
         st.header("Background Jobs")
         st.caption("Monitor active sends, review completed work, and cancel queued jobs.")

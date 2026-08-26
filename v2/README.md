@@ -1,5 +1,7 @@
 # Editorial Board Invitation Tool v2
 
+**Discard for future implementations.** New work belongs in the Streamlit v1 app (`app.py` at the repo root), not this FastAPI tree.
+
 FastAPI + HTMX replacement for the Streamlit-based editorial board invitation tool.
 
 ## Architecture
